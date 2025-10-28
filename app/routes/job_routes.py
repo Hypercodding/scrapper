@@ -1,0 +1,170 @@
+
+from fastapi import APIRouter, Query, HTTPException
+from typing import List, Optional
+from app.models.job_model import Job # pylint: disable=import-error
+from app.core.config import settings # pylint: disable=import-error
+from app.services.indeed_selenium_service import scrape_indeed_selenium, CloudflareBlockedError # pylint: disable=import-error
+from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
+from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
+from app.core.caching import get_cache, set_cache # pylint: disable=import-error
+
+router = APIRouter()
+
+
+@router.get("/jobs", response_model=List[Job])
+async def get_jobs(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location (flexible format like LinkedIn). Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'"),
+    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
+    salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
+    salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
+    experience_level: Optional[str] = Query(None, description="Experience level filter: 'entry', 'mid', 'senior', 'executive'"),
+    employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
+    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)")
+):
+    """
+    Get jobs from Indeed using enhanced browser automation (Selenium)
+    
+    ⭐ ENHANCED VERSION: Now works like ZipRecruiter with comprehensive data extraction and advanced filtering!
+    
+    Features:
+    - Extracts salary ranges, company URLs, job descriptions
+    - Job types, experience levels, benefits, requirements, skills
+    - Raw job card data (HTML + text) for complete information access
+    - Dynamic location filtering (flexible format like LinkedIn search URLs)
+    - Salary range filtering
+    - Experience level filtering
+    - Employment type filtering
+    - Pagination support for more results
+    - Better error handling and debugging
+    
+    Location Filter (Dynamic - works like LinkedIn):
+    - Accepts any location format that Indeed supports
+    - Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'
+    - 'San Francisco, CA', 'London, UK', 'Toronto, ON', etc.
+    - Any valid location string will be URL-encoded and passed to Indeed
+    
+    Job Type Filter:
+    - 'remote' - Remote jobs only
+    - 'hybrid' - Hybrid jobs only  
+    - 'onsite' or 'on-site' - On-site jobs only
+    
+    Salary Filters:
+    - salary_min: Minimum salary (e.g., 50000)
+    - salary_max: Maximum salary (e.g., 100000)
+    
+    Experience Level Filter:
+    - 'entry' - Entry-level jobs
+    - 'mid' - Mid-level jobs
+    - 'senior' - Senior-level jobs
+    - 'executive' - Executive-level jobs
+    
+    Employment Type Filter:
+    - 'full-time' - Full-time jobs
+    - 'part-time' - Part-time jobs
+    - 'contract' - Contract jobs
+    - 'internship' - Internship jobs
+    
+    Date Filter:
+    - days_old: Filter jobs posted within last N days
+    - 30 - Jobs posted in last 30 days
+    - 7 - Jobs posted in last 7 days
+    - 1 - Jobs posted today
+    """
+    cache_key = f"indeed_selenium_enhanced:{query}:{location}:{job_type}:{salary_min}:{salary_max}:{experience_level}:{employment_type}:{days_old}:{max_results}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_indeed_selenium(
+            query, location, max_results, job_type, 
+            salary_min, salary_max, experience_level, employment_type, days_old
+        )
+    except CloudflareBlockedError as e:
+        # Indeed is blocked - return clear error with solution
+        raise HTTPException(
+            status_code=503,
+            detail=f"Indeed blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Use /api/jobs/ziprecruiter-enhanced endpoint 3) Wait and retry"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
+
+
+
+@router.get("/jobs/ziprecruiter", response_model=List[Job])
+async def get_ziprecruiter_jobs(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location, e.g. 'remote', 'New York'"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)")
+):
+    """
+    Get jobs from ZipRecruiter using browser automation (Selenium)
+    
+    This may work better than Indeed as ZipRecruiter has less aggressive anti-scraping measures.
+    """
+    cache_key = f"ziprecruiter:{query}:{location}:{max_results}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_ziprecruiter(query, location, max_results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
+
+
+@router.get("/jobs/ziprecruiter-enhanced", response_model=List[Job])
+async def get_ziprecruiter_enhanced_jobs(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location, e.g. 'remote', 'Lahore', 'New York', 'USA'"),
+    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'on-site'"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)")
+):
+    """
+    Get detailed jobs from ZipRecruiter with enhanced information extraction
+    
+    ⭐ ENHANCED VERSION: Extracts salary ranges, company URLs, job descriptions, 
+    job types, experience levels, benefits, requirements, skills, and more!
+    
+    Location Examples:
+    - 'remote' or 'work from home' - Remote jobs only
+    - 'Lahore' - Jobs in Lahore, Pakistan
+    - 'New York' - Jobs in New York, NY
+    - 'USA' - Jobs in United States
+    - 'Pakistan' - Jobs in Pakistan
+    
+    Job Type Filter:
+    - 'remote' - Remote jobs only
+    - 'hybrid' - Hybrid jobs only  
+    - 'onsite' or 'on-site' - On-site jobs only
+    
+    Returns detailed job information including:
+    - Job title, company, company URL
+    - Location and remote type (Remote/Hybrid/On-site)
+    - Salary range and job type (Full-time/Part-time/Contract)
+    - Experience level (Entry/Mid/Senior/Executive)
+    - Posted date and job description
+    - Skills, requirements, and benefits
+    - Industry and company size
+    - Job ID for tracking
+    """
+    cache_key = f"ziprecruiter_enhanced:{query}:{location}:{job_type}:{max_results}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_ziprecruiter_enhanced(query, location, max_results, job_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
