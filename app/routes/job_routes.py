@@ -95,6 +95,27 @@ async def get_jobs(
     return jobs
 
 
+@router.get("/jobs/indeed-self-test")
+async def indeed_self_test(q: str = Query("python developer"), l: Optional[str] = Query("remote")):
+    """Quickly test Indeed scraping with small limits to verify Cloudflare workarounds."""
+    try:
+        jobs = await scrape_indeed_selenium(q, l, max_results=5)
+        return {
+            "ok": True,
+            "count": len(jobs),
+            "note": "If count is 0 repeatedly, Cloudflare may still be blocking.",
+        }
+    except CloudflareBlockedError as e:
+        return {
+            "ok": False,
+            "blocked": True,
+            "detail": str(e),
+            "hint": "Set PROXY_URL in .env, increase BACKOFF_MAX, or retry later.",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 
 @router.get("/jobs/ziprecruiter", response_model=List[Job])
 async def get_ziprecruiter_jobs(

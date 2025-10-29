@@ -4,6 +4,11 @@ import random
 import re
 from typing import Optional, List
 import undetected_chromedriver as uc
+from urllib.parse import urlparse
+import os
+import json
+import zipfile
+import tempfile
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -23,44 +28,141 @@ class CloudflareBlockedError(Exception):
     pass
 
 
+def _build_proxy_auth_extension(proxy_url: str) -> str:
+    """Create a minimal Chrome extension that configures a fixed proxy and handles auth.
+
+    Returns path to the zipped extension that can be loaded with --load-extension.
+    """
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("Invalid PROXY_URL; must include host and port")
+    username = parsed.username or ""
+    password = parsed.password or ""
+    host = parsed.hostname
+    port = int(parsed.port)
+
+    manifest = {
+        "version": "1.0",
+        "manifest_version": 2,
+        "name": "ProxyAuth",
+        "permissions": [
+            "proxy",
+            "tabs",
+            "unlimitedStorage",
+            "storage",
+            "<all_urls>",
+            "webRequest",
+            "webRequestBlocking"
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "88.0"
+    }
+
+    background_js = f"""
+    const config = {{
+      mode: "fixed_servers",
+      rules: {{
+        singleProxy: {{ scheme: "http", host: "{host}", port: {port} }},
+        bypassList: ["localhost", "127.0.0.1"]
+      }}
+    }};
+    chrome.proxy.settings.set({{ value: config, scope: "regular" }}, function() {{}});
+
+    function callbackFn(details) {{
+      return {{ authCredentials: {{ username: "{username}", password: "{password}" }} }};
+    }}
+    chrome.webRequest.onAuthRequired.addListener(
+      callbackFn,
+      {{ urls: ["<all_urls>"] }},
+      ["blocking"]
+    );
+    """
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_ext_")
+    manifest_path = os.path.join(temp_dir, "manifest.json")
+    bg_path = os.path.join(temp_dir, "background.js")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    with open(bg_path, "w", encoding="utf-8") as f:
+        f.write(background_js)
+
+    zip_path = os.path.join(temp_dir, "proxy_auth_extension.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(manifest_path, arcname="manifest.json")
+        zf.write(bg_path, arcname="background.js")
+    return zip_path
+
+
 def get_driver():
     """Initialize and return an undetected Chrome WebDriver instance."""
     global _driver
+    # Reset if driver is stale
+    try:
+        if _driver and _driver.service.process:
+            _driver.service.process.poll()
+            if _driver.service.process.returncode is not None:
+                _driver = None
+    except:
+        _driver = None
     if _driver is None:
         # Undetected ChromeDriver automatically handles anti-bot detection
         options = uc.ChromeOptions()
         
         # Add necessary arguments
-        options.add_argument("--headless=new")  # New headless mode (less detectable)
+        # NOTE: Headless mode is detected by Cloudflare - comment out to use visible browser
+        # options.add_argument("--headless=new")  # New headless mode (less detectable)
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument(f"user-agent={settings.USER_AGENT}")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--start-maximized")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--allow-insecure-localhost")
+        options.add_argument("--test-type")
+        try:
+            options.set_capability('acceptInsecureCerts', True)
+        except Exception:
+            pass
         # Accept-Language and locale hints
         if getattr(settings, "ACCEPT_LANGUAGE", None):
             lang_hint = settings.ACCEPT_LANGUAGE.split(",")[0]
             if lang_hint:
                 options.add_argument(f"--lang={lang_hint}")
-        # Optional proxy support
+        # Optional proxy support via extension to avoid MITM fingerprints
+        seleniumwire_options = None
+        proxy_url = None
         if getattr(settings, "PROXY_URL", None):
-            proxy = settings.PROXY_URL.strip()
-            if proxy:
-                options.add_argument(f"--proxy-server={proxy}")
+            proxy_raw = settings.PROXY_URL.strip()
+            if proxy_raw:
+                try:
+                    parsed = urlparse(proxy_raw)
+                    host_port = f"{parsed.hostname}:{parsed.port}" if parsed.hostname and parsed.port else parsed.netloc
+                    if host_port:
+                        # Use Chrome extension for proxy auth; no MITM
+                        ext_zip = _build_proxy_auth_extension(proxy_raw)
+                        options.add_argument(f"--load-extension={os.path.dirname(ext_zip)}")
+                        options.add_argument(f"--disable-extensions-except={os.path.dirname(ext_zip)}")
+                        # Important: do not set --proxy-server when using extension proxy settings
+                        proxy_url = proxy_raw
+                except Exception:
+                    # Fall back to passing raw string; may fail for auth proxies in headless
+                    options.add_argument(f"--proxy-server={proxy_raw}")
         
-        # Initialize undetected chromedriver
+        # Initialize undetected chromedriver without selenium-wire to avoid MITM
         _driver = uc.Chrome(
             options=options,
-            driver_executable_path=None,  # Auto-download if needed
+            driver_executable_path=None,
             browser_executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             use_subprocess=True,
-            version_main=None  # Auto-detect Chrome version
+            version_main=141
         )
         
-        # Additional stealth measures
+        # Additional stealth measures - hide webdriver property
+        _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         _driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": settings.USER_AGENT
+            "userAgent": settings.USER_AGENT,
+            "acceptLanguage": getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9")
         })
         # Extra headers for realism
         try:
@@ -126,7 +228,8 @@ async def scrape_indeed_selenium(
     # Rate limiting
     async with _request_lock:
         now = time.monotonic()
-        wait = settings.MIN_DELAY - (now - _last_fetch)
+        jitter = random.uniform(0, 0.75)
+        wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
         if wait > 0:
             await asyncio.sleep(wait)
         _last_fetch = time.monotonic()
@@ -193,40 +296,44 @@ def _scrape_sync_enhanced(
             print(f"Navigating to page {page + 1}: {url}")
             print(f"DEBUG - Full URL with filters: {url}")
             
-            # Navigate to the page
-            driver.get(url)
-            
-            # Detect Cloudflare/turnstile block pages early
-            page_html = driver.page_source or ""
-            if (
-                "INDEED_CLOUDFLARE_STATIC_PAGE" in page_html
-                or "Additional Verification Required" in page_html
-                or "/cdn-cgi/challenge-platform" in page_html
-            ):
-                # Try a single soft-retry with human-like interactions
-                try:
-                    _perform_human_interactions(driver)
-                    time.sleep(random.uniform(2.0, 3.5))
-                    driver.delete_all_cookies()
-                    time.sleep(random.uniform(0.8, 1.5))
-                    driver.get(url)
-                    time.sleep(random.uniform(2.0, 4.0))
-                    _perform_human_interactions(driver)
-                    page_html = driver.page_source or ""
-                except Exception:
-                    pass
-
-            if (
-                "INDEED_CLOUDFLARE_STATIC_PAGE" in page_html
-                or "Additional Verification Required" in page_html
-                or "/cdn-cgi/challenge-platform" in page_html
-            ):
-                try:
-                    with open('/tmp/indeed_debug.html', 'w', encoding='utf-8') as f:
-                        f.write(page_html)
-                except Exception:
-                    pass
-                raise CloudflareBlockedError("Indeed blocked by Cloudflare (captcha/turnstile). See /tmp/indeed_debug.html")
+            # Navigate to the page with soft-retries and backoff when Cloudflare is detected
+            retries = 0
+            while True:
+                driver.get(url)
+                page_html = driver.page_source or ""
+                if (
+                    "INDEED_CLOUDFLARE_STATIC_PAGE" in page_html
+                    or "Additional Verification Required" in page_html
+                    or "/cdn-cgi/challenge-platform" in page_html
+                ):
+                    if retries >= getattr(settings, "MAX_RETRIES", 1):
+                        try:
+                            with open('/tmp/indeed_debug.html', 'w', encoding='utf-8') as f:
+                                f.write(page_html)
+                        except Exception:
+                            pass
+                        raise CloudflareBlockedError("Indeed blocked by Cloudflare (captcha/turnstile). See /tmp/indeed_debug.html")
+                    backoff = random.uniform(getattr(settings, "BACKOFF_MIN", 2.0), getattr(settings, "BACKOFF_MAX", 8.0)) * (1 + 0.5 * retries)
+                    print(f"Cloudflare detected, retry {retries + 1}/{getattr(settings, 'MAX_RETRIES', 3)}, waiting {backoff:.1f}s...")
+                    try:
+                        if getattr(settings, "HUMANIZE", True):
+                            _perform_human_interactions(driver)
+                        time.sleep(random.uniform(0.8, 1.6))
+                        driver.delete_all_cookies()
+                        # Add more realistic wait
+                        time.sleep(random.uniform(3.0, 6.0))
+                        try:
+                            driver.quit()  # Close browser completely
+                        finally:
+                            # Ensure we have a fresh driver for the next attempt
+                            driver = get_driver()
+                        print(f"Browser restarted, waiting {backoff:.1f}s before retry...")
+                    except Exception:
+                        pass
+                    time.sleep(backoff)
+                    retries += 1
+                    continue
+                break
 
             # Verify we're on the correct page by checking the URL
             current_url = driver.current_url
@@ -238,8 +345,9 @@ def _scrape_sync_enhanced(
                     print(f"WARNING - Expected start={expected_start} but URL shows: {current_url}")
             
             # Random delay to appear more human-like
-            time.sleep(random.uniform(2.2, 5.4))
-            _perform_human_interactions(driver)
+            time.sleep(random.uniform(getattr(settings, "PAGE_DELAY_MIN", 2.0), getattr(settings, "PAGE_DELAY_MAX", 5.8)))
+            if getattr(settings, "HUMANIZE", True):
+                _perform_human_interactions(driver)
             
             # Try to wait for job results
             try:
@@ -250,7 +358,8 @@ def _scrape_sync_enhanced(
                 pass  # Continue even if wait times out
             else:
                 # Additional human-like scrolling to trigger lazy content
-                _progressive_scroll(driver)
+                if getattr(settings, "HUMANIZE", True):
+                    _progressive_scroll(driver)
             
             # Get page source and parse with BeautifulSoup
             soup = BeautifulSoup(driver.page_source, 'html.parser')
