@@ -18,7 +18,7 @@ async def get_jobs(
     job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
     salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
     salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
-    experience_level: Optional[str] = Query(None, description="Experience level filter: 'entry', 'mid', 'senior', 'executive'"),
+    experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
     employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
     days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
     max_results: int = Query(20, description="Maximum number of results (default: 20)")
@@ -55,9 +55,12 @@ async def get_jobs(
     - salary_max: Maximum salary (e.g., 100000)
     
     Experience Level Filter:
-    - 'entry' - Entry-level jobs
-    - 'mid' - Mid-level jobs
+    - 'intern' / 'internship' - Internship jobs
+    - 'assistant' - Assistant-level jobs
+    - 'entry' / 'junior' - Entry-level jobs
+    - 'mid' / 'mid-senior' - Mid-level jobs
     - 'senior' - Senior-level jobs
+    - 'director' / 'manager' - Director/Manager-level jobs
     - 'executive' - Executive-level jobs
     
     Employment Type Filter:

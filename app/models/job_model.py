@@ -21,4 +21,3 @@ class Job(BaseModel):
     industry: Optional[str] = None
     company_size: Optional[str] = None
     job_id: Optional[str] = None
-    raw_job_card_data: Optional[str] = None  # Raw HTML/text data from job card on main page

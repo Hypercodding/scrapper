@@ -16,7 +16,14 @@ class Settings(BaseSettings):
     MAX_RETRIES: int = 3  # Soft-retries when Cloudflare page detected
     BACKOFF_MIN: float = 2.0  # Min backoff between Cloudflare retries
     BACKOFF_MAX: float = 8.0  # Max backoff between Cloudflare retries
-    PROXY_URL: str = "http://ydgjcfkg:akhpmonf8vdj@142.111.48.253:7030"  # Optional proxy, e.g., http://user:pass@host:port
+    # Proxy configuration - supports multiple proxies for rotation
+    # Format: comma-separated list of proxy URLs: http://user:pass@host:port
+    PROXY_URLS: str = "http://ydgjcfkg:akhpmonf8vdj@142.111.48.253:7030,http://ydgjcfkg:akhpmonf8vdj@142.111.67.146:5611,http://ydgjcfkg:akhpmonf8vdj@142.147.128.93:6593"  # Add more proxies separated by commas
+    PROXY_ROTATION_INTERVAL: int = 240  # Rotate proxy every 240 seconds (4 minutes)
+    
+    # Legacy single proxy support (deprecated, use PROXY_URLS instead)
+    PROXY_URL: str = ""  # For backwards compatibility
+    
     ACCEPT_LANGUAGE: str = "en-US,en;q=0.9"
     
     # JSearch API (for Indeed jobs without scraping)

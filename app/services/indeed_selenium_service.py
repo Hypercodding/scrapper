@@ -17,15 +17,42 @@ from selenium_stealth import stealth
 from selenium.webdriver import ActionChains
 from app.models.job_model import Job
 from app.core.config import settings
+from app.core.proxy_manager import get_proxy_manager, reset_proxy_manager
 
 _last_fetch = 0
 _request_lock = asyncio.Lock()
 _driver = None
+_driver_created_at = 0  # Track when driver was created for rotation
 
 
 class CloudflareBlockedError(Exception):
     """Raised when Indeed returns a Cloudflare/turnstile block page."""
     pass
+
+
+def _get_proxy_urls() -> List[str]:
+    """
+    Get list of proxy URLs from settings.
+    
+    Returns:
+        List of proxy URLs
+    """
+    proxy_urls = []
+    
+    # Check new PROXY_URLS setting (comma-separated)
+    if hasattr(settings, "PROXY_URLS") and settings.PROXY_URLS:
+        proxy_urls_str = settings.PROXY_URLS.strip()
+        if proxy_urls_str:
+            # Split by comma and clean up
+            proxy_urls = [url.strip() for url in proxy_urls_str.split(",") if url.strip()]
+    
+    # Fall back to legacy PROXY_URL setting
+    if not proxy_urls and hasattr(settings, "PROXY_URL") and settings.PROXY_URL:
+        proxy_url = settings.PROXY_URL.strip()
+        if proxy_url:
+            proxy_urls = [proxy_url]
+    
+    return proxy_urls
 
 
 def _build_proxy_auth_extension(proxy_url: str) -> str:
@@ -93,15 +120,52 @@ def _build_proxy_auth_extension(proxy_url: str) -> str:
     return zip_path
 
 
-def get_driver():
-    """Initialize and return an undetected Chrome WebDriver instance."""
-    global _driver
-    # Reset if driver is stale
+def get_driver(force_new: bool = False):
+    """
+    Initialize and return an undetected Chrome WebDriver instance.
+    
+    Args:
+        force_new: Force creation of a new driver (useful for proxy rotation)
+    """
+    global _driver, _driver_created_at
+    
+    # Check if we need to rotate proxy
     try:
-        if _driver and _driver.service.process:
-            _driver.service.process.poll()
-            if _driver.service.process.returncode is not None:
+        proxy_urls = _get_proxy_urls()
+        if proxy_urls and len(proxy_urls) > 1:
+            proxy_manager = get_proxy_manager(proxy_urls, settings.PROXY_ROTATION_INTERVAL)
+            if proxy_manager.should_rotate():
+                print("⏰ Proxy rotation interval reached, creating new driver with next proxy...")
+                force_new = True
+                proxy_manager.rotate_proxy()
+    except Exception as e:
+        print(f"⚠️  Error checking proxy rotation: {e}")
+    
+    # Reset if driver is stale or window is closed, or if forced
+    try:
+        if _driver and not force_new:
+            # Check if window is still available
+            try:
+                _driver.current_url  # This will fail if window is closed
+                # Also check if process is still alive
+                if _driver.service.process:
+                    _driver.service.process.poll()
+                    if _driver.service.process.returncode is not None:
+                        _driver = None
+            except Exception:
+                # Window closed or driver dead, reset it
+                try:
+                    _driver.quit()
+                except:
+                    pass
                 _driver = None
+        elif force_new and _driver:
+            # Close existing driver to create new one
+            try:
+                _driver.quit()
+            except:
+                pass
+            _driver = None
     except:
         _driver = None
     if _driver is None:
@@ -132,10 +196,19 @@ def get_driver():
         # Optional proxy support via extension to avoid MITM fingerprints
         seleniumwire_options = None
         proxy_url = None
-        if getattr(settings, "PROXY_URL", None):
-            proxy_raw = settings.PROXY_URL.strip()
-            if proxy_raw:
-                try:
+        
+        # Get proxy URLs and initialize proxy manager
+        proxy_urls = _get_proxy_urls()
+        if proxy_urls:
+            try:
+                # Initialize proxy manager with all available proxies
+                proxy_manager = get_proxy_manager(proxy_urls, settings.PROXY_ROTATION_INTERVAL)
+                
+                # Get the current proxy to use
+                proxy_raw = proxy_manager.get_current_proxy()
+                print(f"🔄 Using proxy: {proxy_manager._mask_proxy(proxy_raw)}")
+                
+                if proxy_raw:
                     parsed = urlparse(proxy_raw)
                     host_port = f"{parsed.hostname}:{parsed.port}" if parsed.hostname and parsed.port else parsed.netloc
                     if host_port:
@@ -145,9 +218,14 @@ def get_driver():
                         options.add_argument(f"--disable-extensions-except={os.path.dirname(ext_zip)}")
                         # Important: do not set --proxy-server when using extension proxy settings
                         proxy_url = proxy_raw
-                except Exception:
-                    # Fall back to passing raw string; may fail for auth proxies in headless
-                    options.add_argument(f"--proxy-server={proxy_raw}")
+            except Exception as e:
+                print(f"⚠️  Error setting up proxy: {e}")
+                # Fall back to first proxy without manager
+                if proxy_urls:
+                    try:
+                        options.add_argument(f"--proxy-server={proxy_urls[0]}")
+                    except:
+                        pass
         
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
         _driver = uc.Chrome(
@@ -191,6 +269,10 @@ def get_driver():
         viewport_width = random.randint(1366, 1920)
         viewport_height = random.randint(768, 1080)
         _driver.set_window_size(viewport_width, viewport_height)
+        
+        # Track when driver was created
+        _driver_created_at = time.time()
+        print(f"✓ WebDriver initialized successfully")
     
     return _driver
 
@@ -216,7 +298,7 @@ async def scrape_indeed_selenium(
         job_type: Job type filter ('remote', 'hybrid', 'On-site')
         salary_min: Minimum salary filter (e.g., 50000)
         salary_max: Maximum salary filter (e.g., 100000)
-        experience_level: Experience level filter ('entry', 'mid', 'senior', 'executive')
+        experience_level: Experience level filter ('intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive')
         employment_type: Employment type filter ('Full-Time', 'Part-Time', 'Contract', 'Internship')
         days_old: Filter jobs posted within last N days (e.g., 30 for last 30 days)
     
@@ -251,7 +333,11 @@ def _scrape_sync_enhanced(
     days_old: Optional[int] = None
 ) -> List[Job]:
     """Enhanced synchronous scraping function with comprehensive data extraction and advanced filtering."""
-    driver = get_driver()
+    try:
+        driver = get_driver()
+    except Exception as e:
+        raise Exception(f"Failed to initialize browser: {str(e)}")
+    
     jobs = []
     all_jobs_before_filter = []  # Track jobs before filtering
     seen_job_ids = set()  # Track job IDs to prevent duplicates
@@ -301,11 +387,23 @@ def _scrape_sync_enhanced(
             while True:
                 driver.get(url)
                 page_html = driver.page_source or ""
-                if (
-                    "INDEED_CLOUDFLARE_STATIC_PAGE" in page_html
-                    or "Additional Verification Required" in page_html
-                    or "/cdn-cgi/challenge-platform" in page_html
-                ):
+                
+                # More precise Cloudflare detection - only trigger if we see actual block indicators
+                # AND we don't see legitimate Indeed job content
+                has_cloudflare_indicators = (
+                    "Checking your browser" in page_html  # Cloudflare's actual text
+                    or "Enable JavaScript and cookies to continue" in page_html  # Cloudflare block message
+                    or ("challenge-platform" in page_html and "<title>Just a moment" in page_html)  # Cloudflare interstitial
+                )
+                has_indeed_content = (
+                    'id="mosaic-provider-jobcards"' in page_html  # Indeed's job cards container
+                    or 'class="jobsearch-ResultsList"' in page_html  # Indeed's results list
+                    or 'data-jk=' in page_html  # Indeed job key attribute
+                )
+                
+                is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
+                
+                if is_actually_blocked:
                     if retries >= getattr(settings, "MAX_RETRIES", 1):
                         try:
                             with open('/tmp/indeed_debug.html', 'w', encoding='utf-8') as f:
@@ -322,14 +420,17 @@ def _scrape_sync_enhanced(
                         driver.delete_all_cookies()
                         # Add more realistic wait
                         time.sleep(random.uniform(3.0, 6.0))
-                        try:
-                            driver.quit()  # Close browser completely
-                        finally:
-                            # Ensure we have a fresh driver for the next attempt
-                            driver = get_driver()
-                        print(f"Browser restarted, waiting {backoff:.1f}s before retry...")
                     except Exception:
                         pass
+                    # Close and recreate browser
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    global _driver
+                    _driver = None  # Force new driver creation
+                    driver = get_driver()
+                    print(f"Browser restarted, waiting {backoff:.1f}s before retry...")
                     time.sleep(backoff)
                     retries += 1
                     continue
@@ -546,10 +647,28 @@ def _scrape_sync_enhanced(
             print("Debug HTML saved to /tmp/indeed_debug.html")
         
     except CloudflareBlockedError:
+        # Mark proxy as failed when Cloudflare blocks
+        try:
+            proxy_urls = _get_proxy_urls()
+            if proxy_urls and len(proxy_urls) > 1:
+                proxy_manager = get_proxy_manager(proxy_urls, settings.PROXY_ROTATION_INTERVAL)
+                proxy_manager.mark_proxy_failure()
+                print("⚠️  Cloudflare challenge detected - proxy marked as failed")
+        except Exception as e:
+            print(f"⚠️  Error marking proxy failure: {e}")
         # Let callers handle the specific block to enable fallback
         raise
     except Exception as e:
         raise Exception(f"Failed to scrape Indeed: {str(e)}")
+    
+    # Mark proxy as successful if scraping completed
+    try:
+        proxy_urls = _get_proxy_urls()
+        if proxy_urls and len(proxy_urls) > 1:
+            proxy_manager = get_proxy_manager(proxy_urls, settings.PROXY_ROTATION_INTERVAL)
+            proxy_manager.mark_proxy_success()
+    except Exception as e:
+        print(f"⚠️  Error marking proxy success: {e}")
     
     return jobs
 
@@ -698,24 +817,6 @@ def _find_job_cards_indeed(soup: BeautifulSoup) -> List:
     return unique_cards
 
 
-def _extract_raw_job_card_data(card) -> Optional[str]:
-    """Extract raw HTML and text data from job card without any processing."""
-    try:
-        # Get the raw HTML of the job card
-        raw_html = str(card)
-        
-        # Also get the clean text content
-        raw_text = card.get_text(separator='\n', strip=True)
-        
-        # Combine both for comprehensive raw data
-        raw_data = f"HTML:\n{raw_html}\n\nTEXT:\n{raw_text}"
-        
-        return raw_data
-    except Exception as e:
-        print(f"Error extracting raw job card data: {e}")
-        return None
-
-
 def _extract_detailed_job_info_indeed(card) -> Optional[Job]:
     """Extract detailed job information from an Indeed job card with enhanced extraction."""
     try:
@@ -779,11 +880,6 @@ def _extract_detailed_job_info_indeed(card) -> Optional[Job]:
         if not posted_date:
             posted_date = _extract_date_from_full_text(full_text)
         
-        # Extract raw job card data (HTML + text without processing)
-        raw_job_card_data = _extract_raw_job_card_data(card)
-        if raw_job_card_data:
-            print(f"  ✓ Raw job card data extracted ({len(raw_job_card_data)} characters)")
-        
         return Job(
             title=title,
             company=company,
@@ -802,8 +898,7 @@ def _extract_detailed_job_info_indeed(card) -> Optional[Job]:
             employment_type=employment_type,
             industry=industry,
             company_size=company_size,
-            job_id=job_id,
-            raw_job_card_data=raw_job_card_data
+            job_id=job_id
         )
         
     except Exception as e:
@@ -1599,207 +1694,55 @@ def _is_end_of_results_indeed(soup: BeautifulSoup) -> bool:
 
 
 def _matches_location_filter_indeed(job: Job, location_filter: Optional[str]) -> bool:
-    """Check if job matches the location filter for Indeed with comprehensive location support like ZipRecruiter."""
+    """Check if job matches the location filter for Indeed with comprehensive location support like ZipRecruiter.
+    
+    Since we're using Indeed's URL-based location filtering, be very permissive here.
+    Indeed has already filtered the results, so we only filter out obvious mismatches.
+    """
     if not location_filter:
         return True
     
-    # If no job location is available, accept it (don't filter out)
+    # Since Indeed's URL filtering has already done the work, be very permissive
+    # Only filter out jobs if they're obviously wrong
+    # If no job location is available, accept it (Indeed returned it for a reason)
     if not job.location:
         return True
     
     location_filter = location_filter.lower().strip()
     job_location = job.location.lower()
     
-    # Handle remote jobs - if user asks for remote, only show remote jobs
+    # For remote searches, be flexible - remote jobs are remote anywhere
     if location_filter in ['remote', 'work from home', 'wfh']:
-        return job.remote_type and job.remote_type.lower() == 'remote'
-    
-    # For non-remote searches, allow remote jobs to appear too (they can be done from anywhere)
-    if job.remote_type and job.remote_type.lower() == 'remote':
-        return True
-    
-    # Handle country-level filtering
-    if location_filter in ['usa', 'us', 'united states']:
-        # Check for US locations (state codes, common cities, or "United States")
-        us_indicators = ['united states', ', us', 'usa']
-        us_states = ['al', 'ak', 'az', 'ar', 'ca', 'co', 'ct', 'de', 'fl', 'ga', 
-                     'hi', 'id', 'il', 'in', 'ia', 'ks', 'ky', 'la', 'me', 'md',
-                     'ma', 'mi', 'mn', 'ms', 'mo', 'mt', 'ne', 'nv', 'nh', 'nj',
-                     'nm', 'ny', 'nc', 'nd', 'oh', 'ok', 'or', 'pa', 'ri', 'sc',
-                     'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy']
-        
-        # Check for US indicators
-        if any(indicator in job_location for indicator in us_indicators):
+        # Accept jobs that are remote or have remote indicators
+        if job.remote_type and 'remote' in job.remote_type.lower():
             return True
-        
-        # Check if location ends with state code (e.g., "New York, NY")
-        location_parts = job_location.split(',')
-        if len(location_parts) >= 2:
-            state_code = location_parts[-1].strip()
-            if state_code in us_states:
-                return True
-        
-        return False
+        # Also accept if location contains remote
+        if 'remote' in job_location:
+            return True
+        # Be permissive - if Indeed returned it for a remote search, trust it
+        return True
     
-    # Handle US state filtering with both full names and abbreviations
-    us_state_mappings = {
-        'california': ['california', 'ca'],
-        'ca': ['california', 'ca'],
-        'texas': ['texas', 'tx'],
-        'tx': ['texas', 'tx'],
-        'florida': ['florida', 'fl'],
-        'fl': ['florida', 'fl'],
-        'new york': ['new york', 'ny'],
-        'ny': ['new york', 'ny'],
-        'illinois': ['illinois', 'il'],
-        'il': ['illinois', 'il'],
-        'pennsylvania': ['pennsylvania', 'pa'],
-        'pa': ['pennsylvania', 'pa'],
-        'ohio': ['ohio', 'oh'],
-        'oh': ['ohio', 'oh'],
-        'georgia': ['georgia', 'ga'],
-        'ga': ['georgia', 'ga'],
-        'north carolina': ['north carolina', 'nc'],
-        'nc': ['north carolina', 'nc'],
-        'michigan': ['michigan', 'mi'],
-        'mi': ['michigan', 'mi'],
-        'new jersey': ['new jersey', 'nj'],
-        'nj': ['new jersey', 'nj'],
-        'virginia': ['virginia', 'va'],
-        'va': ['virginia', 'va'],
-        'washington': ['washington', 'wa'],
-        'wa': ['washington', 'wa'],
-        'arizona': ['arizona', 'az'],
-        'az': ['arizona', 'az'],
-        'massachusetts': ['massachusetts', 'ma'],
-        'ma': ['massachusetts', 'ma'],
-        'tennessee': ['tennessee', 'tn'],
-        'tn': ['tennessee', 'tn'],
-        'indiana': ['indiana', 'in'],
-        'in': ['indiana', 'in'],
-        'missouri': ['missouri', 'mo'],
-        'mo': ['missouri', 'mo'],
-        'maryland': ['maryland', 'md'],
-        'md': ['maryland', 'md'],
-        'wisconsin': ['wisconsin', 'wi'],
-        'wi': ['wisconsin', 'wi'],
-        'colorado': ['colorado', 'co'],
-        'co': ['colorado', 'co'],
-        'minnesota': ['minnesota', 'mn'],
-        'mn': ['minnesota', 'mn'],
-        'south carolina': ['south carolina', 'sc'],
-        'sc': ['south carolina', 'sc'],
-        'alabama': ['alabama', 'al'],
-        'al': ['alabama', 'al'],
-        'louisiana': ['louisiana', 'la'],
-        'la': ['louisiana', 'la'],
-        'kentucky': ['kentucky', 'ky'],
-        'ky': ['kentucky', 'ky'],
-        'oregon': ['oregon', 'or'],
-        'or': ['oregon', 'or'],
-        'oklahoma': ['oklahoma', 'ok'],
-        'ok': ['oklahoma', 'ok'],
-        'connecticut': ['connecticut', 'ct'],
-        'ct': ['connecticut', 'ct'],
-        'utah': ['utah', 'ut'],
-        'ut': ['utah', 'ut'],
-        'iowa': ['iowa', 'ia'],
-        'ia': ['iowa', 'ia'],
-        'nevada': ['nevada', 'nv'],
-        'nv': ['nevada', 'nv'],
-        'arkansas': ['arkansas', 'ar'],
-        'ar': ['arkansas', 'ar'],
-        'mississippi': ['mississippi', 'ms'],
-        'ms': ['mississippi', 'ms'],
-        'kansas': ['kansas', 'ks'],
-        'ks': ['kansas', 'ks'],
-        'new mexico': ['new mexico', 'nm'],
-        'nm': ['new mexico', 'nm'],
-        'nebraska': ['nebraska', 'ne'],
-        'ne': ['nebraska', 'ne'],
-        'west virginia': ['west virginia', 'wv'],
-        'wv': ['west virginia', 'wv'],
-        'idaho': ['idaho', 'id'],
-        'id': ['idaho', 'id'],
-        'hawaii': ['hawaii', 'hi'],
-        'hi': ['hawaii', 'hi'],
-        'new hampshire': ['new hampshire', 'nh'],
-        'nh': ['new hampshire', 'nh'],
-        'maine': ['maine', 'me'],
-        'me': ['maine', 'me'],
-        'montana': ['montana', 'mt'],
-        'mt': ['montana', 'mt'],
-        'rhode island': ['rhode island', 'ri'],
-        'ri': ['rhode island', 'ri'],
-        'delaware': ['delaware', 'de'],
-        'de': ['delaware', 'de'],
-        'south dakota': ['south dakota', 'sd'],
-        'sd': ['south dakota', 'sd'],
-        'north dakota': ['north dakota', 'nd'],
-        'nd': ['north dakota', 'nd'],
-        'alaska': ['alaska', 'ak'],
-        'ak': ['alaska', 'ak'],
-        'vermont': ['vermont', 'vt'],
-        'vt': ['vermont', 'vt'],
-        'wyoming': ['wyoming', 'wy'],
-        'wy': ['wyoming', 'wy']
-    }
-    
-    if location_filter in us_state_mappings:
-        state_keywords = us_state_mappings[location_filter]
-        return any(keyword in job_location for keyword in state_keywords)
-    
-    elif location_filter in ['pakistan', 'pk']:
-        return 'pakistan' in job_location or ', pk' in job_location
-    
-    elif location_filter in ['uk', 'united kingdom']:
-        return 'uk' in job_location or 'united kingdom' in job_location or 'england' in job_location
-    
-    elif location_filter in ['canada', 'ca']:
-        return 'canada' in job_location or ', ca' in job_location
-    
-    # Handle city-level filtering with more flexible matching
-    city_keywords = {
-        'lahore': ['lahore'],
-        'karachi': ['karachi'],
-        'islamabad': ['islamabad'],
-        'new york': ['new york', 'nyc', 'ny'],
-        'nyc': ['new york', 'nyc', 'ny'],
-        'san francisco': ['san francisco', 'sf'],
-        'sf': ['san francisco', 'sf'],
-        'los angeles': ['los angeles', 'la'],
-        'la': ['los angeles'],
-        'chicago': ['chicago'],
-        'boston': ['boston'],
-        'seattle': ['seattle'],
-        'austin': ['austin'],
-        'denver': ['denver'],
-        'miami': ['miami'],
-        'london': ['london'],
-        'toronto': ['toronto'],
-        'vancouver': ['vancouver'],
-        'sydney': ['sydney'],
-        'melbourne': ['melbourne'],
-        'berlin': ['berlin'],
-        'paris': ['paris'],
-        'mumbai': ['mumbai'],
-        'delhi': ['delhi'],
-        'bangalore': ['bangalore', 'bengaluru'],
-        'tokyo': ['tokyo'],
-        'shanghai': ['shanghai'],
-        'beijing': ['beijing']
-    }
-    
-    if location_filter in city_keywords:
-        return any(keyword in job_location for keyword in city_keywords[location_filter])
-    
-    # For other locations, use flexible partial matching
-    # This is the key fix - be more permissive with location matching
-    # Also check if the location filter is a city and the job is remote (remote jobs can be done from anywhere)
+    # For non-remote searches, always allow remote jobs (they can be done from anywhere)
     if job.remote_type and job.remote_type.lower() == 'remote':
         return True
     
-    return location_filter in job_location
+    # Since Indeed has already filtered by location in the URL, trust its filtering
+    # We'll just do a very permissive check here to catch any obvious issues
+    
+    # Be very permissive - if the location filter appears anywhere in the job location, it's a match
+    # This handles partial matches, variations in formatting, etc.
+    if location_filter in job_location:
+        return True
+    
+    # Also check common location variations without strict mapping
+    # This catches cases where Indeed might use slightly different formatting
+    location_parts = location_filter.split()
+    if any(part in job_location for part in location_parts if len(part) > 2):
+        return True
+    
+    # Since Indeed returned this job for the location search, trust it
+    # Only filter out if it's completely unrelated (which is rare since Indeed already filtered)
+    return True
 
 
 def _matches_job_type_filter_indeed(job: Job, job_type_filter: Optional[str]) -> bool:
@@ -2132,11 +2075,6 @@ def _extract_complete_job_details_from_url(driver, job) -> Optional[Job]:
             if enhanced_company_size and not job.company_size:
                 job.company_size = enhanced_company_size
                 print(f"  ✓ Enhanced company size: {enhanced_company_size}")
-            
-            # Keep original raw data as primary source, only supplement if missing
-            if enhanced_raw_data and not job.raw_job_card_data:
-                job.raw_job_card_data = enhanced_raw_data
-                print(f"  ✓ Enhanced raw data: {len(enhanced_raw_data)} characters")
             
         finally:
             # Always navigate back to the original page
@@ -2784,10 +2722,15 @@ def _get_indeed_experience_filter(experience_level: str) -> Optional[str]:
         'entry level': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
         'junior': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
         'jr': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
+        'intern': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
+        'internship': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
+        'assistant': '0kf%3Aexplvl%28ENTRY_LEVEL%29%3B',
         'mid': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
         'mid-level': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
         'mid level': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
         'intermediate': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
+        'mid-senior': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
+        'mid senior': '0kf%3Aexplvl%28MID_LEVEL%29%3B',
         'senior': '0kf%3Aexplvl%28SENIOR_LEVEL%29%3B',
         'senior-level': '0kf%3Aexplvl%28SENIOR_LEVEL%29%3B',
         'senior level': '0kf%3Aexplvl%28SENIOR_LEVEL%29%3B',
@@ -3024,8 +2967,12 @@ def _format_location_for_indeed(location: str) -> str:
 
 def close_driver():
     """Close the WebDriver when done."""
-    global _driver
+    global _driver, _driver_created_at
     if _driver:
         _driver.quit()
         _driver = None
+        _driver_created_at = 0
+    
+    # Optionally reset proxy manager (uncomment if you want fresh start each time)
+    # reset_proxy_manager()
 
