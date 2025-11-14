@@ -1,0 +1,222 @@
+{
+  "test_date": "2025-11-07T22:02:13.459179",
+  "total_urls": 8,
+  "successful": 7,
+  "failed": 1,
+  "total_jobs_found": 27,
+  "average_time_seconds": 18.7,
+  "results": [
+    {
+      "url": "https://www.burton.com/us/en/careers",
+      "success": true,
+      "count": 10,
+      "elapsed_seconds": 16.9,
+      "jobs": [
+        {
+          "title": "VIEW ALL JOBS",
+          "company": "Burton",
+          "location": null,
+          "url": "https://dayforcehcm.com/CandidatePortal/en-US/burton/SITE/BURTONCOMCAREERS/?preview=scale-300%3a%23bcbec0%3balert%3a%23ff5500%3bscale%3a%23393839%3bscale-600%3a%23ffffff%3bscale-100%3a%234d4d4f%3bsecondary%3a%230022cc%3bscale-400%3a%23e2e3e4%3bsuccess%3a%2300c63c%3berror%3a%23eb0000%3baccent%3a%230022cc%3bscale-500%3a%23f1f1f2%3blight%3a%23ffffff%3bscale-200%3a%23747679%3battention%3a%23ffd652%3bprimary%3a%23000000",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "WORKING INJAPAN",
+          "company": "Burton",
+          "location": null,
+          "url": "https://dayforcehcm.com/CandidatePortal/ja-JP/burton/Site/BURTONCOMCAREERSJPN",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "WORKING INAUSTRALIA ANDNEW ZEALAND",
+          "company": "Burton",
+          "location": null,
+          "url": "https://dayforcehcm.com/CandidatePortal/en-US/burton/SITE/BURTONCOMCAREERSOZ",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "WORKING INTHE AMERICAS",
+          "company": "Burton",
+          "location": null,
+          "url": "https://www.burton.com/us/en/content/careers.html",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "WORKING INEUROPE",
+          "company": "Burton",
+          "location": null,
+          "url": "https://www.burton.com/us/en/content/careers-europe.html",
+          "remote_type": null,
+          "employment_type": null
+        }
+      ]
+    },
+    {
+      "url": "https://skida.com/pages/careers",
+      "success": true,
+      "count": 2,
+      "elapsed_seconds": 20.1,
+      "jobs": [
+        {
+          "title": "Current Open Positions",
+          "company": "Skida",
+          "location": null,
+          "url": "https://skida.com/pages/careers#category-template--20814671478807__16466728915d8698ff-8a730af1-d483-49ed-83ec-871094cf3257",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Careers",
+          "company": "Skida",
+          "location": null,
+          "url": "https://skida.com/pages/careers",
+          "remote_type": null,
+          "employment_type": null
+        }
+      ]
+    },
+    {
+      "url": "https://thujasocks.com/pages/careers",
+      "success": false,
+      "error": "Message: unknown error: net::ERR_NAME_NOT_RESOLVED\n  (Session info: chrome=141.0.7390.123)\nStacktrace:\n0   chromedriver                        0x0000000106f42108 chromedriver + 6119688\n1   chromedriver                        0x0000000106f3980a chromedriver + 6084618\n2   chromedriver                        0x00000001069d51a6 chromedriver + 430502\n3   chromedriver                        0x00000001069cbe06 chromedriver + 392710\n4   chromedriver                        0x00000001069bd128 chromedriver + 332072\n5   chromedriver                        0x00000001069beefb chromedriver + 339707\n6   chromedriver                        0x00000001069bd68d chromedriver + 333453\n7   chromedriver                        0x00000001069bce96 chromedriver + 331414\n8   chromedriver                        0x00000001069bcbb9 chromedriver + 330681\n9   chromedriver                        0x00000001069baa24 chromedriver + 322084\n10  chromedriver                        0x00000001069bb1ea chromedriver + 324074\n11  chromedriver                        0x00000001069d8739 chromedriver + 444217\n12  chromedriver                        0x0000000106a75fb5 chromedriver + 1089461\n13  chromedriver                        0x0000000106a4de02 chromedriver + 925186\n14  chromedriver                        0x0000000106a75378 chromedriver + 1086328\n15  chromedriver                        0x0000000106a4dbd3 chromedriver + 924627\n16  chromedriver                        0x0000000106a19c0b chromedriver + 711691\n17  chromedriver                        0x0000000106a1a8d1 chromedriver + 714961\n18  chromedriver                        0x0000000106eff5d0 chromedriver + 5846480\n19  chromedriver                        0x0000000106f03865 chromedriver + 5863525\n20  chromedriver                        0x0000000106edada7 chromedriver + 5696935\n21  chromedriver                        0x0000000106f042ff chromedriver + 5866239\n22  chromedriver                        0x0000000106eca204 chromedriver + 5628420\n23  chromedriver                        0x0000000106f26828 chromedriver + 6006824\n24  chromedriver                        0x0000000106f269ed chromedriver + 6007277\n25  chromedriver                        0x0000000106f393e1 chromedriver + 6083553\n26  libsystem_pthread.dylib             0x00007ff80a74c4e1 _pthread_start + 125\n27  libsystem_pthread.dylib             0x00007ff80a747f6b thread_start + 15\n",
+      "elapsed_seconds": 4.1
+    },
+    {
+      "url": "https://darntough.com/pages/careers",
+      "success": true,
+      "count": 6,
+      "elapsed_seconds": 27.0,
+      "jobs": [
+        {
+          "title": "Log in",
+          "company": "Darntough",
+          "location": null,
+          "url": "https://darntough.com/account/login?return_url=/pages/careers",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Log in",
+          "company": "Darntough",
+          "location": null,
+          "url": "https://darntough.com/account/login?return_url=/pages/careers ",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "View Open Positions",
+          "company": "Darntough",
+          "location": null,
+          "url": "https://recruiting.ultipro.com/DAR1003DATO/JobBoard/66d85f55-29c5-444b-b382-ef6ae0d6e4af",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "careers@cabothosierymills.com",
+          "company": "Darntough",
+          "location": null,
+          "url": "mailto:careers@cabothosierymills.com",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "View Open Positions",
+          "company": "Darntough",
+          "location": null,
+          "url": "https://recruiting.ultipro.com/DAR1003DATO/JobBoard/66d85f55-29c5-444b-b382-ef6ae0d6e4af",
+          "remote_type": null,
+          "employment_type": null
+        }
+      ]
+    },
+    {
+      "url": "https://www.turtlefur.com/pages/careers",
+      "success": true,
+      "count": 0,
+      "elapsed_seconds": 21.4,
+      "jobs": []
+    },
+    {
+      "url": "https://vermontglove.com/pages/careers",
+      "success": true,
+      "count": 0,
+      "elapsed_seconds": 16.3,
+      "jobs": []
+    },
+    {
+      "url": "https://orvis.com/pages/careers",
+      "success": true,
+      "count": 2,
+      "elapsed_seconds": 26.4,
+      "jobs": [
+        {
+          "title": "Thanks for Visiting our Career SiteEnjoy 15% off your first order atorvis.com!Sign Up Here",
+          "company": "Orvis",
+          "location": null,
+          "url": "https://orvis.com",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Career OpportunitiesRetail Sales Associate \u2013 Seasonal\u2013Charlotte, NCAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outd...Retail Sales Associate \u2013 Seasonal\u2013Huntersville, NCAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outd...Retail Sales Associate \u2013 Seasonal\u2013Leesburg, VAAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outd...Outlet Sales Associate \u2013 Seasonal\u2013Dawsonville, GAAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the out...Retail Sales Associate \u2013 Seasonal\u2013Virginia Beach, VAAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outd...Retail Sales Associate \u2013 Seasonal\u2013Atlanta, GAAt Orvis, our Sales Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outd...Retail Associate \u2013 Seasonal Stock Person\u2013New York, NYAt Orvis, our Associates are front line Retail Guides\u2014inspiring, outfitting, and guiding customers on their outdoor adventures.\n\u00a0\nWe are Seeking a dynamic Retail Guide who appreciates the outdoor li...123\u202610>>",
+          "company": "Orvis",
+          "location": "Charlotte, NC",
+          "url": "https://orvisjobs.com/retail-sales-associate-seasonal-27/",
+          "remote_type": null,
+          "employment_type": null
+        }
+      ]
+    },
+    {
+      "url": "https://www.concept2.com/company/employment",
+      "success": true,
+      "count": 7,
+      "elapsed_seconds": 17.1,
+      "jobs": [
+        {
+          "title": "Products",
+          "company": "Concept2",
+          "location": null,
+          "url": "https://www.concept2.com/careers",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Community",
+          "company": "Concept2",
+          "location": null,
+          "url": "https://www.concept2.com/careers",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Training",
+          "company": "Concept2",
+          "location": null,
+          "url": "https://www.concept2.com/careers",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Support",
+          "company": "Concept2",
+          "location": null,
+          "url": "https://www.concept2.com/careers",
+          "remote_type": null,
+          "employment_type": null
+        },
+        {
+          "title": "Commercial & GSA",
+          "company": "Concept2",
+          "location": null,
+          "url": "https://www.concept2.com/careers",
+          "remote_type": null,
+          "employment_type": null
+        }
+      ]
+    }
+  ]
+}

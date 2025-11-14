@@ -1,14 +1,22 @@
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Body
 from typing import List, Optional
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
 from app.services.indeed_selenium_service import scrape_indeed_selenium, CloudflareBlockedError # pylint: disable=import-error
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
+from app.services.generic_career_scraper import scrape_generic_career_page # pylint: disable=import-error
 from app.core.caching import get_cache, set_cache # pylint: disable=import-error
+from pydantic import BaseModel
 
 router = APIRouter()
+
+
+class CareerPageRequest(BaseModel):
+    url: str
+    max_results: Optional[int] = 20
+    search_query: Optional[str] = None
 
 
 @router.get("/jobs", response_model=List[Job])
@@ -189,6 +197,95 @@ async def get_ziprecruiter_enhanced_jobs(
         jobs = await scrape_ziprecruiter_enhanced(query, location, max_results, job_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
+
+
+@router.post("/jobs/scrape-url", response_model=List[Job])
+async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
+    """
+    Scrape jobs from any company career page URL
+    
+    This endpoint accepts any career page URL and attempts to extract job listings from it.
+    Works with various career page formats and structures.
+    
+    Example URLs:
+    - https://www.burton.com/us/en/careers
+    - https://skida.com/pages/careers
+    - https://thujasocks.com/pages/careers
+    - https://darntough.com/pages/careers
+    - https://www.turtlefur.com/pages/careers
+    - https://vermontglove.com/pages/careers
+    - https://orvis.com/pages/careers
+    - https://www.concept2.com/company/employment
+    
+    Request Body:
+    {
+        "url": "https://example.com/careers",
+        "max_results": 20,
+        "search_query": "software engineer" (optional)
+    }
+    
+    Features:
+    - Automatically follows job board links (Greenhouse, Lever, Dayforce, etc.)
+    - Extracts actual job titles from job boards
+    - Optional search_query to filter jobs by keyword
+    
+    Returns:
+    - List of Job objects with actual job titles, company, location, description, etc.
+    """
+    cache_key = f"generic_career:{request.url}:{request.max_results}:{request.search_query}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error scraping {request.url}: {str(e)}")
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
+
+
+@router.get("/jobs/scrape-url-get", response_model=List[Job])
+async def scrape_career_page_url_get(
+    url: str = Query(..., description="Career page URL to scrape"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+    search_query: Optional[str] = Query(None, description="Search/filter jobs by keyword (e.g., 'software engineer', 'sales')")
+):
+    """
+    Scrape jobs from any company career page URL (GET method for easy testing)
+    
+    ⭐ ENHANCED: Now follows job board links and extracts actual job titles!
+    
+    This endpoint:
+    - Automatically follows links to job boards (Greenhouse, Lever, Dayforce, etc.)
+    - Extracts actual job titles instead of just navigation links
+    - Supports search/filtering by keyword
+    
+    Example usage:
+    /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers&max_results=20
+    /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers&search_query=designer
+    
+    Parameters:
+    - url: Career page URL to scrape
+    - max_results: Maximum number of results (default: 20)
+    - search_query: Optional keyword to filter jobs (searches in title, description, location)
+    
+    Returns:
+    - List of Job objects with actual job titles, company, location, description, etc.
+    """
+    cache_key = f"generic_career:{url}:{max_results}:{search_query}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_generic_career_page(url, max_results, search_query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error scraping {url}: {str(e)}")
 
     await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
