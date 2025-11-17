@@ -9,6 +9,7 @@ python-dotenv==1.0.1
 setuptools>=65.0.0
 
 selenium==4.27.1
+webdriver-manager==4.0.2
 undetected-chromedriver==3.5.5
 selenium-stealth==1.0.6
 
