@@ -36,6 +36,24 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 
+def get_chromedriver_path() -> Optional[str]:
+    """Get ChromeDriver executable path based on environment."""
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path and os.path.exists(chromedriver_path):
+        return chromedriver_path
+    
+    paths = [
+        "/usr/local/bin/chromedriver",
+        "/usr/bin/chromedriver",
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
+
+
 def get_driver():
     """Initialize and return an undetected Chrome WebDriver instance."""
     global _driver
@@ -73,9 +91,10 @@ def get_driver():
         
         # Initialize undetected chromedriver
         chrome_path = get_chrome_executable_path()
+        chromedriver_path = get_chromedriver_path()
         _driver = uc.Chrome(
             options=options,
-            driver_executable_path=None,
+            driver_executable_path=chromedriver_path,
             browser_executable_path=chrome_path,
             use_subprocess=True,
             version_main=None

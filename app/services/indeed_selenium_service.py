@@ -65,6 +65,31 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 
+def get_chromedriver_path() -> Optional[str]:
+    """
+    Get ChromeDriver executable path based on environment.
+    Checks CHROMEDRIVER_PATH env var first, then common installation paths.
+    """
+    # Check environment variable first (set in Dockerfile)
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path and os.path.exists(chromedriver_path):
+        return chromedriver_path
+    
+    # Common paths
+    paths = [
+        "/usr/local/bin/chromedriver",  # Dockerfile installation
+        "/usr/bin/chromedriver",
+        "/usr/local/share/chromedriver",
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    
+    # If not found, return None and let undetected-chromedriver download it
+    return None
+
+
 class CloudflareBlockedError(Exception):
     """Raised when Indeed returns a Cloudflare/turnstile block page."""
     pass
@@ -289,12 +314,13 @@ def get_driver(force_new: bool = False):
         
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
         chrome_path = get_chrome_executable_path()
+        chromedriver_path = get_chromedriver_path()
         _driver = uc.Chrome(
             options=options,
-            driver_executable_path=None,
+            driver_executable_path=chromedriver_path,
             browser_executable_path=chrome_path,
             use_subprocess=True,
-            version_main=141
+            version_main=None  # Let it auto-detect version
         )
         
         # Additional stealth measures - hide webdriver property
