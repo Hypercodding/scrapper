@@ -6,7 +6,7 @@ from app.core.config import settings # pylint: disable=import-error
 from app.services.indeed_selenium_service import scrape_indeed_selenium, CloudflareBlockedError # pylint: disable=import-error
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
-from app.services.generic_career_scraper import scrape_generic_career_page # pylint: disable=import-error
+from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
 from app.core.caching import get_cache, set_cache # pylint: disable=import-error
 from pydantic import BaseModel
 
@@ -17,6 +17,13 @@ class CareerPageRequest(BaseModel):
     url: str
     max_results: Optional[int] = 20
     search_query: Optional[str] = None
+
+
+class MultipleCareerPagesRequest(BaseModel):
+    urls: List[str]
+    max_results_per_url: Optional[int] = 20
+    search_query: Optional[str] = None
+    total_max_results: Optional[int] = None
 
 
 @router.get("/jobs", response_model=List[Job])
@@ -286,6 +293,59 @@ async def scrape_career_page_url_get(
         jobs = await scrape_generic_career_page(url, max_results, search_query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping {url}: {str(e)}")
+
+    await set_cache(cache_key, jobs, settings.CACHE_TTL)
+    return jobs
+
+
+@router.post("/jobs/scrape-multiple-urls", response_model=List[Job])
+async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequest = Body(...)):
+    """
+    Scrape jobs from multiple company career page URLs in one request
+    
+    This endpoint accepts multiple career page URLs and extracts job listings from all of them.
+    Results are combined and deduplicated.
+    
+    Request Body:
+    {
+        "urls": [
+            "https://company1.com/careers",
+            "https://company2.com/careers",
+            "https://company3.com/careers"
+        ],
+        "max_results_per_url": 20,
+        "search_query": "software engineer",  // optional
+        "total_max_results": 50  // optional - limits total results across all URLs
+    }
+    
+    Features:
+    - Scrapes multiple career pages in sequence
+    - Automatic deduplication of jobs across URLs
+    - Progress tracking and error handling per URL
+    - Optional total result limit across all URLs
+    - Failed URLs don't stop processing of other URLs
+    - Optional search_query to filter jobs by keyword
+    
+    Returns:
+    - Combined and deduplicated list of Job objects from all URLs
+    - Jobs are deduplicated based on title + company
+    """
+    # Create cache key from sorted URLs
+    urls_key = ":".join(sorted(request.urls))
+    cache_key = f"generic_career_multi:{urls_key}:{request.max_results_per_url}:{request.search_query}:{request.total_max_results}"
+    cached = await get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        jobs = await scrape_multiple_career_pages(
+            urls=request.urls,
+            max_results_per_url=request.max_results_per_url,
+            search_query=request.search_query,
+            total_max_results=request.total_max_results
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error scraping multiple URLs: {str(e)}")
 
     await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
