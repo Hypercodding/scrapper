@@ -3,6 +3,7 @@ import asyncio
 import random
 import re
 import json
+import os
 from typing import Optional, List, Dict, Any
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -15,6 +16,26 @@ from app.core.config import settings
 _last_fetch = 0
 _request_lock = asyncio.Lock()
 _driver = None
+
+
+def get_chrome_executable_path() -> Optional[str]:
+    """Get Chrome executable path based on environment."""
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin and os.path.exists(chrome_bin):
+        return chrome_bin
+    
+    # Common paths
+    paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
 
 
 def get_driver():
@@ -33,10 +54,11 @@ def get_driver():
         options.add_argument("--disable-blink-features=AutomationControlled")
         
         # Initialize undetected chromedriver
+        chrome_path = get_chrome_executable_path()
         _driver = uc.Chrome(
             options=options,
             driver_executable_path=None,
-            browser_executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            browser_executable_path=chrome_path,
             use_subprocess=True,
             version_main=None
         )

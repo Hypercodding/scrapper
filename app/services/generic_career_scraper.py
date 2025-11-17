@@ -16,6 +16,7 @@ import json
 import random
 import time
 import logging
+import os
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from selenium import webdriver
@@ -134,6 +135,46 @@ DATE_PATTERNS = [
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
+
+def get_chrome_executable_path() -> Optional[str]:
+    """
+    Get Chrome executable path based on environment.
+    Checks CHROME_BIN env var first, then common installation paths.
+    """
+    # Check environment variable first (set in Dockerfile)
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin and os.path.exists(chrome_bin):
+        return chrome_bin
+    
+    # Common Linux paths
+    linux_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    
+    # Common macOS paths
+    mac_paths = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    
+    # Common Windows paths
+    windows_paths = [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    ]
+    
+    # Check all paths
+    all_paths = linux_paths + mac_paths + windows_paths
+    for path in all_paths:
+        if os.path.exists(path):
+            return path
+    
+    # If not found, return None and let undetected-chromedriver find it
+    return None
+
 
 def get_random_user_agent() -> str:
     """Return a random user agent"""
@@ -1349,9 +1390,13 @@ async def scrape_with_selenium(
         # Use undetected-chromedriver for anti-bot protection
         if use_undetected:
             print("Using undetected-chromedriver for anti-bot protection")
-            driver = uc.Chrome(options=chrome_options)
+            chrome_path = get_chrome_executable_path()
+            driver = uc.Chrome(options=chrome_options, browser_executable_path=chrome_path)
         else:
             service = Service(ChromeDriverManager().install())
+            chrome_path = get_chrome_executable_path()
+            if chrome_path:
+                chrome_options.binary_location = chrome_path
             driver = webdriver.Chrome(service=service, options=chrome_options)
         
         print(f"Loading career page: {url}")

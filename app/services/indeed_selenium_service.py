@@ -25,6 +25,46 @@ _driver = None
 _driver_created_at = 0  # Track when driver was created for rotation
 
 
+def get_chrome_executable_path() -> Optional[str]:
+    """
+    Get Chrome executable path based on environment.
+    Checks CHROME_BIN env var first, then common installation paths.
+    """
+    # Check environment variable first (set in Dockerfile)
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin and os.path.exists(chrome_bin):
+        return chrome_bin
+    
+    # Common Linux paths
+    linux_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    
+    # Common macOS paths
+    mac_paths = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    
+    # Common Windows paths (for completeness)
+    windows_paths = [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    ]
+    
+    # Check all paths
+    all_paths = linux_paths + mac_paths + windows_paths
+    for path in all_paths:
+        if os.path.exists(path):
+            return path
+    
+    # If not found, return None and let undetected-chromedriver find it
+    return None
+
+
 class CloudflareBlockedError(Exception):
     """Raised when Indeed returns a Cloudflare/turnstile block page."""
     pass
@@ -228,10 +268,11 @@ def get_driver(force_new: bool = False):
                         pass
         
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
+        chrome_path = get_chrome_executable_path()
         _driver = uc.Chrome(
             options=options,
             driver_executable_path=None,
-            browser_executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            browser_executable_path=chrome_path,
             use_subprocess=True,
             version_main=141
         )
