@@ -4,7 +4,7 @@ FROM python:3.13-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for Chrome and Selenium
+# Install system dependencies for Chrome, Selenium, and Python packages
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -30,6 +30,10 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     libu2f-udev \
     libvulkan1 \
+    build-essential \
+    gcc \
+    libxml2-dev \
+    libxslt1-dev \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
