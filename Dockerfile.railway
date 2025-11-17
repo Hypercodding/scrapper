@@ -79,4 +79,4 @@ ENV CHROME_BIN=/usr/bin/google-chrome \
 
 EXPOSE $PORT
 
-CMD ["/start.sh"]
+CMD ["/bin/bash", "/start.sh"]
