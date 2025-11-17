@@ -66,6 +66,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY app ./app
 
+# Copy startup script
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
 # Environment
 ENV CHROME_BIN=/usr/bin/google-chrome \
     CHROMEDRIVER_PATH=/usr/local/bin/chromedriver \
@@ -75,4 +79,4 @@ ENV CHROME_BIN=/usr/bin/google-chrome \
 
 EXPOSE $PORT
 
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD ["/start.sh"]
