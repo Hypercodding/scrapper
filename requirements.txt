@@ -6,9 +6,12 @@ lxml==5.1.0
 pydantic==2.9.2
 pydantic-settings==2.0.3
 python-dotenv==1.0.1
+
 selenium==4.27.1
-webdriver-manager==4.0.2
 undetected-chromedriver==3.5.5
 selenium-stealth==1.0.6
+
+# Optional: network interception
 selenium-wire>=5,<6
+
 blinker<1.8
