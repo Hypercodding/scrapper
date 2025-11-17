@@ -42,14 +42,34 @@ def get_driver():
     if _driver is None:
         options = uc.ChromeOptions()
         
-        # Add necessary arguments
+        # Add necessary arguments for containerized environments
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
         options.add_argument(f"user-agent={settings.USER_AGENT}")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--start-maximized")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument("--remote-debugging-address=0.0.0.0")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-breakpad")
+        options.add_argument("--disable-client-side-phishing-detection")
+        options.add_argument("--disable-default-apps")
+        options.add_argument("--disable-hang-monitor")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-prompt-on-repost")
+        options.add_argument("--disable-sync")
+        options.add_argument("--metrics-recording-only")
+        options.add_argument("--no-first-run")
+        options.add_argument("--safebrowsing-disable-auto-update")
+        options.add_argument("--password-store=basic")
         
         # Initialize undetected chromedriver
         chrome_path = get_chrome_executable_path()
