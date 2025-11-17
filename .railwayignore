@@ -1,0 +1,55 @@
+# Railway ignore file - files to exclude from deployment
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+test_*.py
+*_test.py
+test_report.json
+
+# Documentation (optional - uncomment if you want to exclude)
+# *.md
+# !README.md
+
+# Environment files (should use Railway env vars instead)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Azure Functions (not needed for Railway)
+azure_fn/
+
+# Scripts (optional - uncomment if not needed)
+# *.sh
+# run.sh
+
+# Debug files
+debug_*.py
+quick_test.py
+

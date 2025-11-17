@@ -9,4 +9,14 @@ app.include_router(job_routes.router, prefix="/api", tags=["Jobs"])
 
 @app.get("/")
 def root():
-    return {"message": f"Welcome to {settings.PROJECT_NAME}"}
+    return {
+        "message": f"Welcome to {settings.PROJECT_NAME}",
+        "version": settings.VERSION,
+        "status": "running"
+    }
+
+
+@app.get("/health")
+def health():
+    """Health check endpoint for Railway monitoring"""
+    return {"status": "healthy", "service": settings.PROJECT_NAME}
