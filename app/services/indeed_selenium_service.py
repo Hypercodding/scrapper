@@ -238,8 +238,9 @@ def get_driver(force_new: bool = False):
         options = uc.ChromeOptions()
         
         # Add necessary arguments for containerized environments
-        # NOTE: Headless mode is detected by Cloudflare - comment out to use visible browser
-        # options.add_argument("--headless=new")  # New headless mode (less detectable)
+        # Enable headless mode for Railway (no display available)
+        # NOTE: Headless mode may be detected by Cloudflare, but required for Railway
+        options.add_argument("--headless=new")  # New headless mode (less detectable)
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -315,13 +316,26 @@ def get_driver(force_new: bool = False):
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
         chrome_path = get_chrome_executable_path()
         chromedriver_path = get_chromedriver_path()
-        _driver = uc.Chrome(
-            options=options,
-            driver_executable_path=chromedriver_path,
-            browser_executable_path=chrome_path,
-            use_subprocess=True,
-            version_main=None  # Let it auto-detect version
-        )
+        
+        # For Railway/containerized environments, try without use_subprocess first
+        try:
+            _driver = uc.Chrome(
+                options=options,
+                driver_executable_path=chromedriver_path,
+                browser_executable_path=chrome_path,
+                use_subprocess=False,  # Disable subprocess for better container compatibility
+                version_main=None  # Let it auto-detect version
+            )
+        except Exception as e:
+            print(f"⚠️  First attempt failed: {e}, trying with use_subprocess=True")
+            # Fallback to subprocess if needed
+            _driver = uc.Chrome(
+                options=options,
+                driver_executable_path=chromedriver_path,
+                browser_executable_path=chrome_path,
+                use_subprocess=True,
+                version_main=None
+            )
         
         # Additional stealth measures - hide webdriver property
         _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")

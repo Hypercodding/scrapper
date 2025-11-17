@@ -176,6 +176,31 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 
+def get_chromedriver_path() -> Optional[str]:
+    """
+    Get ChromeDriver executable path based on environment.
+    Checks CHROMEDRIVER_PATH env var first, then common installation paths.
+    """
+    # Check environment variable first (set in Dockerfile)
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path and os.path.exists(chromedriver_path):
+        return chromedriver_path
+    
+    # Common paths
+    paths = [
+        "/usr/local/bin/chromedriver",  # Dockerfile installation
+        "/usr/bin/chromedriver",
+        "/usr/local/share/chromedriver",
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    
+    # If not found, return None and let undetected-chromedriver download it
+    return None
+
+
 def get_random_user_agent() -> str:
     """Return a random user agent"""
     return random.choice(USER_AGENTS)
@@ -1410,7 +1435,24 @@ async def scrape_with_selenium(
         if use_undetected:
             print("Using undetected-chromedriver for anti-bot protection")
             chrome_path = get_chrome_executable_path()
-            driver = uc.Chrome(options=chrome_options, browser_executable_path=chrome_path)
+            chromedriver_path = get_chromedriver_path()
+            
+            # For Railway/containerized environments, try without use_subprocess first
+            try:
+                driver = uc.Chrome(
+                    options=chrome_options,
+                    browser_executable_path=chrome_path,
+                    driver_executable_path=chromedriver_path,
+                    use_subprocess=False
+                )
+            except Exception as e:
+                print(f"⚠️  First attempt failed: {e}, trying with use_subprocess=True")
+                driver = uc.Chrome(
+                    options=chrome_options,
+                    browser_executable_path=chrome_path,
+                    driver_executable_path=chromedriver_path,
+                    use_subprocess=True
+                )
         else:
             service = Service(ChromeDriverManager().install())
             chrome_path = get_chrome_executable_path()
