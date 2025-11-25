@@ -288,17 +288,43 @@ def is_valid_job_url(url: str) -> bool:
         '/privacy', '/terms', '/policy', '/legal', '/cookie',
         '/contact', '/help', '/support', '/faq',
         '/watch', '/video', '/media', '/youtube',
-        '.pdf', '.mp4', '.mov', '.avi'
+        '.pdf', '.mp4', '.mov', '.avi',
+        '/actionworks', '/action-works',  # Patagonia Action Works
+        '/jointalentcommunity', '/join-talent-community',  # Talent community pages
+        '/our-brands-group',  # Company group pages
+        # Product/category URLs
+        '/fly-fishing', '/fly-rods', '/fly-line', '/fly-',
+        '/womens', '/mens', '/kids', '/clothing', '/equipment',
+        '/products', '/shop', '/store', '/catalog',
+        # Content/blog URLs
+        '/stories', '/blog', '/news', '/articles', '/dog-stories',
+        '/wingshooting', '/content',
+        # Customer service URLs
+        '/customer-care', '/help', '/faq', '/contact-us',
+        '/order-status', '/shipping', '/returns', '/exchanges',
+        '/repairs', '/gift-card', '/rewards', '/feedback',
     ]
     
     if any(pattern in url_lower for pattern in non_job_patterns):
         return False
     
     # URLs that are just category/filter pages (not individual jobs)
+    # Patterns like /c/marketing-communications-jobs, /c/product-jobs
     if '/job_categories' in url_lower or '/job-categories' in url_lower:
         return False
     if '/hourly-jobs' in url_lower or '/hourly_jobs' in url_lower:
         return False
+    
+    # Category pages with /c/ pattern (like Patagonia)
+    if '/c/' in url_lower and '-jobs' in url_lower:
+        return False
+    
+    # Location pages (like /pages/careers for country-specific pages)
+    if '/pages/careers' in url_lower and url_lower.count('/') >= 4:
+        # This might be a country-specific careers landing page
+        # Allow it if it looks like a job listing page, otherwise filter
+        if '/jobs/' not in url_lower and '/job/' not in url_lower:
+            return False
     
     # Check if it's a search/results page (these aren't individual job postings)
     # But allow if it has a job ID or specific job indicator
@@ -310,12 +336,77 @@ def is_valid_job_url(url: str) -> bool:
         if not has_job_id:
             return False
     
+    # Allow URLs with numeric job IDs (common patterns like /careers/40, /jobs/123, etc.)
+    # Pattern: /careers/123 or /jobs/123 or /openings/123
+    job_id_patterns = [
+        r'/careers/\d+', r'/jobs/\d+', r'/job/\d+', r'/openings/\d+',
+        r'/positions/\d+', r'/position/\d+', r'/postings/\d+', r'/posting/\d+',
+        r'/vacancies/\d+', r'/vacancy/\d+', r'/opportunities/\d+', r'/opportunity/\d+'
+    ]
+    for pattern in job_id_patterns:
+        if re.search(pattern, url_lower):
+            # This is clearly a job with a numeric ID - always valid
+            return True
+    
+    # Also check for paths that end with a number after /careers/ or /jobs/
+    # This catches cases like /careers/40 or /jobs/123
+    if re.search(r'/(careers|jobs|job|openings|positions|postings)/\d+', url_lower):
+        return True
+    
+    # Allow URLs with /job/ or /jobs/ followed by location/job-name patterns
+    # Examples: /job/Portland-Oregon-United-States-of-A, /jobs/software-engineer
+    # These are clearly individual job postings
+    if re.search(r'/(job|jobs)/[^/]+', url_lower):
+        # Check that it's not just /job or /jobs (must have something after)
+        # And it's not a category page
+        if not url_lower.endswith('/job') and not url_lower.endswith('/jobs') and \
+           not url_lower.endswith('/job/') and not url_lower.endswith('/jobs/'):
+            # This looks like a specific job posting URL
+            return True
+    
+    # Filter out URLs that are just the main careers page (unless they have job-specific paths)
+    if url_lower.endswith('/careers') or url_lower.endswith('/careers/'):
+        # This is the main careers page, not a specific job
+        return False
+    
+    # Filter out URLs that end with common non-job patterns
+    non_job_endings = [
+        '/careers', '/jobs', '/openings', '/positions',
+        '/jointalentcommunity', '/actionworks'
+    ]
+    for ending in non_job_endings:
+        if url_lower.endswith(ending) or url_lower.endswith(ending + '/'):
+            # Unless it's a job-specific path like /careers/12345
+            path_parts = url.rstrip('/').split('/')
+            if len(path_parts) <= 2:  # Just domain + /careers or /jobs
+                return False
+    
     return True
 
 
 def is_valid_job_title(title: str) -> bool:
     """Check if extracted title looks like a valid job title"""
     if not title or len(title) < 5 or len(title) > 200:
+        return False
+    
+    title_lower = title.lower().strip()
+    
+    # Filter out titles with job counts (category pages)
+    # Patterns like "0Jobs", "(1Job )", "Marketing & Communications 0 Jobs"
+    job_count_patterns = [
+        r'^\d+\s*jobs?$',  # "0Jobs", "1Job", "5 Jobs"
+        r'\(\d+\s*jobs?\)',  # "(1Job )", "(5 Jobs )"
+        r'\d+\s*jobs?$',  # "Marketing 0 Jobs"
+        r'.*\s+\(\d+\s*jobs?\)',  # "Marketing & Communications (0 Jobs )"
+        r'.*\s+\d+\s*jobs?$',  # "Family Services 5 Jobs"
+    ]
+    
+    for pattern in job_count_patterns:
+        if re.search(pattern, title_lower):
+            return False
+    
+    # Filter out titles that are just numbers or job counts
+    if re.match(r'^(\d+\s*jobs?|\(?\d+\s*jobs?\)?)$', title_lower):
         return False
     
     # Skip navigation-like titles and UI elements
@@ -354,10 +445,28 @@ def is_valid_job_title(title: str) -> bool:
         'job categories', 'find your role', 'hourly',
         # UI elements
         'watch on', 'play video', 'see video', 'listen',
-        'download', 'print', 'email', 'share this'
+        'download', 'print', 'email', 'share this',
+        # Action page titles
+        'take action', 'join talent community', 'we would love to get to know you',
+        'patagonia action works',
+        # Marketing/CTA text
+        'love where you work', 'apply today', 'thanks for visiting',
+        'thanks for visiting our career site', 'sign up here',
+        # Product categories (common in e-commerce sites)
+        'fly rods', 'fly line', 'womens', 'mens', 'kids', 'accessories',
+        'clothing', 'equipment', 'gear', 'products', 'shop', 'store',
+        # Content/blog sections
+        'wingshooting', 'dog stories', 'stories', 'blog', 'news', 'articles',
+        # Support/customer service
+        'customer care', 'help', 'faq', 'contact us', 'order status',
+        'shipping information', 'returns', 'exchanges', 'repairs',
+        'gift card', 'rewards', 'feedback',
+        # Benefits/info sections
+        'protecting your future', 'catalog', 'request a catalog',
+        'generous health benefit', '401k', 'paid parental leave',
+        'life & disability insurance', 'conservation leadership'
     ]
     
-    title_lower = title.lower()
     if any(kw in title_lower for kw in nav_keywords):
         return False
     
@@ -370,6 +479,7 @@ def is_valid_job_title(title: str) -> bool:
         r'^choose\s+',     # "Choose category"
         r'^click\s+',      # "Click here"
         r'^\d+\s*result',  # "25 results"
+        r'^we would',      # "we would love to get to know you"
     ]
     
     for pattern in ui_patterns:
@@ -385,7 +495,7 @@ def is_valid_job_title(title: str) -> bool:
         return False
     
     # Single word titles are usually not job titles (unless they're role names)
-    # Filter out common single-word navigation items
+    # Filter out common single-word navigation items and locations
     single_word_nav = [
         'overview', 'teams', 'locations', 'offices', 'benefits',
         'culture', 'values', 'students', 'hourly', 'design',
@@ -393,24 +503,36 @@ def is_valid_job_title(title: str) -> bool:
         'operations', 'consulting', 'technology', 'business',
         'strategy', 'retail', 'corporate', 'headquarters',
         'messages', 'notifications', 'settings', 'profile',
-        'dublin', 'london', 'singapore', 'hyderabad', 'munich',
-        'paris', 'tokyo', 'seattle', 'austin', 'boston'
+        # Common location names that appear in navigation
+        'japan', 'australia', 'dublin', 'london', 'singapore', 
+        'hyderabad', 'munich', 'paris', 'tokyo', 'seattle', 
+        'austin', 'boston', 'portland', 'carlsbad',
+        # Department/category names
+        'product', 'supply chain', 'executive management & legal',
+        'information technology', 'sales & e-commerce',
+        'people & culture', 'finance & accounting',
+        'family services', 'environmental activism',
+        'justice, equity & antiracism', 'justice, equity',
+        # Product categories (single word)
+        'womens', 'mens', 'kids', 'accessories', 'clothing',
+        'equipment', 'gear', 'products', 'shop', 'store', 'catalog'
     ]
     
     word_count = len(title.split())
     if word_count == 1 and title_lower in single_word_nav:
         return False
     
-    # Check if title is just a city name (usually 1-2 words, starts with capital)
+    # Check if title is just a city/country name (usually 1-2 words, starts with capital)
     if word_count <= 2 and title[0].isupper():
-        # List of major cities that appear in navigation
-        cities = ['new york', 'san francisco', 'los angeles', 'mountain view',
+        # List of major cities and countries that appear in navigation
+        locations = ['new york', 'san francisco', 'los angeles', 'mountain view',
                   'palo alto', 'menlo park', 'redmond', 'seattle', 'austin',
                   'boston', 'chicago', 'denver', 'atlanta', 'dallas', 'houston',
                   'london', 'dublin', 'paris', 'munich', 'berlin', 'amsterdam',
                   'singapore', 'tokyo', 'sydney', 'toronto', 'vancouver',
-                  'bangalore', 'hyderabad', 'pune', 'mumbai', 'delhi']
-        if title_lower in cities:
+                  'bangalore', 'hyderabad', 'pune', 'mumbai', 'delhi',
+                  'japan', 'australia', 'portland', 'carlsbad']
+        if title_lower in locations:
             return False
     
     # Titles that are just generic department names (without "role" or "position")
@@ -419,13 +541,22 @@ def is_valid_job_title(title: str) -> bool:
         'marketing & communications', 'marketing and communications',
         'business strategy', 'technical solutions',
         'data center operations', 'account management',
-        'technical program management', 'silicon engineering'
+        'technical program management', 'silicon engineering',
+        'family services', 'environmental activism',
+        'justice, equity & antiracism', 'justice, equity',
+        'executive management & legal', 'supply chain',
+        'sales & e-commerce', 'people & culture',
+        'finance & accounting', 'information technology',
+        'product'
     ]
     if title_lower in generic_departments:
         return False
     
-    # Must contain typical job title indicators
-    # Job titles usually have role indicators or are specific enough
+    # Filter out titles that are just department/category names
+    if title_lower in ['product', 'supply chain', 'sales & e-commerce']:
+        return False
+    
+    # Must contain typical job title indicators OR be a specific enough role
     job_indicators = [
         'engineer', 'developer', 'manager', 'director', 'analyst',
         'specialist', 'coordinator', 'assistant', 'associate',
@@ -434,7 +565,8 @@ def is_valid_job_title(title: str) -> bool:
         'technician', 'administrator', 'representative', 'agent',
         'officer', 'supervisor', 'operator', 'instructor',
         'programmer', 'tester', 'qa', 'devops', 'sre',
-        'intern', 'co-op', 'apprentice', 'fellow'
+        'intern', 'co-op', 'apprentice', 'fellow', 'executive',
+        'vice president', 'vp', 'head of', 'chief'
     ]
     
     # If it's a longer title (3+ words), it should have at least one job indicator
@@ -451,6 +583,288 @@ def is_valid_job_title(title: str) -> bool:
                 return False
     
     return True
+
+
+def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
+    """
+    Comprehensive validation of a job entry to filter out non-job entries
+    
+    SIMPLIFIED - Accepts jobs with valid titles and URLs that look like job postings.
+    Only rejects obvious non-jobs.
+    
+    Args:
+        job: Job object to validate
+        debug: If True, print detailed debug information about why validation fails
+    """
+    # Basic title check - must exist and have reasonable length
+    if not job.title or len(job.title.strip()) < 3 or len(job.title.strip()) > 200:
+        if debug:
+            print(f"       ❌ Failed: Invalid title length")
+        return False
+    
+    title_lower = job.title.lower().strip()
+    
+    # Check URL - if it looks like a job URL, accept it immediately
+    has_job_url = False
+    if job.url:
+        url_lower = job.url.lower()
+        # Check if URL contains job-related patterns (case-insensitive, more lenient)
+        url_has_job_pattern = any(pattern in url_lower for pattern in [
+            '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+            '/positions/', '/position/', '/postings/', '/posting/',
+            '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+            '/recruitment/', '/apply/', '/req/', '/mdf/',  # ADP/Workday patterns
+            '/job', '/jobs', '/careers', '/career', '/recruitment'  # Also check without trailing slash
+        ])
+        
+        # Check if URL has a numeric ID (like /careers/40)
+        url_has_numeric_id = re.search(r'/(careers|jobs|job|openings|positions)/\d+', url_lower)
+        
+        # Check if URL has location/job-name pattern (like /job/Portland-Oregon)
+        # More lenient - any path after /job/ or /jobs/
+        url_has_job_path = re.search(r'/(job|jobs)/[^/?]+', url_lower)
+        
+        # Also check for URLs ending with job ID or location
+        url_ends_with_job_pattern = bool(re.search(r'/(job|jobs|careers?|openings?|positions?)/[^/?]+/?$', url_lower))
+        
+        if url_has_job_pattern or url_has_numeric_id or url_has_job_path or url_ends_with_job_pattern:
+            has_job_url = True
+            if debug:
+                print(f"       ✅ URL looks like job URL: '{job.url[:80]}'")
+        elif debug:
+            print(f"       ⚠️  URL doesn't match job patterns: '{job.url[:80]}'")
+    
+    # SIMPLIFIED VALIDATION: If job has ANY URL, accept it unless obviously not a job
+    # Be very lenient - most jobs with URLs are valid
+    if job.url:
+        # Only reject obvious non-jobs - very permissive approach
+        # Check for job count in title (like "0Jobs", "5 Jobs")
+        has_job_count = bool(re.search(r'^\d+\s*jobs?$|\(?\d+\s*jobs?\)?$', title_lower))
+        if has_job_count:
+            if debug:
+                print(f"       ❌ Failed: Title is a job count")
+            return False
+        
+        # Reject very obvious non-job titles only
+        obvious_non_jobs = ['view all', 'all jobs']  # Minimal list
+        if title_lower in obvious_non_jobs:
+            if debug:
+                print(f"       ❌ Failed: Title is obvious navigation")
+            return False
+        
+        # If job has URL and title doesn't match obvious non-job patterns, ACCEPT IT
+        # Be very lenient - trust that if there's a URL, it's probably a real job
+        if debug:
+            print(f"       ✅ Accepted: Has URL and valid title (lenient validation)")
+        return True
+    
+    # If no job URL, be lenient but check title more carefully
+    # Accept if title looks like a job title (at least 2 words, not obviously a non-job)
+    obvious_non_jobs = [
+        'fly rods', 'fly line', 'womens', 'mens', 'wingshooting', 
+        'dog stories', 'customer care', 'catalog', 'protecting your future',
+        'love where you work', 'apply today', 'thanks for visiting',
+        'view all', 'all jobs', 'current openings'  # Navigation elements
+    ]
+    
+    # Check for job count in title
+    has_job_count = bool(re.search(r'^\d+\s*jobs?$|\(?\d+\s*jobs?\)?$', title_lower))
+    
+    if title_lower in obvious_non_jobs or has_job_count:
+        if debug:
+            print(f"       ❌ Failed: Title is obvious non-job or job count")
+        return False
+    
+    # If title has at least 2 words and doesn't match non-job patterns, accept it
+    word_count = len(title_lower.split())
+    if word_count >= 2:
+        if debug:
+            print(f"       ✅ Accepted: Valid title (lenient validation)")
+        return True
+    
+    # Default: reject only single-word titles that don't look like jobs
+    if debug:
+        print(f"       ❌ Failed: Title too short or doesn't meet criteria")
+    return False
+    
+    # Check if description is identical to title (indicates it's not a real job listing)
+    # Only check this if we have a description - jobs with valid URLs might not have descriptions yet
+    if job.description and job.title:
+        desc_clean = clean_text(job.description).strip()
+        title_clean = clean_text(job.title).strip()
+        if desc_clean.lower() == title_clean.lower():
+            # Description matches title exactly - this is likely just a link, not a job listing
+            return False
+    
+    # Check for category/department page indicators in description
+    if job.description:
+        desc_lower = job.description.lower()
+        category_indicators = [
+            ' jobs', 'job)', '(jobs)', '0 jobs', 'no jobs',
+            'view all', 'see all jobs', 'browse jobs',
+            'category', 'department', 'team'
+        ]
+        if any(indicator in desc_lower for indicator in category_indicators):
+            # Check if it's describing a category page
+            if any(pattern in desc_lower for pattern in ['0 jobs', ' jobs)', ' jobs ']):
+                # Likely a category page with job count
+                return False
+        
+        # Check for product category descriptions
+        product_indicators = [
+            'view all', 'fly fishing', 'fly rods', 'fly line',
+            'freshwater', 'saltwater', 'shirts', 'jackets', 'pants',
+            'shorts', 'hats', 'gloves', 'mittens', 'clays',
+            'catalog', 'request a catalog', 'shop', 'store',
+            'products', 'equipment', 'gear', 'accessories'
+        ]
+        # If description contains product indicators and looks like a product listing
+        if any(indicator in desc_lower for indicator in product_indicators):
+            # Check if it's a product listing (has "View All" followed by product names)
+            if 'view all' in desc_lower and len(desc_lower.split()) < 30:
+                # Short description with "View All" = likely product category
+                return False
+        
+        # Check for content/blog section descriptions
+        content_indicators = [
+            'dog stories', 'wingshooting', 'stories', 'blog',
+            'view all dog stories', 'view all stories'
+        ]
+        if any(indicator in desc_lower for indicator in content_indicators):
+            # Likely a content/blog section, not a job
+            return False
+        
+        # Check for customer service descriptions
+        customer_service_indicators = [
+            'help / faq', 'contact us', 'order status', 'shipping information',
+            'size & fit', 'returns & exchanges', 'repairs', 'gift card balance',
+            'rewards', 'visa', 'international orders', 'corporate sales',
+            'promotional exclusions', 'give us feedback'
+        ]
+        if any(indicator in desc_lower for indicator in customer_service_indicators):
+            # Likely a customer service page, not a job
+            return False
+        
+        # Check for marketing/CTA descriptions
+        marketing_indicators = [
+            'thanks for visiting', 'sign up here', 'enjoy 15% off',
+            'love where you work', 'inclusive culture', 'remote and flexible',
+            'generous associate discount', 'company holidays', 'pto',
+            'rod loaner program', 'this is just a placeholder copy',
+            'we live to develop and share our equipment'
+        ]
+        if any(indicator in desc_lower for indicator in marketing_indicators):
+            # Check if it's just marketing text without actual job details
+            job_detail_indicators = ['responsibilities', 'requirements', 'qualifications',
+                                   'experience', 'skills', 'bachelor', 'degree',
+                                   'years of experience', 'salary', 'compensation']
+            if not any(indicator in desc_lower for indicator in job_detail_indicators):
+                # Marketing text without job details = not a real job
+                return False
+    
+    # Filter out entries with suspicious patterns in title
+    title_lower = job.title.lower()
+    
+    # Filter titles that are clearly category pages
+    category_patterns = [
+        r'.*\s+\(\d+\s*jobs?\)',  # "Marketing (5 Jobs )"
+        r'.*\s+\d+\s*jobs?$',  # "Marketing 0 Jobs"
+        r'^\d+\s*jobs?$',  # "0Jobs"
+    ]
+    for pattern in category_patterns:
+        if re.match(pattern, title_lower):
+            return False
+    
+    # Filter out location-only entries (like "Japan", "Australia")
+    # These should have been caught by is_valid_job_title, but double-check
+    common_locations = [
+        'japan', 'australia', 'united states', 'united kingdom',
+        'canada', 'germany', 'france', 'spain', 'italy'
+    ]
+    if title_lower in common_locations and not any(indicator in title_lower for indicator in 
+                                                   ['engineer', 'manager', 'developer', 'analyst', 'specialist']):
+        return False
+    
+    # Filter out product category titles (even if they passed title validation)
+    product_category_titles = [
+        'fly rods', 'fly line', 'womens', 'mens', 'kids',
+        'wingshooting', 'dog stories', 'customer care',
+        'catalog', 'request a catalog', 'protecting your future'
+    ]
+    if title_lower in product_category_titles:
+        if debug:
+            print(f"       ❌ Failed: Title is a product category")
+        return False
+    
+    # Filter out marketing/CTA titles
+    marketing_titles = [
+        'love where you work', 'apply today',
+        'thanks for visiting our career site', 'thanks for visiting'
+    ]
+    if title_lower in marketing_titles:
+        return False
+    
+    # Filter "Career Opportunities" if it's clearly a section header
+    # (description contains multiple job titles or section-like text)
+    if title_lower == 'career opportunities' and job.description:
+        desc_lower = job.description.lower()
+        # If description contains multiple job titles or section indicators
+        if ('retail sales associate' in desc_lower and 
+            desc_lower.count('retail') > 1) or 'view all' in desc_lower:
+            # This is a section header listing multiple jobs, not an individual job
+            return False
+    
+    # Filter out titles that are clearly not job titles
+    # Check if title looks like a product name or category
+    job_keywords = ['associate', 'manager', 'director', 'engineer', 'developer',
+                   'analyst', 'specialist', 'coordinator', 'assistant',
+                   'lead', 'senior', 'junior', 'principal', 'staff',
+                   'consultant', 'architect', 'designer', 'scientist',
+                   'technician', 'administrator', 'representative', 'agent',
+                   'officer', 'supervisor', 'operator', 'instructor',
+                   'sales', 'retail', 'store', 'warehouse', 'technician']
+    
+    has_job_keyword = any(job_word in title_lower for job_word in job_keywords)
+    if not has_job_keyword:
+        # If title doesn't contain job-related words, check if it's a product/category
+        product_keywords = ['fly', 'rods', 'line', 'womens', 'mens', 'kids',
+                           'wingshooting', 'stories', 'catalog', 'care']
+        if any(keyword in title_lower for keyword in product_keywords):
+            # Likely a product/category, not a job
+            if debug:
+                print(f"       ❌ Failed: Title doesn't contain job keywords and matches product keywords")
+            return False
+        elif debug:
+            print(f"       ⚠️  Warning: Title doesn't contain common job keywords, but allowing it")
+    
+    if debug:
+        print(f"       ✅ Validation passed for '{job.title}'")
+    
+    return True
+
+
+def filter_invalid_jobs(jobs: List[Job]) -> List[Job]:
+    """
+    Post-process and filter out invalid job entries
+    
+    Returns only valid job entries that pass all validation checks
+    """
+    valid_jobs = []
+    filtered_count = 0
+    
+    for job in jobs:
+        if is_valid_job_entry(job):
+            valid_jobs.append(job)
+        else:
+            filtered_count += 1
+            print(f"  ✗ Filtered invalid entry: {job.title}")
+            if job.url:
+                print(f"     URL: {job.url[:80] if len(job.url) > 80 else job.url}")
+    
+    if filtered_count > 0:
+        print(f"\n  Filtered out {filtered_count} invalid job entries")
+    
+    return valid_jobs
 
 
 # ============================================================================
@@ -1021,35 +1435,179 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
         soup = BeautifulSoup(element.get_attribute('outerHTML'), 'html.parser')
         text = soup.get_text(separator=' ', strip=True)
         
-        # Extract title
+        # Also get text directly from Selenium element (might be more reliable)
+        try:
+            element_text = element.text.strip()
+            if element_text and len(element_text) > len(text):
+                text = element_text  # Use Selenium text if it's more complete
+        except:
+            pass  # Fall back to BeautifulSoup text
+        
+        # Extract title - be more lenient, extract first and validate later
         title = None
-        title_selectors = [
-            ('h1', None), ('h2', None), ('h3', None), ('h4', None),
-            ('[class*="title"]', None), ('[class*="job"]', None),
-            ('[class*="position"]', None), ('a', None)
+        
+        # Priority order: specific selectors first, then generic
+        title_selectors_ordered = [
+            # Workday/ADP specific
+            '[data-automation-id="jobTitle"]',
+            '[data-testid*="job"]',
+            '[data-testid*="title"]',
+            # Specific title classes
+            '[class*="job-title"]', '[class*="jobTitle"]', '[class*="JobTitle"]',
+            '[class*="position-title"]', '[class*="opening-title"]',
+            # Headings
+            'h1', 'h2', 'h3', 'h4', 'h5',
+            # Links (often contain job titles)
+            'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]',
+            # Generic title/position classes
+            '[class*="title"]', '[class*="job"]', '[class*="position"]',
+            # Any link
+            'a'
         ]
         
-        for tag, attr in title_selectors:
-            elem = soup.select_one(tag)
-            if elem:
-                title_text = elem.get_text(strip=True)
-                if is_valid_job_title(title_text):
-                    title = title_text
-                    break
+        # Try ordered selectors first
+        for selector in title_selectors_ordered:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    title_text = elem.get_text(strip=True)
+                    if title_text and len(title_text) >= 3 and len(title_text) <= 200:
+                        # Accept if it looks reasonable - validate later
+                        if not title or len(title_text) > len(title or ''):
+                            title = title_text
+            except Exception:
+                continue
         
+        # If still no title, try getting text from the whole element
         if not title:
+            # Get all text from element and find the longest line that looks like a title
+            all_text = soup.get_text(separator='\n', strip=True)
+            lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+            for line in lines:
+                if len(line) >= 5 and len(line) <= 200:
+                    # Check if line looks like it could be a title (not all caps short words)
+                    if not line.isupper() or len(line.split()) >= 2:
+                        title = line
+                        break
+        
+        # If still no title, use the first meaningful text from the element
+        if not title:
+            # Get first line of text that's not too short or too long
+            text_lines = text.strip().split('\n') if text else []
+            for line in text_lines:
+                line = line.strip()
+                if line and len(line) >= 5 and len(line) <= 200:
+                    # Skip lines that are clearly not titles
+                    if not any(nav_word in line.lower() for nav_word in ['view all', 'current openings', 'search', 'filter']):
+                        title = line
+                        break
+        
+        # Last resort: use first 100 characters of element text
+        if not title and text:
+            first_part = text.strip()[:100].strip()
+            if first_part and len(first_part) >= 5:
+                # Clean it up - take first sentence or first part before common separators
+                for separator in ['\n', '. ', ' - ', ' | ']:
+                    if separator in first_part:
+                        title = first_part.split(separator)[0].strip()
+                        break
+                if not title:
+                    title = first_part
+        
+        # Final check - must have a title
+        if not title or len(title.strip()) < 3:
             return None
         
-        # Extract URL
+        # Extract description first (before URL validation)
+        description = clean_text(text)
+        if len(description) > 500:
+            description = description[:500] + "..."
+        
+        # Extract URL - look for links more thoroughly
         job_url = None
-        link = soup.find('a', href=True)
-        if link:
+        
+        # Try multiple strategies to find the job URL
+        # Strategy 1: Find all links and pick the one that looks like a job URL
+        all_links = soup.find_all('a', href=True)
+        for link in all_links:
             href = link.get('href')
-            job_url = urljoin(base_url, href)
+            if not href:
+                continue
+            full_url = urljoin(base_url, href)
+            url_lower = full_url.lower()
             
-            # Validate URL - if it's not a valid job URL, skip this element
-            if not is_valid_job_url(job_url):
-                return None
+            # Check if this looks like a job URL
+            looks_like_job_url = any(pattern in url_lower for pattern in [
+                '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+                '/positions/', '/position/', '/postings/', '/posting/',
+                '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+                '/recruitment/', '/apply/', '/req/'  # ADP/Workday patterns
+            ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment)/', url_lower)
+            
+            if looks_like_job_url:
+                job_url = full_url
+                break
+        
+        # Strategy 2: If no job-like URL found, use the first link
+        if not job_url and all_links:
+            first_link = all_links[0]
+            href = first_link.get('href')
+            if href:
+                job_url = urljoin(base_url, href)
+        
+        # Strategy 3: Use Selenium to find links directly from the element
+        if not job_url:
+            try:
+                # Find all links within this element using Selenium
+                links_in_element = element.find_elements(By.TAG_NAME, 'a')
+                for link_elem in links_in_element:
+                    try:
+                        href = link_elem.get_attribute('href')
+                        if href:
+                            full_url = urljoin(base_url, href) if not href.startswith('http') else href
+                            url_lower = full_url.lower()
+                            
+                            # Check if this looks like a job URL
+                            looks_like_job_url = any(pattern in url_lower for pattern in [
+                                '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+                                '/positions/', '/position/', '/postings/', '/posting/',
+                                '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+                                '/recruitment/', '/apply/', '/req/', '/mdf/'  # ADP/Workday patterns
+                            ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment|mdf)/', url_lower)
+                            
+                            if looks_like_job_url:
+                                job_url = full_url
+                                break
+                            
+                            # If no job-like URL but this is the first link, use it anyway
+                            if not job_url:
+                                job_url = full_url
+                    except:
+                        continue
+            except:
+                pass
+        
+        # Be very lenient with URLs - if it looks like a job URL, keep it
+        # Don't reject URLs unless they're clearly not job-related
+        if job_url:
+            url_lower = job_url.lower()
+            looks_like_job_url = any(pattern in url_lower for pattern in [
+                '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+                '/positions/', '/position/', '/postings/', '/posting/',
+                '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+                '/recruitment/', '/apply/', '/req/', '/mdf/'  # ADP/Workday patterns
+            ]) or re.search(r'/(careers|jobs|job|openings|positions)/\d+', url_lower) or \
+                re.search(r'/(job|jobs)/[^/?]+', url_lower)
+            
+            if not looks_like_job_url and not is_valid_job_url(job_url):
+                # URL doesn't look like a job URL at all
+                # For expandable sections, jobs might not have direct links
+                # Only reject if we also don't have a description
+                if not description or len(description.strip()) < 20:
+                    # No job-like URL and no description - likely not a job listing
+                    return None
+                job_url = None  # Set to None but continue with extraction
+            # Otherwise, keep the URL even if validation failed
         
         # Extract location
         location = extract_text_field(text, LOCATION_PATTERNS)
@@ -1067,11 +1625,6 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
             if match:
                 salary = match.group(0)
                 break
-        
-        # Extract description
-        description = clean_text(text)
-        if len(description) > 500:
-            description = description[:500] + "..."
         
         # Extract posting date
         posted_date = None
@@ -1114,43 +1667,350 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
 # PAGINATION & INFINITE SCROLL HANDLING
 # ============================================================================
 
-async def handle_pagination(driver, max_pages: int = 5) -> None:
-    """Handle pagination by clicking next buttons"""
-    for page_num in range(max_pages):
-        try:
-            # Common pagination selectors
-            next_selectors = [
-                'a[aria-label*="next"]',
-                'button[aria-label*="next"]',
-                '.pagination .next',
-                '.pagination a:last-child',
-                '[class*="next-page"]',
-                '[class*="pagination-next"]',
-            ]
-            
-            next_button = None
-            for selector in next_selectors:
-                try:
-                    next_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
+async def detect_pagination(driver) -> Dict[str, Any]:
+    """
+    Detect pagination on the page and return information about it
+    
+    Returns:
+        Dict with pagination info: {
+            'type': 'numbered' | 'next_only' | 'none',
+            'current_page': int,
+            'total_pages': int or None,
+            'page_numbers': List[int] or None,
+            'has_next': bool,
+            'has_prev': bool
+        }
+    """
+    pagination_info = {
+        'type': 'none',
+        'current_page': 1,
+        'total_pages': None,
+        'page_numbers': None,
+        'has_next': False,
+        'has_prev': False
+    }
+    
+    try:
+        # Look for pagination container
+        pagination_selectors = [
+            '.pagination', '[class*="pagination"]', '[class*="paging"]',
+            '[class*="page-navigation"]', '[role="navigation"]',
+            'nav[aria-label*="pagination"]', 'nav[aria-label*="Pagination"]'
+        ]
+        
+        pagination_container = None
+        for selector in pagination_selectors:
+            try:
+                containers = driver.find_elements(By.CSS_SELECTOR, selector)
+                for container in containers:
+                    container_text = container.text.lower()
+                    if any(keyword in container_text for keyword in ['page', 'next', 'prev', '1', '2', '3']):
+                        pagination_container = container
+                        break
+                if pagination_container:
                     break
-                except TimeoutException:
+            except Exception:
+                continue
+        
+        if not pagination_container:
+            return pagination_info
+        
+        # Get all pagination links and buttons
+        pagination_links = pagination_container.find_elements(By.TAG_NAME, 'a')
+        pagination_buttons = pagination_container.find_elements(By.TAG_NAME, 'button')
+        all_elements = pagination_links + pagination_buttons
+        
+        # Detect numbered pagination
+        page_numbers = []
+        current_page = 1
+        has_next = False
+        has_prev = False
+        
+        for elem in all_elements:
+            try:
+                if not elem.is_displayed():
                     continue
-            
-            if next_button:
-                print(f"Navigating to page {page_num + 2}")
-                driver.execute_script("arguments[0].scrollIntoView(true);", next_button)
-                await asyncio.sleep(0.5)
-                next_button.click()
-                await asyncio.sleep(2)
-            else:
-                print("No more pages found")
-                break
                 
-        except Exception as e:
-            print(f"Pagination ended: {e}")
-            break
+                elem_text = elem.text.strip()
+                elem_aria = elem.get_attribute('aria-label') or ''
+                
+                # Check for page numbers (digits only, typically 1-999)
+                if re.match(r'^\d+$', elem_text):
+                    page_num = int(elem_text)
+                    if 1 <= page_num <= 999:  # Reasonable page number range
+                        page_numbers.append(page_num)
+                        
+                        # Check if it's the current/active page
+                        classes = elem.get_attribute('class') or ''
+                        aria_current = elem.get_attribute('aria-current')
+                        if ('active' in classes.lower() or 'current' in classes.lower() or
+                            'selected' in classes.lower() or aria_current == 'page' or
+                            'bold' in classes.lower() or elem.tag_name == 'strong'):
+                            current_page = page_num
+                
+                # Check for next button
+                if ('next' in elem_text.lower() or '>' in elem_text or
+                    'next' in elem_aria.lower() or 'next' in (elem.get_attribute('title') or '').lower()):
+                    # Check if it's disabled
+                    classes = elem.get_attribute('class') or ''
+                    aria_disabled = elem.get_attribute('aria-disabled')
+                    if 'disabled' not in classes.lower() and aria_disabled != 'true':
+                        has_next = True
+                
+                # Check for previous button
+                if ('prev' in elem_text.lower() or '<' in elem_text or
+                    'prev' in elem_aria.lower() or 'previous' in elem_text.lower()):
+                    has_prev = True
+                    
+            except Exception:
+                continue
+        
+        # Determine pagination type
+        if page_numbers:
+            pagination_info['type'] = 'numbered'
+            pagination_info['page_numbers'] = sorted(set(page_numbers))
+            pagination_info['current_page'] = current_page
+            pagination_info['total_pages'] = max(page_numbers) if page_numbers else None
+        elif has_next:
+            pagination_info['type'] = 'next_only'
+        
+        pagination_info['has_next'] = has_next
+        pagination_info['has_prev'] = has_prev
+        
+    except Exception as e:
+        print(f"Error detecting pagination: {e}")
+    
+    return pagination_info
+
+
+async def navigate_to_page(driver, page_number: int) -> bool:
+    """
+    Navigate to a specific page number in pagination
+    
+    Returns:
+        True if navigation was successful
+    """
+    try:
+        # Look for pagination container
+        pagination_selectors = [
+            '.pagination', '[class*="pagination"]', '[class*="paging"]',
+            '[class*="page-navigation"]', '[role="navigation"]'
+        ]
+        
+        pagination_container = None
+        for selector in pagination_selectors:
+            try:
+                containers = driver.find_elements(By.CSS_SELECTOR, selector)
+                for container in containers:
+                    if container.is_displayed():
+                        pagination_container = container
+                        break
+                if pagination_container:
+                    break
+            except Exception:
+                continue
+        
+        if not pagination_container:
+            return False
+        
+        # Find the page number link/button
+        all_elements = pagination_container.find_elements(By.TAG_NAME, 'a') + \
+                       pagination_container.find_elements(By.TAG_NAME, 'button')
+        
+        target_element = None
+        for elem in all_elements:
+            try:
+                if not elem.is_displayed():
+                    continue
+                
+                elem_text = elem.text.strip()
+                if elem_text == str(page_number):
+                    # Check if it's not disabled
+                    classes = elem.get_attribute('class') or ''
+                    aria_disabled = elem.get_attribute('aria-disabled')
+                    if 'disabled' not in classes.lower() and aria_disabled != 'true':
+                        target_element = elem
+                        break
+            except Exception:
+                continue
+        
+        if target_element:
+            print(f"  Clicking page {page_number}...")
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_element)
+            await asyncio.sleep(0.5)
+            driver.execute_script("arguments[0].click();", target_element)
+            await asyncio.sleep(3)  # Wait for page to load
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"  Error navigating to page {page_number}: {e}")
+        return False
+
+
+async def navigate_to_next_page(driver) -> bool:
+    """
+    Navigate to the next page using next button
+    
+    Returns:
+        True if navigation was successful
+    """
+    try:
+        # Common next button selectors
+        next_selectors = [
+            'a[aria-label*="next" i]',
+            'button[aria-label*="next" i]',
+            'a[title*="next" i]',
+            'button[title*="next" i]',
+            '.pagination .next',
+            '.pagination a:last-child',
+            '[class*="next-page"]',
+            '[class*="pagination-next"]',
+            'a:contains(">")',
+            'button:contains(">")',
+            'a:contains("Next")',
+            'button:contains("Next")',
+        ]
+        
+        # Also search by text content
+        all_links = driver.find_elements(By.TAG_NAME, 'a')
+        all_buttons = driver.find_elements(By.TAG_NAME, 'button')
+        
+        next_element = None
+        
+        # Try selectors first
+        for selector in next_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    if elem.is_displayed() and elem.is_enabled():
+                        classes = elem.get_attribute('class') or ''
+                        aria_disabled = elem.get_attribute('aria-disabled')
+                        if 'disabled' not in classes.lower() and aria_disabled != 'true':
+                            next_element = elem
+                            break
+                if next_element:
+                    break
+            except Exception:
+                continue
+        
+        # Try text-based search
+        if not next_element:
+            for elem in all_links + all_buttons:
+                try:
+                    if not elem.is_displayed():
+                        continue
+                    
+                    elem_text = elem.text.strip().lower()
+                    elem_aria = (elem.get_attribute('aria-label') or '').lower()
+                    
+                    if ('next' in elem_text or '>' in elem_text or 'next' in elem_aria):
+                        classes = elem.get_attribute('class') or ''
+                        aria_disabled = elem.get_attribute('aria-disabled')
+                        if ('disabled' not in classes.lower() and aria_disabled != 'true' and
+                            elem.is_enabled()):
+                            next_element = elem
+                            break
+                except Exception:
+                    continue
+        
+        if next_element:
+            print(f"  Clicking 'Next' button...")
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_element)
+            await asyncio.sleep(0.5)
+            driver.execute_script("arguments[0].click();", next_element)
+            await asyncio.sleep(3)  # Wait for page to load
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"  Error navigating to next page: {e}")
+        return False
+
+
+async def handle_pagination(driver, max_pages: int = 10) -> List[int]:
+    """
+    Comprehensive pagination handler that collects jobs from all pages
+    
+    Returns:
+        List of page numbers that were successfully scraped
+    """
+    scraped_pages = [1]  # Start with page 1
+    
+    try:
+        print("\n🔍 Detecting pagination...")
+        pagination_info = await detect_pagination(driver)
+        
+        if pagination_info['type'] == 'none':
+            print("  No pagination detected")
+            return scraped_pages
+        
+        print(f"  Pagination type: {pagination_info['type']}")
+        if pagination_info['total_pages']:
+            print(f"  Total pages: {pagination_info['total_pages']}")
+        print(f"  Current page: {pagination_info['current_page']}")
+        
+        if pagination_info['type'] == 'numbered' and pagination_info['page_numbers']:
+            # Numbered pagination - navigate through all pages
+            all_page_numbers = pagination_info['page_numbers']
+            total_pages = pagination_info['total_pages'] or max(all_page_numbers)
+            
+            # If we detected page numbers, try to navigate through them
+            pages_to_scrape = list(range(1, min(total_pages + 1, max_pages + 1)))
+            
+            for page_num in pages_to_scrape:
+                if page_num == 1:
+                    continue  # Already on page 1
+                
+                if len(scraped_pages) >= max_pages:
+                    break
+                
+                print(f"\n📄 Navigating to page {page_num}...")
+                success = await navigate_to_page(driver, page_num)
+                
+                if success:
+                    scraped_pages.append(page_num)
+                    # Wait for content to load
+                    await asyncio.sleep(2)
+                else:
+                    print(f"  ⚠️  Could not navigate to page {page_num}, stopping pagination")
+                    break
+        
+        elif pagination_info['type'] == 'next_only' or pagination_info['has_next']:
+            # Next-only pagination - click next until no more pages
+            print("\n📄 Navigating through pages using 'Next' button...")
+            
+            page_num = 1
+            consecutive_failures = 0
+            max_consecutive_failures = 2
+            
+            while page_num < max_pages:
+                page_num += 1
+                print(f"\n📄 Attempting to navigate to page {page_num}...")
+                
+                success = await navigate_to_next_page(driver)
+                
+                if success:
+                    scraped_pages.append(page_num)
+                    consecutive_failures = 0
+                    # Wait for content to load
+                    await asyncio.sleep(2)
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        print(f"  ⚠️  No more pages found after {consecutive_failures} attempts")
+                        break
+        
+        print(f"\n✓ Successfully scraped {len(scraped_pages)} page(s): {scraped_pages}")
+        
+    except Exception as e:
+        print(f"⚠️  Error in pagination handling: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return scraped_pages
 
 
 async def detect_and_clear_no_results(driver) -> bool:
@@ -1326,6 +2186,155 @@ async def handle_infinite_scroll(driver, max_scrolls: int = 10) -> None:
         print(f"Infinite scroll {scroll_num + 1}/{max_scrolls}")
 
 
+async def expand_collapsible_sections(driver, max_expansions: int = 20) -> int:
+    """
+    Find and expand collapsible/accordion sections that might contain job listings
+    
+    Returns:
+        Number of sections expanded
+    """
+    try:
+        print("Checking for expandable/collapsible sections...")
+        expanded_count = 0
+        
+        # Common selectors for expandable sections
+        expand_selectors = [
+            # Buttons with expand/collapse indicators
+            'button[aria-expanded="false"]',
+            'button[aria-expanded="true"]',  # Try both, we'll check state
+            '[role="button"][aria-expanded="false"]',
+            # Accordion elements
+            '.accordion-button:not(.collapsed)',
+            '.accordion-header button',
+            '[class*="accordion"] button',
+            '[class*="collapse"] button',
+            '[class*="expand"] button',
+            '[class*="toggle"] button',
+            # Elements with + or expand icons
+            'button:has(svg[class*="plus"])',
+            'button:has(svg[class*="expand"])',
+            'button:has(svg[class*="chevron-down"])',
+            # Generic buttons near job-related text
+            'button[class*="job"]',
+            'button[class*="position"]',
+            'button[class*="career"]',
+            # Shopify/theme-specific patterns
+            '[class*="collapsible"] button',
+            '[class*="collapsible-content"] + button',
+        ]
+        
+        # Also look for buttons by text content
+        all_buttons = driver.find_elements(By.TAG_NAME, 'button')
+        expand_buttons = []
+        
+        for btn in all_buttons:
+            try:
+                if not btn.is_displayed():
+                    continue
+                
+                btn_text = btn.text.lower().strip()
+                btn_aria = btn.get_attribute('aria-expanded')
+                
+                # Check if button looks like an expand button
+                # Look for +, expand, or check if it's near job-related content
+                btn_html = btn.get_attribute('outerHTML') or ''
+                
+                # Check for expand indicators
+                has_expand_indicator = (
+                    '+' in btn_text or
+                    'expand' in btn_text or
+                    'more' in btn_text or
+                    'show' in btn_text or
+                    '+' in btn_html or
+                    'plus' in btn_html.lower() or
+                    'expand' in btn_html.lower() or
+                    'chevron' in btn_html.lower()
+                )
+                
+                # Check if button is in a collapsible context
+                parent = btn.find_element(By.XPATH, './..')
+                parent_class = parent.get_attribute('class') or ''
+                parent_id = parent.get_attribute('id') or ''
+                
+                is_collapsible_context = (
+                    'accordion' in parent_class.lower() or
+                    'collapse' in parent_class.lower() or
+                    'collapsible' in parent_class.lower() or
+                    'accordion' in parent_id.lower() or
+                    'collapse' in parent_id.lower()
+                )
+                
+                # If button has expand indicator or is in collapsible context
+                if has_expand_indicator or is_collapsible_context:
+                    # Check if it's collapsed (aria-expanded="false" or no aria-expanded)
+                    if btn_aria == 'false' or btn_aria is None:
+                        expand_buttons.append(btn)
+            except Exception:
+                continue
+        
+        # Also try selector-based approach
+        for selector in expand_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    if elem.is_displayed() and elem.is_enabled():
+                        aria_expanded = elem.get_attribute('aria-expanded')
+                        # Only expand if it's currently collapsed
+                        if aria_expanded == 'false' or aria_expanded is None:
+                            if elem not in expand_buttons:
+                                expand_buttons.append(elem)
+            except Exception:
+                continue
+        
+        # Remove duplicates
+        unique_buttons = []
+        seen_locations = set()
+        for btn in expand_buttons:
+            try:
+                loc = btn.location
+                loc_key = (loc['x'], loc['y'])
+                if loc_key not in seen_locations:
+                    seen_locations.add(loc_key)
+                    unique_buttons.append(btn)
+            except Exception:
+                continue
+        
+        print(f"Found {len(unique_buttons)} potential expandable sections")
+        
+        # Expand each section
+        for i, btn in enumerate(unique_buttons[:max_expansions]):
+            try:
+                # Scroll to button
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", btn)
+                await asyncio.sleep(0.5)
+                
+                # Check if already expanded
+                aria_expanded = btn.get_attribute('aria-expanded')
+                if aria_expanded == 'true':
+                    continue
+                
+                # Click to expand
+                driver.execute_script("arguments[0].click();", btn)
+                expanded_count += 1
+                print(f"  ✓ Expanded section {i+1}/{min(len(unique_buttons), max_expansions)}")
+                await asyncio.sleep(1)  # Wait for content to load
+                
+            except Exception as e:
+                print(f"  ✗ Could not expand section {i+1}: {e}")
+                continue
+        
+        if expanded_count > 0:
+            print(f"Expanded {expanded_count} collapsible sections")
+            # Wait a bit more for all content to load
+            await asyncio.sleep(2)
+        
+        return expanded_count
+        
+    except Exception as e:
+        print(f"Error expanding collapsible sections: {e}")
+        return 0
+
+
 async def handle_load_more_button(driver, max_clicks: int = 10) -> None:
     """Handle 'Load More' buttons"""
     for click_num in range(max_clicks):
@@ -1386,6 +2395,155 @@ async def handle_load_more_button(driver, max_clicks: int = 10) -> None:
 # ============================================================================
 # MAIN SCRAPING FUNCTIONS
 # ============================================================================
+
+async def extract_jobs_from_current_page(
+    driver, url: str, company_name: str, max_results: int, 
+    seen_titles: set, iframe_switched: bool = False
+) -> List[Job]:
+    """
+    Extract jobs from the current page state
+    
+    Args:
+        driver: Selenium WebDriver instance
+        url: Base URL
+        company_name: Company name
+        max_results: Maximum number of jobs to extract
+        seen_titles: Set of already seen job titles (to avoid duplicates)
+        iframe_switched: Whether we're currently in an iframe context
+    
+    Returns:
+        List of Job objects extracted from current page
+    """
+    page_jobs = []
+    
+    try:
+        # Comprehensive job selectors
+        job_selectors = [
+            # Board-specific selectors FIRST (most accurate)
+            '[data-ui="job"]', 'li[data-ui="job"]',  # Workable
+            '.BambooHR-ATS-Jobs-Item',  # BambooHR
+            '.opening', '.postings-group',  # Greenhouse, Lever
+            '.posting',  # Lever
+            '[data-automation-id="jobTitle"]',  # Workday
+            '.jv-job-list-item',  # Jobvite
+            '.opening-job',  # SmartRecruiters
+            '[class*="JobsList"]',  # Ashby
+            
+            # Shopify/theme-specific patterns
+            '[class*="collapsible"]', '[class*="accordion"]',
+            '[class*="collapsible-content"]', '[class*="accordion-content"]',
+            '[class*="collapsible-trigger"]', '[class*="accordion-trigger"]',
+            'details', 'details summary',  # HTML5 details element
+            
+            # Generic job containers
+            '[class*="job-list"]', '[class*="job-item"]', '[class*="job-card"]',
+            '[class*="job-posting"]', '[class*="jobPosting"]', '[class*="JobPosting"]',
+            '[id*="job-list"]', '[id*="job-item"]', '[id*="joblist"]',
+            
+            # Position/Opening containers
+            '[class*="position"]', '[class*="opening"]', '[class*="vacancy"]',
+            '[class*="career"]', '[class*="role"]',
+            
+            # More generic selectors
+            '.job-listing', '.job', '.position',
+            '[data-job-id]', '[data-posting-id]', '[data-position-id]',
+            
+            # Common HTML structures
+            'article[class*="job"]', 'li[class*="job"]', 'div[class*="job"]',
+            'article[class*="position"]', 'li[class*="position"]', 'div[class*="position"]',
+            'article[class*="career"]', 'li[class*="opening"]', 'div[class*="posting"]',
+            
+            # List items that might contain jobs
+            'ul[class*="job"] > li', 'ul[class*="position"] > li',
+            'ul[class*="opening"] > li', 'ul[class*="career"] > li',
+            
+            # Table rows (some sites use tables)
+            'table[class*="job"] tr', 'table[class*="career"] tr',
+            'tr[class*="job"]', 'tr[class*="position"]',
+            
+            # Headings that might be job titles (for expandable sections)
+            'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+            'strong', 'b',  # Bold text often used for job titles
+            
+            # Broader fallback - any link with job-like text
+            'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]', 'a[href*="opening"]',
+        ]
+        
+        elements = []
+        for selector in job_selectors:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, selector)
+                if found:
+                    elements.extend(found)
+            except Exception:
+                continue
+        
+        # Remove duplicates by position
+        unique_elements = []
+        seen_positions = set()
+        for elem in elements:
+            try:
+                pos = elem.location
+                pos_key = (pos['x'], pos['y'])
+                if pos_key not in seen_positions:
+                    seen_positions.add(pos_key)
+                    unique_elements.append(elem)
+            except Exception:
+                continue
+        
+        # Fallback: If no elements found, try text-based search
+        if len(unique_elements) == 0:
+            job_title_patterns = ["Director", "Manager", "Engineer", "Developer", "Analyst",
+                                "Specialist", "Coordinator", "Assistant", "Associate"]
+            
+            for pattern in job_title_patterns[:5]:
+                try:
+                    xpath_query = f"//*[contains(text(), '{pattern}') and string-length(text()) > 10 and string-length(text()) < 200]"
+                    found = driver.find_elements(By.XPATH, xpath_query)
+                    for elem in found:
+                        try:
+                            text = elem.text.strip()
+                            if is_valid_job_title(text):
+                                unique_elements.append(elem)
+                        except:
+                            continue
+                except Exception:
+                    continue
+        
+        # Extract jobs from elements
+        elements_with_links = []
+        elements_without_links = []
+        
+        for element in unique_elements:
+            try:
+                has_link = element.find_elements(By.TAG_NAME, 'a')
+                if has_link:
+                    elements_with_links.append(element)
+                else:
+                    elements_without_links.append(element)
+            except Exception:
+                elements_without_links.append(element)
+        
+        # Process elements with links first
+        for element in elements_with_links + elements_without_links:
+            if len(page_jobs) >= max_results:
+                break
+            
+            job = extract_job_from_element(element, url, company_name)
+            if job:
+                if job.title in seen_titles:
+                    continue
+                if not is_valid_job_entry(job):
+                    continue
+                
+                seen_titles.add(job.title)
+                page_jobs.append(job)
+        
+    except Exception as e:
+        print(f"  Error extracting jobs from page: {e}")
+    
+    return page_jobs
+
 
 async def scrape_with_selenium(
     url: str,
@@ -1558,11 +2716,25 @@ async def scrape_with_selenium(
                 for i, iframe in enumerate(iframes):
                     try:
                         driver.switch_to.frame(iframe)
-                        await asyncio.sleep(1)
-                        iframe_source = driver.page_source
-                        if any(kw in iframe_source.lower() for kw in ['job', 'position', 'career', 'opening', 'vacancy']):
+                        await asyncio.sleep(2)  # Give iframe more time to load
+                        
+                        # Check if iframe has job-related content
+                        iframe_source = driver.page_source.lower()
+                        has_job_keywords = any(kw in iframe_source for kw in ['job', 'position', 'career', 'opening', 'vacancy', 'director', 'manager', 'marketing', 'operations'])
+                        
+                        # Also check for visible job-related elements
+                        try:
+                            job_elements_in_iframe = driver.find_elements(By.XPATH, 
+                                "//*[contains(text(), 'Director') or contains(text(), 'Manager') or contains(text(), 'Marketing') or contains(text(), 'Operations')]")
+                            has_visible_jobs = len(job_elements_in_iframe) > 0
+                        except:
+                            has_visible_jobs = False
+                        
+                        if has_job_keywords or has_visible_jobs:
                             print(f"Found job content in iframe #{i+1} - staying in this context")
                             iframe_switched = True
+                            # Wait a bit more for iframe content to fully load
+                            await asyncio.sleep(2)
                             break
                         else:
                             driver.switch_to.default_content()
@@ -1578,31 +2750,47 @@ async def scrape_with_selenium(
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
             await asyncio.sleep(2)
             
+            # Expand any collapsible/accordion sections that might contain jobs
+            await expand_collapsible_sections(driver, max_expansions=20)
+            
+            # Scroll again after expansion to ensure all content is visible
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            await asyncio.sleep(2)
+            
             # Try load more button first
             await handle_load_more_button(driver, max_clicks=5)
             
             # Try infinite scroll
             await handle_infinite_scroll(driver, max_scrolls=5)
             
-            # Try pagination
-            await handle_pagination(driver, max_pages=3)
-            
-            # Wait a bit more for any delayed content
+            # Wait a bit more for any delayed content before extraction
             await asyncio.sleep(3)  # Increased from 2 to 3 seconds
             
-            print("\nExtracting job listings from page...")
+            print("\nExtracting job listings from page 1...")
             
             # Extract jobs from page with comprehensive selectors
             job_selectors = [
-                # Board-specific selectors FIRST (most accurate)
+                # ADP/Workday specific selectors FIRST (for workforcenow.adp.com)
+                '[data-automation-id="jobTitle"]',  # Workday - specific job title elements
+                '[aria-label*="job" i]',  # ADP elements with job in aria-label
+                '[id*="jobTitle"]', '[id*="job-title"]',  # Job title IDs
+                'div[class*="job-card"]', 'div[class*="jobCard"]',  # Job card containers
+                'a[href*="/job"]', 'a[href*="/req"]', 'a[href*="/recruitment"]',  # Job links
+                
+                # Board-specific selectors
                 '[data-ui="job"]', 'li[data-ui="job"]',  # Workable
                 '.BambooHR-ATS-Jobs-Item',  # BambooHR
-                '.opening', '.postings-group',  # Greenhouse, Lever
+                '.postings-group',  # Greenhouse, Lever
                 '.posting',  # Lever
-                '[data-automation-id="jobTitle"]',  # Workday
                 '.jv-job-list-item',  # Jobvite
                 '.opening-job',  # SmartRecruiters
                 '[class*="JobsList"]',  # Ashby
+                
+                # Shopify/theme-specific patterns
+                '[class*="collapsible"]', '[class*="accordion"]',
+                '[class*="collapsible-content"]', '[class*="accordion-content"]',
+                '[class*="collapsible-trigger"]', '[class*="accordion-trigger"]',
+                'details', 'details summary',  # HTML5 details element
                 
                 # Generic job containers
                 '[class*="job-list"]', '[class*="job-item"]', '[class*="job-card"]',
@@ -1630,6 +2818,10 @@ async def scrape_with_selenium(
                 'table[class*="job"] tr', 'table[class*="career"] tr',
                 'tr[class*="job"]', 'tr[class*="position"]',
                 
+                # Headings that might be job titles (for expandable sections)
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                'strong', 'b',  # Bold text often used for job titles
+                
                 # Broader fallback - any link with job-like text
                 'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]', 'a[href*="opening"]',
             ]
@@ -1652,22 +2844,102 @@ async def scrape_with_selenium(
                 for sel, count in list(found_with_selector.items())[:5]:  # Show top 5
                     print(f"  • {sel}: {count} elements")
             
-            # Remove duplicates by position
+            # Remove duplicates by position and filter out header/navigation elements
             unique_elements = []
             seen_positions = set()
+            seen_text = set()
+            
+            # Text patterns that indicate headers/navigation (not actual jobs)
+            header_patterns = [
+                'current openings', 'all openings', 'job openings',
+                'search', 'filter', 'location', 'job type',
+                'select location', 'select job type', '0 items selected',
+                'view all', 'see all', 'browse jobs', 'explore careers'
+            ]
+            
             for elem in elements:
                 try:
+                    elem_text_full = elem.text.strip()
+                    elem_text = elem_text_full.lower()[:200]  # First 200 chars
+                    
+                    # Skip if element text is header/navigation
+                    if any(pattern in elem_text for pattern in header_patterns):
+                        # Check if it's ONLY header text (not a job listing that happens to contain these words)
+                        if len(elem_text_full.split('\n')) < 3:  # Headers are usually single line or 2 lines
+                            continue  # Skip header/navigation elements
+                    
+                    # Skip elements that are clearly search/filter UI
+                    if 'select location' in elem_text or 'select job type' in elem_text:
+                        continue
+                    
+                    # Skip very short elements that are likely UI labels
+                    if len(elem_text) < 10 and any(ui_word in elem_text for ui_word in ['search', 'filter', 'location', 'type']):
+                        continue
+                    
+                    # Prefer elements that contain job-like content (locations, dates, employment types)
+                    has_job_indicators = any(indicator in elem_text for indicator in [
+                        'full time', 'part time', 'contract', 'remote', 'hybrid',
+                        'days ago', 'ago', 'posted', 'location:', 'location',
+                        'manager', 'director', 'engineer', 'analyst', 'specialist',
+                        'sr.', 'sr ', 'senior', 'junior', 'lead', 'principal'
+                    ])
+                    
+                    # Skip elements that don't have job indicators and are very short
+                    if not has_job_indicators and len(elem_text) < 30:
+                        continue
+                    
                     pos = elem.location
                     pos_key = (pos['x'], pos['y'])
-                    if pos_key not in seen_positions:
+                    
+                    # Also check for duplicate text content
+                    text_key = elem_text[:50]  # First 50 chars as key
+                    
+                    if pos_key not in seen_positions and text_key not in seen_text:
                         seen_positions.add(pos_key)
+                        seen_text.add(text_key)
                         unique_elements.append(elem)
                 except Exception:
                     continue
             
-            print(f"Found {len(unique_elements)} unique job elements")
+            print(f"Found {len(unique_elements)} unique job elements (after filtering headers)")
             
-            # If no elements found, save page source for debugging
+            # Fallback: If no elements found with standard selectors, try text-based search
+            if len(unique_elements) == 0:
+                print("\n⚠️  No elements found with standard selectors. Trying text-based fallback...")
+                try:
+                    # Look for elements containing common job title patterns
+                    job_title_patterns = [
+                        "Director", "Manager", "Engineer", "Developer", "Analyst",
+                        "Specialist", "Coordinator", "Assistant", "Associate",
+                        "Lead", "Senior", "Junior", "Principal", "Staff",
+                        "Consultant", "Architect", "Designer", "Scientist",
+                        "Technician", "Administrator", "Representative"
+                    ]
+                    
+                    fallback_elements = []
+                    for pattern in job_title_patterns[:5]:  # Try first 5 patterns
+                        try:
+                            # Find elements containing these job title keywords
+                            xpath_query = f"//*[contains(text(), '{pattern}') and string-length(text()) > 10 and string-length(text()) < 200]"
+                            found = driver.find_elements(By.XPATH, xpath_query)
+                            for elem in found:
+                                try:
+                                    text = elem.text.strip()
+                                    # Check if it looks like a job title
+                                    if is_valid_job_title(text) and text not in [e.text.strip() for e in fallback_elements]:
+                                        fallback_elements.append(elem)
+                                except:
+                                    continue
+                        except Exception:
+                            continue
+                    
+                    if fallback_elements:
+                        print(f"  Found {len(fallback_elements)} potential job titles via text search")
+                        unique_elements = fallback_elements[:max_results * 2]  # Limit to avoid too many
+                except Exception as e:
+                    print(f"  Fallback text search failed: {e}")
+            
+            # If still no elements found, save page source for debugging
             if len(unique_elements) == 0:
                 print("\n⚠️  No job elements found. Saving page source for debugging...")
                 page_source = driver.page_source
@@ -1746,37 +3018,164 @@ async def scrape_with_selenium(
             print(f"  Elements with links: {len(elements_with_links)}, without links: {len(elements_without_links)}")
             
             # Process elements with links first (more likely to be real jobs)
-            for element in elements_with_links + elements_without_links:
+            print(f"\n  Attempting to extract jobs from {len(elements_with_links + elements_without_links)} elements...")
+            extraction_failures = 0
+            
+            for i, element in enumerate(elements_with_links + elements_without_links):
                 if len(jobs) >= max_results:
                     break
                 
-                job = extract_job_from_element(element, url, company_name)
-                if job:
-                    if job.title in seen_titles:
-                        continue
-                    # Double-check title is valid (additional validation)
-                    if not is_valid_job_title(job.title):
-                        print(f"  ✗ Skipped (invalid title): {job.title}")
-                        continue
-                    # Triple-check URL is valid
-                    if job.url and not is_valid_job_url(job.url):
-                        print(f"  ✗ Skipped (invalid URL): {job.title}")
-                        print(f"     URL: {job.url[:80] if len(job.url) > 80 else job.url}")
-                        continue
-                    # All checks passed
-                    seen_titles.add(job.title)
-                    jobs.append(job)
-                    print(f"  ✓ Extracted: {job.title}")
+                try:
+                    # Get element text for debugging
+                    element_text = element.text.strip()[:100] if element.text else "No text"
+                    
+                    job = extract_job_from_element(element, url, company_name)
+                    if job:
+                        if job.title in seen_titles:
+                            continue
+                        # Comprehensive validation using is_valid_job_entry
+                        validation_result = is_valid_job_entry(job, debug=True)
+                        if not validation_result:
+                            print(f"  ✗ Skipped (invalid entry): {job.title}")
+                            if job.url:
+                                print(f"     URL: {job.url[:80] if len(job.url) > 80 else job.url}")
+                            continue
+                        # All checks passed
+                        seen_titles.add(job.title)
+                        jobs.append(job)
+                        print(f"  ✓ Extracted: {job.title}")
+                    else:
+                        extraction_failures += 1
+                        if extraction_failures <= 3:  # Only show first 3 failures
+                            print(f"  ⚠️  Failed to extract job from element {i+1}: '{element_text}'")
+                except Exception as e:
+                    extraction_failures += 1
+                    if extraction_failures <= 3:
+                        print(f"  ⚠️  Error extracting from element {i+1}: {e}")
+                    continue
+            
+            if extraction_failures > 0:
+                print(f"  ⚠️  Failed to extract jobs from {extraction_failures} elements")
             
             # Switch back to default content if we were in an iframe
+            # (Pagination is usually in the main document, not in iframes)
             if iframe_switched:
                 try:
                     driver.switch_to.default_content()
-                    print("Switched back to default content")
+                    print("Switched back to default content for pagination detection")
+                    iframe_switched = False  # Reset flag since we're now in default content
+                    await asyncio.sleep(1)  # Wait for context switch
                 except Exception:
                     pass
+            
+            # Now handle pagination and extract jobs from each page
+            if len(jobs) < max_results:
+                print(f"\n{'='*60}")
+                print(f"Handling pagination to collect more jobs...")
+                print(f"Current jobs: {len(jobs)}, Target: {max_results}")
+                print(f"{'='*60}")
+                
+                # Detect pagination (make sure we're in default content, not in an iframe)
+                print("🔍 Detecting pagination...")
+                pagination_info = await detect_pagination(driver)
+                
+                print(f"  Pagination type: {pagination_info['type']}")
+                if pagination_info['total_pages']:
+                    print(f"  Total pages detected: {pagination_info['total_pages']}")
+                if pagination_info['current_page']:
+                    print(f"  Current page: {pagination_info['current_page']}")
+                if pagination_info['page_numbers']:
+                    print(f"  Page numbers found: {pagination_info['page_numbers'][:10]}")  # Show first 10
+                
+                if pagination_info['type'] == 'none':
+                    print("  ⚠️  No pagination detected - only scraping page 1")
+                
+                if pagination_info['type'] != 'none':
+                    if pagination_info['type'] == 'numbered' and pagination_info['page_numbers']:
+                        # Numbered pagination
+                        all_page_numbers = pagination_info['page_numbers']
+                        total_pages = pagination_info['total_pages'] or max(all_page_numbers)
+                        current_page = pagination_info['current_page']
+                        
+                        # Start from page 2 if we're on page 1
+                        start_page = 2 if current_page == 1 else current_page + 1
+                        pages_to_scrape = list(range(start_page, min(total_pages + 1, 20)))  # Limit to 20 pages
+                        
+                        for page_num in pages_to_scrape:
+                            if len(jobs) >= max_results:
+                                break
+                            
+                            print(f"\n📄 Extracting jobs from page {page_num}...")
+                            success = await navigate_to_page(driver, page_num)
+                            
+                            if not success:
+                                print(f"  ⚠️  Could not navigate to page {page_num}, stopping pagination")
+                                break
+                            
+                            # Expand sections and wait for content
+                            await expand_collapsible_sections(driver, max_expansions=20)
+                            await asyncio.sleep(2)
+                            
+                            # Extract jobs from this page using the same logic
+                            page_jobs = await extract_jobs_from_current_page(
+                                driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
+                            )
+                            
+                            # Add page jobs to main jobs list
+                            for job in page_jobs:
+                                if job.title not in seen_titles:
+                                    seen_titles.add(job.title)
+                                    jobs.append(job)
+                                    print(f"  ✓ Extracted: {job.title}")
+                            
+                            print(f"  Found {len(page_jobs)} jobs on page {page_num} (Total: {len(jobs)})")
+                    
+                    elif pagination_info['has_next'] or pagination_info['type'] == 'next_only':
+                        # Next-only pagination
+                        page_num = 1
+                        consecutive_failures = 0
+                        max_consecutive_failures = 2
+                        
+                        while len(jobs) < max_results and page_num < 20:  # Limit to 20 pages
+                            page_num += 1
+                            print(f"\n📄 Extracting jobs from page {page_num}...")
+                            
+                            success = await navigate_to_next_page(driver)
+                            
+                            if not success:
+                                consecutive_failures += 1
+                                if consecutive_failures >= max_consecutive_failures:
+                                    print(f"  ⚠️  No more pages found after {consecutive_failures} attempts")
+                                    break
+                                continue
+                            
+                            consecutive_failures = 0
+                            
+                            # Expand sections and wait for content
+                            await expand_collapsible_sections(driver, max_expansions=20)
+                            await asyncio.sleep(2)
+                            
+                            # Extract jobs from this page
+                            page_jobs = await extract_jobs_from_current_page(
+                                driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
+                            )
+                            
+                            # Add page jobs to main jobs list
+                            for job in page_jobs:
+                                if job.title not in seen_titles:
+                                    seen_titles.add(job.title)
+                                    jobs.append(job)
+                                    print(f"  ✓ Extracted: {job.title}")
+                            
+                            print(f"  Found {len(page_jobs)} jobs on page {page_num} (Total: {len(jobs)})")
         
         print(f"\nTotal jobs extracted: {len(jobs)}")
+        
+        # Apply comprehensive filtering to remove invalid entries
+        if jobs:
+            print(f"\nApplying comprehensive validation filters...")
+            jobs = filter_invalid_jobs(jobs)
+            print(f"Jobs after filtering: {len(jobs)}")
         
     except Exception as e:
         print(f"Error in Selenium scraping: {e}")
@@ -1853,6 +3252,12 @@ async def scrape_generic_career_page(
         jobs = filtered_jobs
     elif not search_query and jobs:
         print(f"\nNo search query provided - returning all {len(jobs)} jobs found")
+    
+    # Apply final validation filter to catch any remaining invalid entries
+    if jobs:
+        print(f"\nApplying final validation filter...")
+        jobs = filter_invalid_jobs(jobs)
+        print(f"Jobs after final filtering: {len(jobs)}")
     
     # Return limited results
     final_jobs = jobs[:max_results]
