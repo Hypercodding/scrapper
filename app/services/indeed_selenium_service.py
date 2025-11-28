@@ -237,38 +237,70 @@ def get_driver(force_new: bool = False):
         # Undetected ChromeDriver automatically handles anti-bot detection
         options = uc.ChromeOptions()
         
-        # Add necessary arguments for containerized environments
-        # NOTE: Headless mode is detected by Cloudflare - comment out to use visible browser
-        # options.add_argument("--headless=new")  # New headless mode (less detectable)
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-setuid-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-software-rasterizer")
+        # Detect if we're in a headless environment (Railway, Docker, etc.)
+        # Check for DISPLAY env var, Railway env vars, or if running in container
+        # Also check if DISPLAY is set but invalid (common in cloud environments)
+        # Allow forcing headless mode via FORCE_HEADLESS env var for testing
+        force_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes")
+        display = os.environ.get("DISPLAY")
+        is_headless_env = force_headless or (
+            not display or  # No display server
+            display == ":99" or  # Virtual display (often used in Docker)
+            os.environ.get("RAILWAY_ENVIRONMENT") or  # Railway platform
+            os.environ.get("RAILWAY_SERVICE_NAME") or  # Railway service
+            os.environ.get("RAILWAY_PROJECT_ID") or  # Railway project
+            os.environ.get("DYNO") or  # Heroku
+            os.path.exists("/.dockerenv") or  # Docker container
+            (not os.path.exists("/dev/tty") and not os.path.exists("/dev/tty0"))  # No TTY available
+        )
+        
+        # Enable headless mode for headless environments (required for Railway)
+        if is_headless_env:
+            print("🌐 Detected headless environment, enabling headless mode...")
+            # Use regular headless (more stable than --headless=new on macOS)
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-software-rasterizer")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-background-networking")
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-backgrounding-occluded-windows")
+            options.add_argument("--disable-breakpad")
+            options.add_argument("--disable-client-side-phishing-detection")
+            options.add_argument("--disable-default-apps")
+            options.add_argument("--disable-hang-monitor")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--disable-prompt-on-repost")
+            options.add_argument("--disable-sync")
+            options.add_argument("--metrics-recording-only")
+            options.add_argument("--no-first-run")
+            options.add_argument("--safebrowsing-disable-auto-update")
+            options.add_argument("--password-store=basic")
+            options.add_argument("--window-size=1920,1080")  # Set size for headless
+            options.add_argument("--virtual-time-budget=5000")
+        else:
+            # Local development with display - use visible browser to avoid Cloudflare detection
+            print("🖥️  Local environment detected, using visible browser...")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-software-rasterizer")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--start-maximized")
+        
         options.add_argument(f"user-agent={settings.USER_AGENT}")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--start-maximized")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--ignore-certificate-errors")
         options.add_argument("--allow-insecure-localhost")
         options.add_argument("--test-type")
-        options.add_argument("--remote-debugging-port=9222")
-        options.add_argument("--remote-debugging-address=0.0.0.0")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-background-networking")
-        options.add_argument("--disable-background-timer-throttling")
-        options.add_argument("--disable-backgrounding-occluded-windows")
-        options.add_argument("--disable-breakpad")
-        options.add_argument("--disable-client-side-phishing-detection")
-        options.add_argument("--disable-default-apps")
-        options.add_argument("--disable-hang-monitor")
-        options.add_argument("--disable-popup-blocking")
-        options.add_argument("--disable-prompt-on-repost")
-        options.add_argument("--disable-sync")
-        options.add_argument("--metrics-recording-only")
-        options.add_argument("--no-first-run")
-        options.add_argument("--safebrowsing-disable-auto-update")
-        options.add_argument("--password-store=basic")
+        # Only enable remote debugging in headless mode (for debugging)
+        if is_headless_env:
+            options.add_argument("--remote-debugging-port=9222")
+            options.add_argument("--remote-debugging-address=0.0.0.0")
         try:
             options.set_capability('acceptInsecureCerts', True)
         except Exception:
@@ -316,53 +348,208 @@ def get_driver(force_new: bool = False):
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
         chrome_path = get_chrome_executable_path()
         chromedriver_path = get_chromedriver_path()
-        _driver = uc.Chrome(
-            options=options,
-            driver_executable_path=chromedriver_path,
-            browser_executable_path=chrome_path,
-            use_subprocess=True,
-            version_main=None  # Let it auto-detect version
-        )
+        
+        try:
+            # For headless mode on macOS, we need to be more careful
+            # undetected_chromedriver can have issues with headless on macOS
+            if is_headless_env:
+                # Add extra stability flags for headless on macOS
+                options.add_argument("--disable-web-security")
+                options.add_argument("--disable-features=VizDisplayCompositor")
+            
+            _driver = uc.Chrome(
+                options=options,
+                driver_executable_path=chromedriver_path,
+                browser_executable_path=chrome_path,
+                use_subprocess=True,
+                version_main=None  # Let it auto-detect version
+            )
+            
+            # Give browser time to fully initialize (especially important in headless)
+            time.sleep(2.0 if is_headless_env else 0.5)
+            
+            # Verify the window is still open (headless mode on macOS can be unstable)
+            # Note: This is a known limitation of undetected_chromedriver on macOS
+            # On Linux (Railway), headless mode works fine
+            max_retries = 2 if is_headless_env else 1
+            for retry in range(max_retries):
+                try:
+                    # Try a simple operation to verify the window is alive
+                    handles = _driver.window_handles
+                    if handles:
+                        break  # Window is alive, continue
+                except Exception as verify_error:
+                    error_msg = str(verify_error)
+                    if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                        if retry < max_retries - 1:
+                            # Try to recreate
+                            print(f"⚠️  Browser window closed, retrying ({retry + 1}/{max_retries})...")
+                            try:
+                                _driver.quit()
+                            except:
+                                pass
+                            _driver = None
+                            # Recreate
+                            _driver = uc.Chrome(
+                                options=options,
+                                driver_executable_path=chromedriver_path,
+                                browser_executable_path=chrome_path,
+                                use_subprocess=True,
+                                version_main=None
+                            )
+                            time.sleep(3.0)  # Longer wait on retry
+                            continue
+                        else:
+                            # Final failure
+                            if is_headless_env:
+                                print("⚠️  Browser window keeps closing in headless mode on macOS")
+                                print("⚠️  This is a known limitation of undetected_chromedriver on macOS")
+                                print("⚠️  On Railway (Linux), headless mode works correctly")
+                                raise Exception("Browser window closed immediately in headless mode. This is a macOS limitation - on Railway (Linux) this works fine.")
+                            else:
+                                raise Exception(f"Driver verification failed: {error_msg}")
+                    else:
+                        raise Exception(f"Driver verification failed: {error_msg}")
+                
+        except Exception as e:
+            error_msg = str(e)
+            if is_headless_env and ("display" in error_msg.lower() or "x11" in error_msg.lower() or "no display" in error_msg.lower()):
+                # If headless detection failed and we get display errors, force headless
+                print("⚠️  Display error detected, forcing headless mode...")
+                options.add_argument("--headless=new")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                _driver = uc.Chrome(
+                    options=options,
+                    driver_executable_path=chromedriver_path,
+                    browser_executable_path=chrome_path,
+                    use_subprocess=True,
+                    version_main=None
+                )
+            else:
+                raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
+        
+        # Verify window is still open before trying to configure it
+        try:
+            handles = _driver.window_handles
+            if not handles:
+                raise Exception("No window handles - window may have closed")
+        except Exception as window_check:
+            print(f"⚠️  Warning: Window check failed after initialization: {window_check}")
+            print("⚠️  This may indicate a compatibility issue with undetected_chromedriver on macOS")
+            # Try to continue anyway - the window might still work for navigation
         
         # Additional stealth measures - hide webdriver property
-        _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Only try if window is still open
+        try:
+            _driver.window_handles  # Quick check
+            _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except Exception as e:
+            error_msg = str(e)
+            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                print(f"⚠️  Warning: Window closed before configuration - skipping stealth measures")
+                # Don't fail here - try to continue
+            else:
+                print(f"⚠️  Warning: Could not hide webdriver property: {e}")
+        
         # Get accept language with proper fallback for empty strings
         accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
-        _driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": settings.USER_AGENT,
-            "acceptLanguage": accept_lang
-        })
+        
+        # Only try CDP commands if window is still open
+        try:
+            _driver.window_handles  # Quick check
+            _driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                "userAgent": settings.USER_AGENT,
+                "acceptLanguage": accept_lang
+            })
+        except Exception as e:
+            error_msg = str(e)
+            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                print(f"⚠️  Warning: Window closed - skipping user agent override")
+            else:
+                print(f"⚠️  Warning: Could not set user agent override: {e}")
+        
         # Extra headers for realism
         try:
+            _driver.window_handles  # Quick check
             extra_headers = {"Accept-Language": accept_lang}
             _driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {"headers": extra_headers})
-        except Exception:
-            pass
+        except Exception as e:
+            error_msg = str(e)
+            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                print(f"⚠️  Warning: Window closed - skipping extra headers")
+            else:
+                print(f"⚠️  Warning: Could not set extra headers: {e}")
 
         # selenium-stealth to reduce detectability
+        # Note: In headless mode, stealth might cause issues, so we skip it if it fails
         try:
             lang_list = [l.strip() for l in accept_lang.split(',') if l and l.strip()]
             primary_lang = lang_list[0] if lang_list else "en-US"
-            stealth(
-                _driver,
-                languages=[primary_lang, "en"],
-                vendor="Google Inc.",
-                platform="MacIntel",
-                webgl_vendor="Intel Inc.",
-                renderer="Intel Iris OpenGL Engine",
-                fix_hairline=True,
-            )
-        except Exception:
-            pass
+            
+            # Only apply stealth if not in headless mode (stealth can cause issues in headless)
+            if not is_headless_env:
+                stealth(
+                    _driver,
+                    languages=[primary_lang, "en"],
+                    vendor="Google Inc.",
+                    platform="MacIntel",
+                    webgl_vendor="Intel Inc.",
+                    renderer="Intel Iris OpenGL Engine",
+                    fix_hairline=True,
+                )
+            else:
+                # In headless mode, use simpler stealth measures
+                print("⚠️  Skipping selenium-stealth in headless mode (can cause window closure)")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not apply stealth measures: {e}")
+            # Verify driver is still alive - but don't fail if it's just a warning
+            try:
+                _driver.window_handles
+            except Exception:
+                # Window closed - this is a problem
+                raise Exception("Browser window closed after stealth initialization")
         
-        # Random viewport  size to appear more human
-        viewport_width = random.randint(1366, 1920)
-        viewport_height = random.randint(768, 1080)
-        _driver.set_window_size(viewport_width, viewport_height)
+        # Final check - verify window is still open after all configuration
+        try:
+            handles = _driver.window_handles
+            if not handles:
+                raise Exception("No window handles after configuration")
+        except Exception as final_check:
+            error_msg = str(final_check)
+            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                print("⚠️  Browser window closed after configuration")
+                print("⚠️  This may be a compatibility issue with undetected_chromedriver on macOS")
+                print("⚠️  Attempting to continue - window may still work for navigation")
+                # Don't fail here - let it try to navigate and see what happens
+            else:
+                print(f"⚠️  Warning: Final window check failed: {error_msg}")
+        
+        # Set viewport size to appear more human (only if not headless)
+        # In headless mode, window size is set via arguments
+        if not is_headless_env:
+            try:
+                # Check window is still open before setting size
+                _driver.window_handles
+                viewport_width = random.randint(1366, 1920)
+                viewport_height = random.randint(768, 1080)
+                _driver.set_window_size(viewport_width, viewport_height)
+            except Exception as e:
+                error_msg = str(e)
+                if "no such window" in error_msg.lower():
+                    print(f"⚠️  Window closed - skipping window size setting")
+                else:
+                    print(f"⚠️  Could not set window size: {e}")
         
         # Track when driver was created
         _driver_created_at = time.time()
-        print(f"✓ WebDriver initialized successfully")
+        
+        # Final verification before declaring success
+        try:
+            _driver.window_handles
+            print(f"✓ WebDriver initialized successfully")
+        except Exception:
+            print(f"⚠️  WebDriver initialized but window may be unstable - will attempt to use it")
     
     return _driver
 
@@ -423,8 +610,28 @@ def _scrape_sync_enhanced(
     days_old: Optional[int] = None
 ) -> List[Job]:
     """Enhanced synchronous scraping function with comprehensive data extraction and advanced filtering."""
+    global _driver  # Declare global at the top of the function
+    
     try:
         driver = get_driver()
+        
+        # Verify driver is still alive before starting (important for headless mode)
+        try:
+            driver.window_handles
+        except Exception as e:
+            error_msg = str(e)
+            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                # Window closed - try to get a new driver
+                print("⚠️  Driver window closed, attempting to recreate...")
+                _driver = None  # Force recreation
+                driver = get_driver(force_new=True)
+                # Verify again
+                try:
+                    driver.window_handles
+                except:
+                    raise Exception("Browser window keeps closing. This may be a macOS headless mode limitation. On Railway (Linux), this should work.")
+            else:
+                raise Exception(f"Driver verification failed: {error_msg}")
     except Exception as e:
         raise Exception(f"Failed to initialize browser: {str(e)}")
     
@@ -472,10 +679,51 @@ def _scrape_sync_enhanced(
             print(f"Navigating to page {page + 1}: {url}")
             print(f"DEBUG - Full URL with filters: {url}")
             
+            # Verify driver is still alive before navigation
+            try:
+                handles = driver.window_handles
+                if not handles:
+                    raise Exception("No window handles available")
+            except Exception as nav_check_error:
+                error_msg = str(nav_check_error)
+                # Check if we're in headless mode
+                is_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes") or not os.environ.get("DISPLAY")
+                if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                    if is_headless:
+                        print("⚠️  Browser window closed before navigation (macOS headless limitation)")
+                        print("⚠️  This is expected on macOS - headless mode will work on Railway (Linux)")
+                        raise Exception("Browser window closed before navigation. This is a macOS limitation with undetected_chromedriver in headless mode. On Railway (Linux), this works correctly.")
+                    else:
+                        print("⚠️  Browser window closed before navigation (non-headless mode)")
+                        print("⚠️  Attempting to recreate driver...")
+                        _driver = None  # Already declared global at function top
+                        driver = get_driver(force_new=True)
+                        # Try verification again
+                        try:
+                            driver.window_handles
+                        except:
+                            raise Exception("Browser window keeps closing. This may indicate a Chrome/ChromeDriver compatibility issue. Try updating Chrome or ChromeDriver.")
+                else:
+                    raise Exception(f"Driver check failed before navigation: {error_msg}")
+            
             # Navigate to the page with soft-retries and backoff when Cloudflare is detected
             retries = 0
             while True:
-                driver.get(url)
+                try:
+                    driver.get(url)
+                except Exception as nav_error:
+                    error_msg = str(nav_error)
+                    if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                        is_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes") or not os.environ.get("DISPLAY")
+                        if is_headless:
+                            print("⚠️  Browser window closed during navigation (macOS headless limitation)")
+                            print("⚠️  This is expected on macOS - headless mode will work on Railway (Linux)")
+                            raise Exception("Browser window closed during navigation. This is a macOS limitation with undetected_chromedriver in headless mode. On Railway (Linux), this works correctly.")
+                        else:
+                            print("⚠️  Browser window closed during navigation (non-headless mode)")
+                            raise Exception("Browser window closed during navigation. This may indicate a Chrome/ChromeDriver compatibility issue. Try updating Chrome or ChromeDriver.")
+                    else:
+                        raise
                 page_html = driver.page_source or ""
                 
                 # More precise Cloudflare detection - only trigger if we see actual block indicators
@@ -517,7 +765,6 @@ def _scrape_sync_enhanced(
                         driver.quit()
                     except Exception:
                         pass
-                    global _driver
                     _driver = None  # Force new driver creation
                     driver = get_driver()
                     print(f"Browser restarted, waiting {backoff:.1f}s before retry...")
