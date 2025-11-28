@@ -4,6 +4,9 @@ import random
 import re
 from typing import Optional, List
 import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from urllib.parse import urlparse, quote_plus
 import os
 import json
@@ -345,71 +348,179 @@ def get_driver(force_new: bool = False):
                     except:
                         pass
         
-        # Initialize undetected chromedriver without selenium-wire to avoid MITM
+        # Initialize driver - use regular Selenium for headless, undetected for visible
         chrome_path = get_chrome_executable_path()
         chromedriver_path = get_chromedriver_path()
         
         try:
-            # For headless mode on macOS, we need to be more careful
-            # undetected_chromedriver can have issues with headless on macOS
+            # Use regular Selenium for headless, undetected_chromedriver for visible
+            # undetected_chromedriver has fundamental incompatibility with headless mode
             if is_headless_env:
-                # Add extra stability flags for headless on macOS
-                options.add_argument("--disable-web-security")
-                options.add_argument("--disable-features=VizDisplayCompositor")
-            
-            _driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_path,
-                browser_executable_path=chrome_path,
-                use_subprocess=True,
-                version_main=None  # Let it auto-detect version
-            )
-            
-            # Give browser time to fully initialize (especially important in headless)
-            time.sleep(2.0 if is_headless_env else 0.5)
-            
-            # Verify the window is still open (headless mode on macOS can be unstable)
-            # Note: This is a known limitation of undetected_chromedriver on macOS
-            # On Linux (Railway), headless mode works fine
-            max_retries = 2 if is_headless_env else 1
-            for retry in range(max_retries):
+                print("🔧 Using regular Selenium ChromeDriver for headless mode")
+                print("   (undetected_chromedriver incompatible with headless - window closes immediately)")
+                
+                # Create regular Chrome options - use minimal, tested configuration
+                chrome_options = ChromeOptions()
+                
+                # Essential headless arguments (tested and working)
+                chrome_options.add_argument("--headless")
+                chrome_options.add_argument("--no-sandbox")
+                chrome_options.add_argument("--disable-dev-shm-usage")
+                chrome_options.add_argument("--disable-gpu")
+                chrome_options.add_argument("--window-size=1920,1080")
+                
+                # Add user agent
+                chrome_options.add_argument(f"user-agent={settings.USER_AGENT}")
+                
+                # Add other important arguments from undetected options (but be selective)
+                important_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--ignore-certificate-errors",
+                    "--disable-extensions",  # Important for headless
+                ]
+                for arg in important_args:
+                    chrome_options.add_argument(arg)
+                
+                # Set capabilities
+                chrome_options.set_capability('acceptInsecureCerts', True)
+                chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+                chrome_options.add_experimental_option('useAutomationExtension', False)
+                
+                # Handle proxy - simplified for headless mode
+                if proxy_url:
+                    parsed = urlparse(proxy_url)
+                    if parsed.username and parsed.password:
+                        # For authenticated proxies in headless, use extension
+                        try:
+                            ext_zip = _build_proxy_auth_extension(proxy_url)
+                            chrome_options.add_argument(f"--load-extension={os.path.dirname(ext_zip)}")
+                            print(f"   Using proxy extension for authenticated proxy")
+                        except Exception as ext_error:
+                            print(f"⚠️  Warning: Could not set up proxy extension: {ext_error}")
+                            print(f"   Continuing without proxy authentication")
+                    else:
+                        chrome_options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}:{parsed.port}")
+                
+                # Create service and initialize with retry logic
+                # Try using webdriver_manager if available for automatic ChromeDriver management
                 try:
-                    # Try a simple operation to verify the window is alive
-                    handles = _driver.window_handles
-                    if handles:
-                        break  # Window is alive, continue
-                except Exception as verify_error:
-                    error_msg = str(verify_error)
-                    if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    use_webdriver_manager = True
+                    print("   Using webdriver_manager for ChromeDriver version management")
+                except ImportError:
+                    use_webdriver_manager = False
+                    print("   webdriver_manager not available, using provided ChromeDriver path")
+                
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        if use_webdriver_manager and not chromedriver_path:
+                            # Use webdriver_manager to get the right ChromeDriver version
+                            service = Service(ChromeDriverManager().install())
+                            print(f"   ChromeDriver installed via webdriver_manager")
+                        else:
+                            service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
+                        
+                        print(f"   Attempting Chrome initialization (attempt {retry + 1}/{max_retries})...")
+                        print(f"   Chrome path: {chrome_path or 'auto-detect'}")
+                        print(f"   ChromeDriver path: {chromedriver_path or 'auto-detect'}")
+                        
+                        _driver = webdriver.Chrome(service=service, options=chrome_options)
+                        
+                        # Wait for Chrome to fully start
+                        print("   Waiting for Chrome to initialize...")
+                        time.sleep(3.0)  # Longer wait for headless
+                        
+                        # Test navigation to verify it works
+                        print("   Testing navigation...")
+                        _driver.get("data:text/html,<html><body>Test</body></html>")
+                        time.sleep(1.0)
+                        
+                        # Verify we can get page source
+                        page_source = _driver.page_source
+                        if page_source and len(page_source) > 0:
+                            print("✓ Regular Selenium ChromeDriver initialized and tested successfully")
+                            break  # Success
+                        else:
+                            raise Exception("Page source is empty after navigation")
+                            
+                    except Exception as init_error:
+                        error_msg = str(init_error)
+                        print(f"❌ Attempt {retry + 1} failed: {error_msg}")
+                        print(f"   Error type: {type(init_error).__name__}")
+                        
                         if retry < max_retries - 1:
-                            # Try to recreate
-                            print(f"⚠️  Browser window closed, retrying ({retry + 1}/{max_retries})...")
+                            print(f"   Retrying in 3 seconds...")
+                            time.sleep(3.0)
+                            # Try cleaning up
                             try:
-                                _driver.quit()
+                                if '_driver' in locals() and _driver:
+                                    _driver.quit()
                             except:
                                 pass
-                            _driver = None
-                            # Recreate
-                            _driver = uc.Chrome(
-                                options=options,
-                                driver_executable_path=chromedriver_path,
-                                browser_executable_path=chrome_path,
-                                use_subprocess=True,
-                                version_main=None
-                            )
-                            time.sleep(3.0)  # Longer wait on retry
                             continue
                         else:
-                            # Final failure
-                            if is_headless_env:
-                                print("⚠️  Browser window keeps closing in headless mode on macOS")
-                                print("⚠️  This is a known limitation of undetected_chromedriver on macOS")
-                                print("⚠️  On Railway (Linux), headless mode works correctly")
-                                raise Exception("Browser window closed immediately in headless mode. This is a macOS limitation - on Railway (Linux) this works fine.")
+                            print(f"❌ ERROR: Failed to initialize regular Selenium ChromeDriver after {max_retries} attempts")
+                            print(f"   Final error: {error_msg}")
+                            import traceback
+                            print(f"   Full traceback:\n{traceback.format_exc()}")
+                            
+                            # Provide helpful error message
+                            if "unable to discover open pages" in error_msg.lower():
+                                raise Exception(f"ChromeDriver cannot connect to Chrome. This may indicate: 1) Chrome/ChromeDriver version mismatch 2) Chrome not starting properly 3) Missing required system dependencies. Error: {error_msg}")
                             else:
-                                raise Exception(f"Driver verification failed: {error_msg}")
-                    else:
-                        raise Exception(f"Driver verification failed: {error_msg}")
+                                raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
+                
+            else:
+                # Use undetected_chromedriver for visible mode (better anti-detection)
+                print("🔧 Using undetected_chromedriver for visible mode (better anti-detection)")
+                
+                _driver = uc.Chrome(
+                    options=options,
+                    driver_executable_path=chromedriver_path,
+                    browser_executable_path=chrome_path,
+                    use_subprocess=True,
+                    version_main=None  # Let it auto-detect version
+                )
+                
+                # Give browser time to fully initialize
+                time.sleep(0.5)
+            
+            # Verify the window is still open - but don't fail if it's closed
+            # Instead, try to use it and see if it works
+            window_ok = False
+            try:
+                handles = _driver.window_handles
+                if handles:
+                    window_ok = True
+                    print(f"✓ Window verification passed: {len(handles)} handle(s)")
+            except Exception as verify_error:
+                error_msg = str(verify_error)
+                print(f"⚠️  Window check failed: {error_msg}")
+                if is_headless_env:
+                    # For headless mode, try to revive by navigating
+                    print("⚠️  Attempting to revive window by navigating...")
+                    try:
+                        _driver.get("data:text/html,<html><body></body></html>")
+                        time.sleep(1.0)
+                        # Check again
+                        try:
+                            _driver.window_handles
+                            window_ok = True
+                            print("✓ Window revived successfully")
+                        except:
+                            print("⚠️  Window still not accessible, but will attempt to use driver anyway")
+                    except Exception as revive_error:
+                        print(f"⚠️  Could not revive window: {revive_error}")
+                        print("⚠️  Will attempt to use driver anyway - it might still work for navigation")
+                else:
+                    # For visible mode, this is more critical
+                    raise Exception(f"Driver verification failed: {error_msg}")
+            
+            # If window check failed but we're in headless, continue anyway
+            # The driver might still work for navigation even if window_handles fails
+            if not window_ok and is_headless_env:
+                print("⚠️  Window check failed in headless mode, but continuing - driver may still work")
                 
         except Exception as e:
             error_msg = str(e)
@@ -430,14 +541,26 @@ def get_driver(force_new: bool = False):
                 raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
         
         # Verify window is still open before trying to configure it
+        # If window closed, try to navigate to a page to revive it
         try:
             handles = _driver.window_handles
             if not handles:
                 raise Exception("No window handles - window may have closed")
         except Exception as window_check:
             print(f"⚠️  Warning: Window check failed after initialization: {window_check}")
-            print("⚠️  This may indicate a compatibility issue with undetected_chromedriver on macOS")
-            # Try to continue anyway - the window might still work for navigation
+            print("⚠️  Attempting to revive window by navigating to blank page...")
+            try:
+                _driver.get("data:text/html,<html><body></body></html>")
+                time.sleep(1.0)
+                # Check again
+                try:
+                    _driver.window_handles
+                    print("✓ Window revived successfully")
+                except:
+                    print("⚠️  Window could not be revived - will attempt to continue")
+            except Exception as revive_error:
+                print(f"⚠️  Could not revive window: {revive_error}")
+                # Try to continue anyway - might still work for navigation
         
         # Additional stealth measures - hide webdriver property
         # Only try if window is still open
@@ -613,27 +736,71 @@ def _scrape_sync_enhanced(
     global _driver  # Declare global at the top of the function
     
     try:
+        print(f"🔍 [SCRAPE] Starting scrape: query='{query}', location='{location}', max_results={max_results}")
         driver = get_driver()
+        print("✓ [SCRAPE] Driver obtained successfully")
         
-        # Verify driver is still alive before starting (important for headless mode)
-        try:
-            driver.window_handles
-        except Exception as e:
-            error_msg = str(e)
-            if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
-                # Window closed - try to get a new driver
-                print("⚠️  Driver window closed, attempting to recreate...")
-                _driver = None  # Force recreation
-                driver = get_driver(force_new=True)
-                # Verify again
+        # Verify driver is still alive before starting
+        # In headless mode, window_handles check is unreliable, so we'll skip it and test with actual navigation
+        is_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes") or not os.environ.get("DISPLAY")
+        
+        if not is_headless:
+            # For visible mode, do proper verification
+            try:
+                handles = driver.window_handles
+                print(f"✓ [SCRAPE] Driver verification passed: {len(handles)} window handle(s)")
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ [SCRAPE] Driver verification failed: {error_msg}")
+                if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                    print("⚠️  [SCRAPE] Driver window closed, attempting to recreate...")
+                    _driver = None
+                    try:
+                        driver = get_driver(force_new=True)
+                        print("✓ [SCRAPE] New driver created")
+                        driver.window_handles  # Verify new driver
+                        print("✓ [SCRAPE] New driver verification passed")
+                    except Exception as recreate_error:
+                        print(f"❌ [SCRAPE] Failed to recreate driver: {recreate_error}")
+                        raise Exception(f"Failed to recreate driver: {str(recreate_error)}")
+                else:
+                    raise Exception(f"Driver verification failed: {error_msg}")
+        else:
+            # For headless mode, skip window_handles check (it's unreliable)
+            # Instead, test with a simple navigation
+            print("⚠️  [SCRAPE] Headless mode detected - skipping window_handles check (unreliable)")
+            print("   [SCRAPE] Will test driver with actual navigation instead")
+            try:
+                # Test with a simple navigation to verify driver works
+                driver.get("data:text/html,<html><body>Test</body></html>")
+                time.sleep(0.5)
+                print("✓ [SCRAPE] Driver test navigation successful - driver is working")
+            except Exception as test_error:
+                error_msg = str(test_error)
+                print(f"❌ [SCRAPE] Driver test navigation failed: {error_msg}")
+                print(f"   Error type: {type(test_error).__name__}")
+                import traceback
+                print(f"   Traceback:\n{traceback.format_exc()}")
+                
+                # Try to recreate once
+                print("⚠️  [SCRAPE] Attempting to recreate driver...")
+                _driver = None
                 try:
-                    driver.window_handles
-                except:
-                    raise Exception("Browser window keeps closing. This may be a macOS headless mode limitation. On Railway (Linux), this should work.")
-            else:
-                raise Exception(f"Driver verification failed: {error_msg}")
+                    driver = get_driver(force_new=True)
+                    # Test again
+                    driver.get("data:text/html,<html><body>Test</body></html>")
+                    time.sleep(0.5)
+                    print("✓ [SCRAPE] New driver test navigation successful")
+                except Exception as recreate_error:
+                    print(f"❌ [SCRAPE] Failed to recreate and test driver: {recreate_error}")
+                    raise Exception(f"Driver not working in headless mode: {str(recreate_error)}")
     except Exception as e:
-        raise Exception(f"Failed to initialize browser: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [SCRAPE] CRITICAL ERROR in browser initialization: {error_msg}")
+        print(f"   Error type: {type(e).__name__}")
+        import traceback
+        print(f"   Full traceback:\n{traceback.format_exc()}")
+        raise Exception(f"Failed to initialize browser: {error_msg}")
     
     jobs = []
     all_jobs_before_filter = []  # Track jobs before filtering
@@ -710,9 +877,22 @@ def _scrape_sync_enhanced(
             retries = 0
             while True:
                 try:
+                    print(f"   [SCRAPE] Attempting navigation to: {url}")
                     driver.get(url)
+                    print(f"✓ [SCRAPE] Navigation successful")
+                    
+                    # Get page source after successful navigation
+                    page_html = driver.page_source or ""
+                    print(f"✓ [SCRAPE] Page source retrieved: {len(page_html)} characters")
+                    break  # Success, exit retry loop
+                    
                 except Exception as nav_error:
                     error_msg = str(nav_error)
+                    print(f"❌ [SCRAPE] Navigation failed: {error_msg}")
+                    print(f"   Error type: {type(nav_error).__name__}")
+                    import traceback
+                    print(f"   Traceback:\n{traceback.format_exc()}")
+                    
                     if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
                         is_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes") or not os.environ.get("DISPLAY")
                         if is_headless:
@@ -723,55 +903,84 @@ def _scrape_sync_enhanced(
                             print("⚠️  Browser window closed during navigation (non-headless mode)")
                             raise Exception("Browser window closed during navigation. This may indicate a Chrome/ChromeDriver compatibility issue. Try updating Chrome or ChromeDriver.")
                     else:
-                        raise
-                page_html = driver.page_source or ""
+                        # For other errors, check if it's a retryable error
+                        if retries < getattr(settings, "MAX_RETRIES", 3):
+                            retries += 1
+                            print(f"⚠️  Retrying navigation ({retries}/{getattr(settings, 'MAX_RETRIES', 3)})...")
+                            time.sleep(2.0)
+                            continue
+                        else:
+                            raise
                 
-                # More precise Cloudflare detection - only trigger if we see actual block indicators
-                # AND we don't see legitimate Indeed job content
-                has_cloudflare_indicators = (
-                    "Checking your browser" in page_html  # Cloudflare's actual text
-                    or "Enable JavaScript and cookies to continue" in page_html  # Cloudflare block message
-                    or ("challenge-platform" in page_html and "<title>Just a moment" in page_html)  # Cloudflare interstitial
-                )
-                has_indeed_content = (
-                    'id="mosaic-provider-jobcards"' in page_html  # Indeed's job cards container
-                    or 'class="jobsearch-ResultsList"' in page_html  # Indeed's results list
-                    or 'data-jk=' in page_html  # Indeed job key attribute
-                )
-                
-                is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
-                
-                if is_actually_blocked:
-                    if retries >= getattr(settings, "MAX_RETRIES", 1):
-                        try:
-                            with open('/tmp/indeed_debug.html', 'w', encoding='utf-8') as f:
-                                f.write(page_html)
-                        except Exception:
-                            pass
-                        raise CloudflareBlockedError("Indeed blocked by Cloudflare (captcha/turnstile). See /tmp/indeed_debug.html")
-                    backoff = random.uniform(getattr(settings, "BACKOFF_MIN", 2.0), getattr(settings, "BACKOFF_MAX", 8.0)) * (1 + 0.5 * retries)
-                    print(f"Cloudflare detected, retry {retries + 1}/{getattr(settings, 'MAX_RETRIES', 3)}, waiting {backoff:.1f}s...")
+            # After successful navigation, check for Cloudflare
+            # More precise Cloudflare detection - only trigger if we see actual block indicators
+            # AND we don't see legitimate Indeed job content
+            has_cloudflare_indicators = (
+                "Checking your browser" in page_html  # Cloudflare's actual text
+                or "Enable JavaScript and cookies to continue" in page_html  # Cloudflare block message
+                or ("challenge-platform" in page_html and "<title>Just a moment" in page_html)  # Cloudflare interstitial
+            )
+            has_indeed_content = (
+                'id="mosaic-provider-jobcards"' in page_html  # Indeed's job cards container
+                or 'class="jobsearch-ResultsList"' in page_html  # Indeed's results list
+                or 'data-jk=' in page_html  # Indeed job key attribute
+            )
+            
+            is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
+            
+            # Handle Cloudflare blocking with retry logic
+            cloudflare_retries = 0
+            while is_actually_blocked:
+                if cloudflare_retries >= getattr(settings, "MAX_RETRIES", 3):
                     try:
-                        if getattr(settings, "HUMANIZE", True):
-                            _perform_human_interactions(driver)
-                        time.sleep(random.uniform(0.8, 1.6))
-                        driver.delete_all_cookies()
-                        # Add more realistic wait
-                        time.sleep(random.uniform(3.0, 6.0))
+                        with open('/tmp/indeed_debug.html', 'w', encoding='utf-8') as f:
+                            f.write(page_html)
                     except Exception:
                         pass
-                    # Close and recreate browser
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    _driver = None  # Force new driver creation
-                    driver = get_driver()
-                    print(f"Browser restarted, waiting {backoff:.1f}s before retry...")
-                    time.sleep(backoff)
-                    retries += 1
-                    continue
-                break
+                    raise CloudflareBlockedError("Indeed blocked by Cloudflare (captcha/turnstile). See /tmp/indeed_debug.html")
+                
+                backoff = random.uniform(getattr(settings, "BACKOFF_MIN", 2.0), getattr(settings, "BACKOFF_MAX", 8.0)) * (1 + 0.5 * cloudflare_retries)
+                print(f"⚠️  [SCRAPE] Cloudflare detected, retry {cloudflare_retries + 1}/{getattr(settings, 'MAX_RETRIES', 3)}, waiting {backoff:.1f}s...")
+                try:
+                    if getattr(settings, "HUMANIZE", True):
+                        _perform_human_interactions(driver)
+                    time.sleep(random.uniform(0.8, 1.6))
+                    driver.delete_all_cookies()
+                    # Add more realistic wait
+                    time.sleep(random.uniform(3.0, 6.0))
+                except Exception as cf_error:
+                    print(f"⚠️  [SCRAPE] Error during Cloudflare retry preparation: {cf_error}")
+                
+                # Close and recreate browser
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                _driver = None  # Force new driver creation
+                driver = get_driver()
+                print(f"✓ [SCRAPE] Browser restarted, waiting {backoff:.1f}s before retry...")
+                time.sleep(backoff)
+                
+                # Retry navigation
+                try:
+                    driver.get(url)
+                    page_html = driver.page_source or ""
+                    # Re-check for Cloudflare
+                    has_cloudflare_indicators = (
+                        "Checking your browser" in page_html
+                        or "Enable JavaScript and cookies to continue" in page_html
+                        or ("challenge-platform" in page_html and "<title>Just a moment" in page_html)
+                    )
+                    has_indeed_content = (
+                        'id="mosaic-provider-jobcards"' in page_html
+                        or 'class="jobsearch-ResultsList"' in page_html
+                        or 'data-jk=' in page_html
+                    )
+                    is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
+                    cloudflare_retries += 1
+                except Exception as retry_error:
+                    print(f"❌ [SCRAPE] Error during Cloudflare retry navigation: {retry_error}")
+                    raise
 
             # Verify we're on the correct page by checking the URL
             current_url = driver.current_url
