@@ -4,7 +4,7 @@ import random
 import re
 from typing import Optional, List
 import undetected_chromedriver as uc
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 import os
 import json
 import zipfile
@@ -238,9 +238,8 @@ def get_driver(force_new: bool = False):
         options = uc.ChromeOptions()
         
         # Add necessary arguments for containerized environments
-        # Enable headless mode for Railway (no display available)
-        # NOTE: Headless mode may be detected by Cloudflare, but required for Railway
-        options.add_argument("--headless=new")  # New headless mode (less detectable)
+        # NOTE: Headless mode is detected by Cloudflare - comment out to use visible browser
+        # options.add_argument("--headless=new")  # New headless mode (less detectable)
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -275,8 +274,9 @@ def get_driver(force_new: bool = False):
         except Exception:
             pass
         # Accept-Language and locale hints
-        if getattr(settings, "ACCEPT_LANGUAGE", None):
-            lang_hint = settings.ACCEPT_LANGUAGE.split(",")[0]
+        accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
+        if accept_lang:
+            lang_hint = accept_lang.split(",")[0].strip()
             if lang_hint:
                 options.add_argument(f"--lang={lang_hint}")
         # Optional proxy support via extension to avoid MITM fingerprints
@@ -316,43 +316,32 @@ def get_driver(force_new: bool = False):
         # Initialize undetected chromedriver without selenium-wire to avoid MITM
         chrome_path = get_chrome_executable_path()
         chromedriver_path = get_chromedriver_path()
-        
-        # For Railway/containerized environments, try without use_subprocess first
-        try:
-            _driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_path,
-                browser_executable_path=chrome_path,
-                use_subprocess=False,  # Disable subprocess for better container compatibility
-                version_main=None  # Let it auto-detect version
-            )
-        except Exception as e:
-            print(f"⚠️  First attempt failed: {e}, trying with use_subprocess=True")
-            # Fallback to subprocess if needed
-            _driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_path,
-                browser_executable_path=chrome_path,
-                use_subprocess=True,
-                version_main=None
-            )
+        _driver = uc.Chrome(
+            options=options,
+            driver_executable_path=chromedriver_path,
+            browser_executable_path=chrome_path,
+            use_subprocess=True,
+            version_main=None  # Let it auto-detect version
+        )
         
         # Additional stealth measures - hide webdriver property
         _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Get accept language with proper fallback for empty strings
+        accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
         _driver.execute_cdp_cmd('Network.setUserAgentOverride', {
             "userAgent": settings.USER_AGENT,
-            "acceptLanguage": getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9")
+            "acceptLanguage": accept_lang
         })
         # Extra headers for realism
         try:
-            extra_headers = {"Accept-Language": getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9")}
+            extra_headers = {"Accept-Language": accept_lang}
             _driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {"headers": extra_headers})
         except Exception:
             pass
 
         # selenium-stealth to reduce detectability
         try:
-            lang_list = [l.strip() for l in getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9").split(',') if l]
+            lang_list = [l.strip() for l in accept_lang.split(',') if l and l.strip()]
             primary_lang = lang_list[0] if lang_list else "en-US"
             stealth(
                 _driver,
@@ -449,7 +438,7 @@ def _scrape_sync_enhanced(
         while len(jobs) < max_results and page < max_pages:
             # Build Indeed search URL with pagination and filters
             base_url = "https://www.indeed.com/jobs"
-            params = f"?q={query.replace(' ', '+')}"
+            params = f"?q={quote_plus(query)}"
             if location:
                 location_param = _format_location_for_indeed(location)
                 params += f"&l={location_param}"

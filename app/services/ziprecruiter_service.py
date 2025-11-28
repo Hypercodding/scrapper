@@ -92,25 +92,13 @@ def get_driver():
         # Initialize undetected chromedriver
         chrome_path = get_chrome_executable_path()
         chromedriver_path = get_chromedriver_path()
-        
-        # For Railway/containerized environments, try without use_subprocess first
-        try:
-            _driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_path,
-                browser_executable_path=chrome_path,
-                use_subprocess=False,  # Disable subprocess for better container compatibility
-                version_main=None
-            )
-        except Exception as e:
-            print(f"⚠️  First attempt failed: {e}, trying with use_subprocess=True")
-            _driver = uc.Chrome(
-                options=options,
-                driver_executable_path=chromedriver_path,
-                browser_executable_path=chrome_path,
-                use_subprocess=True,
-                version_main=None
-            )
+        _driver = uc.Chrome(
+            options=options,
+            driver_executable_path=chromedriver_path,
+            browser_executable_path=chrome_path,
+            use_subprocess=True,
+            version_main=None
+        )
         
         # Additional stealth measures
         _driver.execute_cdp_cmd('Network.setUserAgentOverride', {
