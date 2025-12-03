@@ -1178,6 +1178,47 @@ async def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0):
     await asyncio.sleep(delay)
 
 
+def safe_get_page_source(driver, timeout: int = 30) -> Optional[str]:
+    """
+    Safely get page source with timeout protection
+    
+    Args:
+        driver: Selenium WebDriver instance
+        timeout: Maximum time to wait in seconds
+        
+    Returns:
+        Page source as string or None if timeout/error
+    """
+    try:
+        # Use JavaScript to get page source as it's more reliable
+        page_source = driver.execute_script("return document.documentElement.outerHTML;")
+        return page_source
+    except Exception as e:
+        logger.warning(f"Failed to get page source: {e}")
+        try:
+            # Fallback to regular page_source property
+            return driver.page_source
+        except Exception as e2:
+            logger.error(f"Failed to get page source (fallback): {e2}")
+            return None
+
+
+def check_driver_alive(driver) -> bool:
+    """
+    Check if the driver is still responsive
+    
+    Returns:
+        True if driver is alive and responsive, False otherwise
+    """
+    try:
+        # Simple test to see if driver responds
+        driver.execute_script("return true;")
+        return True
+    except Exception as e:
+        logger.error(f"Driver is unresponsive: {e}")
+        return False
+
+
 def retry_on_failure(max_attempts: int = 3, delay_seconds: float = 2.0):
     """
     Decorator to retry async functions on failure
@@ -1265,7 +1306,11 @@ async def intercept_api_calls(driver, url: str, wait_time: int = 5) -> List[str]
     
     try:
         driver.execute_script(intercept_script)
-        driver.get(url)
+        try:
+            driver.get(url)
+        except TimeoutException:
+            print("  Page load timeout - stopping page load and continuing")
+            driver.execute_script("window.stop();")
         await asyncio.sleep(wait_time)
         
         # Scroll to trigger more API calls
@@ -1991,7 +2036,10 @@ async def handle_pagination(driver, max_pages: int = 10) -> List[int]:
 async def detect_and_clear_no_results(driver) -> bool:
     """Detect if we're on a 'no results' page and try to clear filters"""
     try:
-        page_text = driver.page_source.lower()
+        page_source = safe_get_page_source(driver)
+        if not page_source:
+            return False
+        page_text = page_source.lower()
         
         # Check for common "no results" messages
         no_results_patterns = [
@@ -2576,16 +2624,35 @@ async def scrape_with_selenium(
                 chrome_options.binary_location = chrome_path
             driver = webdriver.Chrome(service=service, options=chrome_options)
         
+        # Set timeouts to prevent hanging
+        driver.set_page_load_timeout(60)  # Max 60 seconds for page load
+        driver.set_script_timeout(30)  # Max 30 seconds for script execution
+        driver.implicitly_wait(10)  # Max 10 seconds for element finding
+        
         print(f"Loading career page: {url}")
         
         # Try to intercept API calls first (with reduced wait time for speed)
         print("Checking for API endpoints...")
         try:
             api_urls = await intercept_api_calls(driver, url, wait_time=3)  # Reduced from 5 to 3 seconds
+        except TimeoutException as e:
+            print(f"Page load timeout during API interception (continuing with HTML scraping): {e}")
+            try:
+                # Stop page loading and continue
+                driver.execute_script("window.stop();")
+                await asyncio.sleep(2)
+            except:
+                pass
+            api_urls = []
         except Exception as e:
             print(f"API interception failed (continuing with HTML scraping): {e}")
-            driver.get(url)
-            await asyncio.sleep(2)
+            try:
+                driver.get(url)
+                await asyncio.sleep(2)
+            except TimeoutException:
+                print("Page load timeout - stopping page load and continuing")
+                driver.execute_script("window.stop();")
+                await asyncio.sleep(2)
             api_urls = []
         
         if api_urls:
@@ -2618,6 +2685,11 @@ async def scrape_with_selenium(
                     print(f"Modal closing error (non-fatal): {e}")
             
             # Standard workflow continues...
+            # Check if driver is still responsive
+            if not check_driver_alive(driver):
+                print("⚠️  Driver is unresponsive - aborting scrape")
+                return jobs
+            
             # Wait a bit for page to load
             print("Waiting for page to load...")
             await asyncio.sleep(2)
@@ -2677,7 +2749,11 @@ async def scrape_with_selenium(
                         await asyncio.sleep(2)  # Give iframe more time to load
                         
                         # Check if iframe has job-related content
-                        iframe_source = driver.page_source.lower()
+                        iframe_source = safe_get_page_source(driver)
+                        if not iframe_source:
+                            driver.switch_to.default_content()
+                            continue
+                        iframe_source = iframe_source.lower()
                         has_job_keywords = any(kw in iframe_source for kw in ['job', 'position', 'career', 'opening', 'vacancy', 'director', 'manager', 'marketing', 'operations'])
                         
                         # Also check for visible job-related elements
@@ -2900,7 +2976,10 @@ async def scrape_with_selenium(
             # If still no elements found, save page source for debugging
             if len(unique_elements) == 0:
                 print("\n⚠️  No job elements found. Saving page source for debugging...")
-                page_source = driver.page_source
+                page_source = safe_get_page_source(driver)
+                if not page_source:
+                    print("  ⚠️  Could not retrieve page source (timeout/error)")
+                    page_source = "<html><body>Failed to retrieve page source</body></html>"
                 debug_file = "/tmp/career_page_debug.html"
                 try:
                     with open(debug_file, "w", encoding="utf-8") as f:
@@ -3135,6 +3214,12 @@ async def scrape_with_selenium(
             jobs = filter_invalid_jobs(jobs)
             print(f"Jobs after filtering: {len(jobs)}")
         
+    except TimeoutException as e:
+        print(f"Timeout error in Selenium scraping: {e}")
+        print("The page took too long to load or respond")
+        # Try to get whatever jobs we have so far
+        print(f"Returning {len(jobs)} jobs collected before timeout")
+    
     except Exception as e:
         print(f"Error in Selenium scraping: {e}")
         import traceback
@@ -3142,7 +3227,15 @@ async def scrape_with_selenium(
     
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                print(f"Error closing driver: {e}")
+                # Force kill if needed
+                try:
+                    driver.service.process.kill()
+                except:
+                    pass
     
     return jobs
 
