@@ -93,6 +93,97 @@ def get_chromedriver_path() -> Optional[str]:
     return None
 
 
+def check_chrome_process_count() -> int:
+    """
+    Check the number of active Chrome/ChromeDriver processes.
+    Returns the count of active processes.
+    """
+    try:
+        import psutil
+        count = 0
+        
+        for proc in psutil.process_iter(['name', 'cmdline']):
+            try:
+                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+                
+                # Check if it's a Chrome or ChromeDriver process
+                if ('chrome' in proc_name or 'chromedriver' in proc_name) and \
+                   ('--test-type' in cmdline or '--enable-automation' in cmdline or 'chromedriver' in cmdline):
+                    count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        if count > 10:
+            print(f"⚠️  WARNING: {count} Chrome/ChromeDriver processes detected!")
+            print("   This may cause connection pool issues. Consider cleaning up.")
+        
+        return count
+    except ImportError:
+        return -1  # psutil not available
+    except Exception as e:
+        print(f"⚠️  Error checking process count: {e}")
+        return -1
+
+
+def cleanup_zombie_processes(aggressive: bool = False):
+    """
+    Clean up any zombie Chrome/ChromeDriver processes.
+    This helps prevent connection pool exhaustion.
+    
+    Args:
+        aggressive: If True, kill all Chrome/ChromeDriver processes including current session
+    """
+    try:
+        import psutil
+        current_pid = os.getpid()
+        killed_count = 0
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # Skip current process
+                if proc.info['pid'] == current_pid:
+                    continue
+                    
+                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+                
+                # Check if it's a Chrome or ChromeDriver process
+                if ('chrome' in proc_name or 'chromedriver' in proc_name) and \
+                   ('--test-type' in cmdline or '--enable-automation' in cmdline or 'chromedriver' in cmdline):
+                    # This is likely a zombie selenium process
+                    print(f"   Killing zombie process: {proc.info['name']} (PID: {proc.info['pid']})")
+                    
+                    # Try terminate first (graceful)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        # If terminate didn't work, kill it
+                        if aggressive:
+                            print(f"   Force killing process: {proc.info['pid']}")
+                            proc.kill()
+                            proc.wait(timeout=2)
+                    
+                    killed_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                pass
+        
+        if killed_count > 0:
+            print(f"✓ Cleaned up {killed_count} zombie Chrome/ChromeDriver process(es)")
+            # Wait a bit for system to release resources
+            time.sleep(2.0)
+            return killed_count
+        else:
+            print("   No zombie processes found")
+    except ImportError:
+        print("⚠️  psutil not available for process cleanup (install with: pip install psutil)")
+    except Exception as e:
+        print(f"⚠️  Error during zombie process cleanup: {e}")
+    
+    return 0
+
+
 class CloudflareBlockedError(Exception):
     """Raised when Indeed returns a Cloudflare/turnstile block page."""
     pass
@@ -216,27 +307,55 @@ def get_driver(force_new: bool = False):
             try:
                 _driver.current_url  # This will fail if window is closed
                 # Also check if process is still alive
-                if _driver.service.process:
-                    _driver.service.process.poll()
-                    if _driver.service.process.returncode is not None:
-                        _driver = None
-            except Exception:
+                if hasattr(_driver, 'service') and _driver.service:
+                    if hasattr(_driver.service, 'process') and _driver.service.process:
+                        _driver.service.process.poll()
+                        if _driver.service.process.returncode is not None:
+                            print("⚠️  Driver process is dead, cleaning up...")
+                            _driver = None
+            except Exception as check_error:
                 # Window closed or driver dead, reset it
+                print(f"⚠️  Driver check failed: {check_error}, cleaning up...")
                 try:
                     _driver.quit()
-                except:
-                    pass
-                _driver = None
+                    if hasattr(_driver, 'service') and _driver.service:
+                        if hasattr(_driver.service, 'process') and _driver.service.process:
+                            if _driver.service.process.poll() is None:
+                                _driver.service.process.terminate()
+                                try:
+                                    _driver.service.process.wait(timeout=5)
+                                except:
+                                    _driver.service.process.kill()
+                except Exception as quit_error:
+                    print(f"⚠️  Error during driver cleanup: {quit_error}")
+                finally:
+                    _driver = None
         elif force_new and _driver:
             # Close existing driver to create new one
+            print("♻️  Forcing new driver creation, cleaning up old driver...")
             try:
                 _driver.quit()
-            except:
-                pass
-            _driver = None
-    except:
+                if hasattr(_driver, 'service') and _driver.service:
+                    if hasattr(_driver.service, 'process') and _driver.service.process:
+                        if _driver.service.process.poll() is None:
+                            _driver.service.process.terminate()
+                            try:
+                                _driver.service.process.wait(timeout=5)
+                            except:
+                                _driver.service.process.kill()
+            except Exception as quit_error:
+                print(f"⚠️  Error during driver cleanup: {quit_error}")
+            finally:
+                _driver = None
+    except Exception as e:
+        print(f"⚠️  Unexpected error in driver check: {e}")
         _driver = None
+    
     if _driver is None:
+        # Clean up any zombie processes before creating new driver
+        print("🧹 Checking for zombie Chrome/ChromeDriver processes...")
+        cleanup_zombie_processes()
+        
         # Undetected ChromeDriver automatically handles anti-bot detection
         options = uc.ChromeOptions()
         
@@ -412,6 +531,8 @@ def get_driver(force_new: bool = False):
                     print("   webdriver_manager not available, using provided ChromeDriver path")
                 
                 max_retries = 3
+                temp_driver = None  # Track temporary driver for cleanup
+                
                 for retry in range(max_retries):
                     try:
                         if use_webdriver_manager and not chromedriver_path:
@@ -425,7 +546,7 @@ def get_driver(force_new: bool = False):
                         print(f"   Chrome path: {chrome_path or 'auto-detect'}")
                         print(f"   ChromeDriver path: {chromedriver_path or 'auto-detect'}")
                         
-                        _driver = webdriver.Chrome(service=service, options=chrome_options)
+                        temp_driver = webdriver.Chrome(service=service, options=chrome_options)
                         
                         # Wait for Chrome to fully start
                         print("   Waiting for Chrome to initialize...")
@@ -433,13 +554,15 @@ def get_driver(force_new: bool = False):
                         
                         # Test navigation to verify it works
                         print("   Testing navigation...")
-                        _driver.get("data:text/html,<html><body>Test</body></html>")
+                        temp_driver.get("data:text/html,<html><body>Test</body></html>")
                         time.sleep(1.0)
                         
                         # Verify we can get page source
-                        page_source = _driver.page_source
+                        page_source = temp_driver.page_source
                         if page_source and len(page_source) > 0:
                             print("✓ Regular Selenium ChromeDriver initialized and tested successfully")
+                            _driver = temp_driver  # Success, assign to global
+                            temp_driver = None  # Clear temp reference
                             break  # Success
                         else:
                             raise Exception("Page source is empty after navigation")
@@ -449,25 +572,51 @@ def get_driver(force_new: bool = False):
                         print(f"❌ Attempt {retry + 1} failed: {error_msg}")
                         print(f"   Error type: {type(init_error).__name__}")
                         
-                        if retry < max_retries - 1:
-                            print(f"   Retrying in 3 seconds...")
-                            time.sleep(3.0)
-                            # Try cleaning up
+                        # Always cleanup temp_driver on failure
+                        if temp_driver:
                             try:
-                                if '_driver' in locals() and _driver:
-                                    _driver.quit()
-                            except:
-                                pass
+                                print(f"   Cleaning up failed driver instance...")
+                                temp_driver.quit()
+                                # Also ensure service process is terminated
+                                if hasattr(temp_driver, 'service') and temp_driver.service:
+                                    if hasattr(temp_driver.service, 'process') and temp_driver.service.process:
+                                        if temp_driver.service.process.poll() is None:
+                                            temp_driver.service.process.terminate()
+                                            try:
+                                                temp_driver.service.process.wait(timeout=5)
+                                            except:
+                                                temp_driver.service.process.kill()  # Force kill if terminate fails
+                                print(f"   ✓ Failed driver cleaned up")
+                            except Exception as cleanup_error:
+                                print(f"   ⚠️  Error during cleanup: {cleanup_error}")
+                            finally:
+                                temp_driver = None
+                        
+                        if retry < max_retries - 1:
+                            # Clean up any remaining zombie processes before retry
+                            print(f"   Running zombie process cleanup before retry...")
+                            cleanup_zombie_processes()
+                            print(f"   Waiting 5 seconds before retry...")
+                            time.sleep(5.0)
                             continue
                         else:
+                            # Final failure - do aggressive cleanup
                             print(f"❌ ERROR: Failed to initialize regular Selenium ChromeDriver after {max_retries} attempts")
                             print(f"   Final error: {error_msg}")
+                            print(f"   Running aggressive cleanup...")
+                            cleanup_zombie_processes()
                             import traceback
                             print(f"   Full traceback:\n{traceback.format_exc()}")
                             
-                            # Provide helpful error message
+                            # Provide helpful error message based on error type
                             if "unable to discover open pages" in error_msg.lower():
                                 raise Exception(f"ChromeDriver cannot connect to Chrome. This may indicate: 1) Chrome/ChromeDriver version mismatch 2) Chrome not starting properly 3) Missing required system dependencies. Error: {error_msg}")
+                            elif "connection pool" in error_msg.lower() or "max retries" in error_msg.lower():
+                                # Connection pool exhaustion
+                                process_count = check_chrome_process_count()
+                                raise Exception(f"Connection pool exhausted ({process_count} Chrome processes active). Too many Chrome instances are running. Try: 1) Close unused Chrome windows 2) Restart the application 3) Run cleanup_zombie_processes(). Error: {error_msg}")
+                            elif "session not created" in error_msg.lower() or "invalid session" in error_msg.lower():
+                                raise Exception(f"Failed to create Chrome session. This may indicate connection pool exhaustion or resource limits. Try restarting the application. Error: {error_msg}")
                             else:
                                 raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
                 
@@ -734,6 +883,17 @@ def _scrape_sync_enhanced(
 ) -> List[Job]:
     """Enhanced synchronous scraping function with comprehensive data extraction and advanced filtering."""
     global _driver  # Declare global at the top of the function
+    driver = None  # Initialize driver to None for cleanup
+    
+    # Check for too many Chrome processes before starting
+    process_count = check_chrome_process_count()
+    if process_count > 15:
+        print(f"⚠️  WARNING: {process_count} Chrome processes detected before scraping!")
+        print("   Running proactive cleanup to prevent connection pool issues...")
+        cleanup_zombie_processes(aggressive=True)
+        time.sleep(2.0)
+        process_count = check_chrome_process_count()
+        print(f"   After cleanup: {process_count} processes remaining")
     
     try:
         print(f"🔍 [SCRAPE] Starting scrape: query='{query}', location='{location}', max_results={max_results}")
@@ -951,12 +1111,23 @@ def _scrape_sync_enhanced(
                 except Exception as cf_error:
                     print(f"⚠️  [SCRAPE] Error during Cloudflare retry preparation: {cf_error}")
                 
-                # Close and recreate browser
+                # Close and recreate browser - ensure complete cleanup
                 try:
                     driver.quit()
-                except Exception:
-                    pass
-                _driver = None  # Force new driver creation
+                    # Also terminate service process if still running
+                    if hasattr(driver, 'service') and driver.service:
+                        if hasattr(driver.service, 'process') and driver.service.process:
+                            if driver.service.process.poll() is None:
+                                driver.service.process.terminate()
+                                driver.service.process.wait(timeout=5)
+                    print("✓ [SCRAPE] Old browser cleaned up")
+                except Exception as cleanup_err:
+                    print(f"⚠️  [SCRAPE] Error during cleanup: {cleanup_err}")
+                finally:
+                    _driver = None  # Force new driver creation
+                
+                # Give system time to release resources
+                time.sleep(2.0)
                 driver = get_driver()
                 print(f"✓ [SCRAPE] Browser restarted, waiting {backoff:.1f}s before retry...")
                 time.sleep(backoff)
@@ -1205,7 +1376,36 @@ def _scrape_sync_enhanced(
         # Let callers handle the specific block to enable fallback
         raise
     except Exception as e:
-        raise Exception(f"Failed to scrape Indeed: {str(e)}")
+        # Ensure cleanup on any error
+        error_msg = str(e)
+        print(f"❌ [SCRAPE] Exception occurred: {error_msg}")
+        
+        # Check if it's a connection pool or session error
+        if any(keyword in error_msg.lower() for keyword in ['connection pool', 'max retries', 'session not created', 'invalid session']):
+            print("🚨 CONNECTION POOL ERROR DETECTED - Running force cleanup...")
+            try:
+                force_cleanup_all()
+                print("✓ Force cleanup completed - you may need to retry the scrape")
+            except Exception as cleanup_error:
+                print(f"⚠️  Error during force cleanup: {cleanup_error}")
+        
+        raise Exception(f"Failed to scrape Indeed: {error_msg}")
+    finally:
+        # Always clean up resources - but keep driver alive for reuse unless it's stale
+        # Only close if driver is in an error state
+        if driver:
+            try:
+                # Test if driver is still responsive
+                _ = driver.current_url
+                print("✓ [SCRAPE] Driver still responsive, keeping alive for reuse")
+            except Exception as cleanup_error:
+                # Driver is in error state, clean it up
+                print(f"⚠️  [SCRAPE] Driver in error state, cleaning up: {cleanup_error}")
+                try:
+                    driver.quit()
+                except:
+                    pass
+                _driver = None
     
     # Mark proxy as successful if scraping completed
     try:
@@ -3512,13 +3712,79 @@ def _format_location_for_indeed(location: str) -> str:
 
 
 def close_driver():
-    """Close the WebDriver when done."""
+    """Close the WebDriver when done and ensure complete cleanup."""
     global _driver, _driver_created_at
     if _driver:
-        _driver.quit()
-        _driver = None
-        _driver_created_at = 0
+        try:
+            # Quit the driver first
+            _driver.quit()
+            print("✓ Driver quit successfully")
+        except Exception as e:
+            print(f"⚠️  Error during driver.quit(): {e}")
+        
+        try:
+            # Ensure service process is terminated
+            if hasattr(_driver, 'service') and _driver.service:
+                if hasattr(_driver.service, 'process') and _driver.service.process:
+                    if _driver.service.process.poll() is None:  # Process still running
+                        _driver.service.process.terminate()
+                        try:
+                            _driver.service.process.wait(timeout=5)
+                        except:
+                            _driver.service.process.kill()  # Force kill if terminate fails
+                        print("✓ ChromeDriver service process terminated")
+        except Exception as e:
+            print(f"⚠️  Error during service cleanup: {e}")
+        finally:
+            _driver = None
+            _driver_created_at = 0
     
     # Optionally reset proxy manager (uncomment if you want fresh start each time)
     # reset_proxy_manager()
+
+
+def force_cleanup_all():
+    """
+    Force cleanup of all Chrome/ChromeDriver resources.
+    Use this when experiencing connection pool exhaustion.
+    """
+    global _driver, _driver_created_at
+    
+    print("🧹 FORCE CLEANUP: Cleaning up all Chrome/ChromeDriver resources...")
+    
+    # First, close the current driver if exists
+    if _driver:
+        try:
+            print("   Closing current driver...")
+            _driver.quit()
+            if hasattr(_driver, 'service') and _driver.service:
+                if hasattr(_driver.service, 'process') and _driver.service.process:
+                    if _driver.service.process.poll() is None:
+                        _driver.service.process.terminate()
+                        try:
+                            _driver.service.process.wait(timeout=5)
+                        except:
+                            _driver.service.process.kill()
+        except Exception as e:
+            print(f"   Error closing current driver: {e}")
+        finally:
+            _driver = None
+            _driver_created_at = 0
+    
+    # Then, aggressively cleanup all zombie processes
+    print("   Running aggressive zombie cleanup...")
+    cleanup_zombie_processes(aggressive=True)
+    
+    # Check remaining process count
+    process_count = check_chrome_process_count()
+    print(f"✓ Force cleanup complete. Remaining Chrome processes: {process_count}")
+    
+    # Reset proxy manager to start fresh
+    try:
+        reset_proxy_manager()
+        print("✓ Proxy manager reset")
+    except:
+        pass
+    
+    return process_count
 
