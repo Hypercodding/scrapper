@@ -2190,157 +2190,91 @@ async def try_search_filter(driver, search_query: str) -> bool:
 
 
 async def handle_infinite_scroll(driver, max_scrolls: int = 10) -> None:
-    """Handle infinite scroll by scrolling down"""
+    """Handle infinite scroll by scrolling down - OPTIMIZED"""
     last_height = driver.execute_script("return document.body.scrollHeight")
+    no_change_count = 0
     
     for scroll_num in range(max_scrolls):
         # Scroll down
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1.5)  # Reduced from 2 seconds
         
         # Calculate new scroll height
         new_height = driver.execute_script("return document.body.scrollHeight")
         
         if new_height == last_height:
-            print(f"Reached end of infinite scroll after {scroll_num + 1} scrolls")
-            break
+            no_change_count += 1
+            if no_change_count >= 2:  # Stop after 2 consecutive no-changes
+                print(f"Reached end of infinite scroll after {scroll_num + 1} scrolls")
+                break
+        else:
+            no_change_count = 0
+            print(f"Infinite scroll {scroll_num + 1}/{max_scrolls}")
         
         last_height = new_height
-        print(f"Infinite scroll {scroll_num + 1}/{max_scrolls}")
 
 
 async def expand_collapsible_sections(driver, max_expansions: int = 20) -> int:
     """
     Find and expand collapsible/accordion sections that might contain job listings
+    OPTIMIZED: Uses JavaScript for faster DOM queries
     
     Returns:
         Number of sections expanded
     """
     try:
         print("Checking for expandable/collapsible sections...")
+        
+        # Use JavaScript to find expandable buttons much faster
+        js_script = """
+        const expandButtons = [];
+        
+        // Query for specific collapsed buttons only
+        const selectors = [
+            'button[aria-expanded="false"]',
+            '[role="button"][aria-expanded="false"]',
+            '.accordion-button.collapsed',
+            '.accordion-header button',
+        ];
+        
+        const foundElements = new Set();
+        
+        for (const selector of selectors) {
+            try {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => {
+                    if (el.offsetParent !== null) { // visible check
+                        foundElements.add(el);
+                    }
+                });
+            } catch (e) {}
+        }
+        
+        return Array.from(foundElements);
+        """
+        
+        expand_buttons = driver.execute_script(js_script)
+        
+        print(f"Found {len(expand_buttons)} potential expandable sections")
+        
+        if len(expand_buttons) == 0:
+            return 0
+        
         expanded_count = 0
         
-        # Common selectors for expandable sections
-        expand_selectors = [
-            # Buttons with expand/collapse indicators
-            'button[aria-expanded="false"]',
-            'button[aria-expanded="true"]',  # Try both, we'll check state
-            '[role="button"][aria-expanded="false"]',
-            # Accordion elements
-            '.accordion-button:not(.collapsed)',
-            '.accordion-header button',
-            '[class*="accordion"] button',
-            '[class*="collapse"] button',
-            '[class*="expand"] button',
-            '[class*="toggle"] button',
-            # Elements with + or expand icons
-            'button:has(svg[class*="plus"])',
-            'button:has(svg[class*="expand"])',
-            'button:has(svg[class*="chevron-down"])',
-            # Generic buttons near job-related text
-            'button[class*="job"]',
-            'button[class*="position"]',
-            'button[class*="career"]',
-            # Shopify/theme-specific patterns
-            '[class*="collapsible"] button',
-            '[class*="collapsible-content"] + button',
-        ]
-        
-        # Also look for buttons by text content
-        all_buttons = driver.find_elements(By.TAG_NAME, 'button')
-        expand_buttons = []
-        
-        for btn in all_buttons:
+        # Expand each section (limit to max_expansions)
+        for i, btn in enumerate(expand_buttons[:max_expansions]):
             try:
-                if not btn.is_displayed():
-                    continue
-                
-                btn_text = btn.text.lower().strip()
-                btn_aria = btn.get_attribute('aria-expanded')
-                
-                # Check if button looks like an expand button
-                # Look for +, expand, or check if it's near job-related content
-                btn_html = btn.get_attribute('outerHTML') or ''
-                
-                # Check for expand indicators
-                has_expand_indicator = (
-                    '+' in btn_text or
-                    'expand' in btn_text or
-                    'more' in btn_text or
-                    'show' in btn_text or
-                    '+' in btn_html or
-                    'plus' in btn_html.lower() or
-                    'expand' in btn_html.lower() or
-                    'chevron' in btn_html.lower()
-                )
-                
-                # Check if button is in a collapsible context
-                parent = btn.find_element(By.XPATH, './..')
-                parent_class = parent.get_attribute('class') or ''
-                parent_id = parent.get_attribute('id') or ''
-                
-                is_collapsible_context = (
-                    'accordion' in parent_class.lower() or
-                    'collapse' in parent_class.lower() or
-                    'collapsible' in parent_class.lower() or
-                    'accordion' in parent_id.lower() or
-                    'collapse' in parent_id.lower()
-                )
-                
-                # If button has expand indicator or is in collapsible context
-                if has_expand_indicator or is_collapsible_context:
-                    # Check if it's collapsed (aria-expanded="false" or no aria-expanded)
-                    if btn_aria == 'false' or btn_aria is None:
-                        expand_buttons.append(btn)
-            except Exception:
-                continue
-        
-        # Also try selector-based approach
-        for selector in expand_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for elem in elements:
-                    if elem.is_displayed() and elem.is_enabled():
-                        aria_expanded = elem.get_attribute('aria-expanded')
-                        # Only expand if it's currently collapsed
-                        if aria_expanded == 'false' or aria_expanded is None:
-                            if elem not in expand_buttons:
-                                expand_buttons.append(elem)
-            except Exception:
-                continue
-        
-        # Remove duplicates
-        unique_buttons = []
-        seen_locations = set()
-        for btn in expand_buttons:
-            try:
-                loc = btn.location
-                loc_key = (loc['x'], loc['y'])
-                if loc_key not in seen_locations:
-                    seen_locations.add(loc_key)
-                    unique_buttons.append(btn)
-            except Exception:
-                continue
-        
-        print(f"Found {len(unique_buttons)} potential expandable sections")
-        
-        # Expand each section
-        for i, btn in enumerate(unique_buttons[:max_expansions]):
-            try:
-                # Scroll to button
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", btn)
-                await asyncio.sleep(0.5)
-                
-                # Check if already expanded
+                # Check if still collapsed before clicking
                 aria_expanded = btn.get_attribute('aria-expanded')
                 if aria_expanded == 'true':
                     continue
                 
-                # Click to expand
-                driver.execute_script("arguments[0].click();", btn)
+                # Click to expand using JavaScript (faster)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", btn)
                 expanded_count += 1
-                print(f"  ✓ Expanded section {i+1}/{min(len(unique_buttons), max_expansions)}")
-                await asyncio.sleep(1)  # Wait for content to load
+                print(f"  ✓ Expanded section {i+1}/{min(len(expand_buttons), max_expansions)}")
+                await asyncio.sleep(0.3)  # Reduced wait time
                 
             except Exception as e:
                 print(f"  ✗ Could not expand section {i+1}: {e}")
@@ -2348,8 +2282,7 @@ async def expand_collapsible_sections(driver, max_expansions: int = 20) -> int:
         
         if expanded_count > 0:
             print(f"Expanded {expanded_count} collapsible sections")
-            # Wait a bit more for all content to load
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced from 2 seconds
         
         return expanded_count
         
@@ -2359,53 +2292,41 @@ async def expand_collapsible_sections(driver, max_expansions: int = 20) -> int:
 
 
 async def handle_load_more_button(driver, max_clicks: int = 10) -> None:
-    """Handle 'Load More' buttons"""
+    """Handle 'Load More' buttons - OPTIMIZED with JavaScript"""
     for click_num in range(max_clicks):
         try:
-            # Find load more buttons using multiple strategies
-            load_more = None
+            # Use JavaScript to find load more button faster
+            js_script = """
+            const keywords = ['load more', 'show more', 'see more', 'view more'];
+            const selectors = [
+                '[class*="load-more"]', '[class*="loadmore"]',
+                '[class*="show-more"]', '[class*="showmore"]',
+                '[id*="load-more"]', '[id*="loadmore"]',
+                'button', 'a[role="button"]'
+            ];
             
-            # Strategy 1: Find by text content
-            try:
-                buttons = driver.find_elements(By.TAG_NAME, 'button')
-                for btn in buttons:
-                    btn_text = btn.text.lower()
-                    if any(text in btn_text for text in ['load more', 'show more', 'see more', 'view more', 'load']):
-                        if btn.is_displayed() and btn.is_enabled():
-                            load_more = btn
-                            break
-            except Exception:
-                pass
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                for (const el of elements) {
+                    if (el.offsetParent === null) continue; // skip hidden
+                    
+                    const text = el.textContent.toLowerCase();
+                    const hasKeyword = keywords.some(kw => text.includes(kw));
+                    
+                    if (hasKeyword) {
+                        return el;
+                    }
+                }
+            }
+            return null;
+            """
             
-            # Strategy 2: Find by common class patterns
-            if not load_more:
-                load_more_selectors = [
-                    '[class*="load-more"]',
-                    '[class*="loadmore"]',
-                    '[class*="show-more"]',
-                    '[class*="showmore"]',
-                    '[id*="load-more"]',
-                    '[id*="loadmore"]',
-                ]
-                
-                for selector in load_more_selectors:
-                    try:
-                        found = driver.find_elements(By.CSS_SELECTOR, selector)
-                        for elem in found:
-                            if elem.is_displayed() and elem.is_enabled():
-                                load_more = elem
-                                break
-                        if load_more:
-                            break
-                    except Exception:
-                        continue
+            load_more = driver.execute_script(js_script)
             
             if load_more:
                 print(f"Clicking 'Load More' button (click {click_num + 1})")
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more)
-                await asyncio.sleep(0.5)
-                driver.execute_script("arguments[0].click();", load_more)
-                await asyncio.sleep(3)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", load_more)
+                await asyncio.sleep(2)  # Reduced from 3 seconds
             else:
                 print("No more 'Load More' button found")
                 break
@@ -2778,18 +2699,18 @@ async def scrape_with_selenium(
             
             # Handle different loading patterns
             print("Waiting for initial content to load...")
-            await asyncio.sleep(5)  # Increased from 3 to 5 seconds for JS-heavy pages
+            await asyncio.sleep(3)  # Reduced from 5 to 3 seconds
             
             # Scroll to trigger lazy-loaded content
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced from 2 seconds
             
             # Expand any collapsible/accordion sections that might contain jobs
-            await expand_collapsible_sections(driver, max_expansions=20)
+            await expand_collapsible_sections(driver, max_expansions=15)  # Reduced from 20
             
             # Scroll again after expansion to ensure all content is visible
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced from 2 seconds
             
             # Try load more button first
             await handle_load_more_button(driver, max_clicks=5)
@@ -2798,7 +2719,7 @@ async def scrape_with_selenium(
             await handle_infinite_scroll(driver, max_scrolls=5)
             
             # Wait a bit more for any delayed content before extraction
-            await asyncio.sleep(3)  # Increased from 2 to 3 seconds
+            await asyncio.sleep(1.5)  # Reduced from 3 seconds
             
             print("\nExtracting job listings from page 1...")
             
@@ -3150,8 +3071,8 @@ async def scrape_with_selenium(
                                 break
                             
                             # Expand sections and wait for content
-                            await expand_collapsible_sections(driver, max_expansions=20)
-                            await asyncio.sleep(2)
+                            await expand_collapsible_sections(driver, max_expansions=10)  # Reduced from 20
+                            await asyncio.sleep(1)  # Reduced from 2 seconds
                             
                             # Extract jobs from this page using the same logic
                             page_jobs = await extract_jobs_from_current_page(
@@ -3189,8 +3110,8 @@ async def scrape_with_selenium(
                             consecutive_failures = 0
                             
                             # Expand sections and wait for content
-                            await expand_collapsible_sections(driver, max_expansions=20)
-                            await asyncio.sleep(2)
+                            await expand_collapsible_sections(driver, max_expansions=10)  # Reduced from 20
+                            await asyncio.sleep(1)  # Reduced from 2 seconds
                             
                             # Extract jobs from this page
                             page_jobs = await extract_jobs_from_current_page(
