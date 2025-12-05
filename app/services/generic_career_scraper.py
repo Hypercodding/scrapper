@@ -1311,13 +1311,13 @@ async def intercept_api_calls(driver, url: str, wait_time: int = 5) -> List[str]
         except TimeoutException:
             print("  Page load timeout - stopping page load and continuing")
             driver.execute_script("window.stop();")
-        await asyncio.sleep(wait_time)
         
-        # Scroll to trigger more API calls
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        await asyncio.sleep(2)
+        # OPTIMIZED: Reduced wait times significantly
+        await asyncio.sleep(1.5)  # Reduced from wait_time (3s) to 1.5s
+        
+        # Quick scroll to trigger API calls (if any)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # Reduced from 4s total (2+2) to 1s
         
         # Get captured requests
         captured = driver.execute_script("return window.capturedRequests;")
@@ -1328,6 +1328,8 @@ async def intercept_api_calls(driver, url: str, wait_time: int = 5) -> List[str]
             for req in captured:
                 api_urls.append(req['url'])
                 print(f"  Found API: {req['url'][:100]}")
+        else:
+            print("No API endpoints found - will use HTML scraping")
         
         return api_urls
         
@@ -1448,6 +1450,137 @@ async def scrape_api_endpoint(session: requests.Session, api_url: str, company_n
 # ============================================================================
 # JOB EXTRACTION FROM HTML ELEMENTS
 # ============================================================================
+
+def extract_job_from_element_optimized(element, element_data: dict, base_url: str, company_name: str) -> Optional[Job]:
+    """
+    OPTIMIZED: Extract comprehensive job information using pre-fetched element data
+    This avoids expensive WebDriver API calls
+    """
+    try:
+        # Use pre-fetched outerHTML and text
+        outer_html = element_data.get('outerHTML', '')
+        text = element_data.get('text', '')
+        
+        if not outer_html or not text:
+            return None
+        
+        soup = BeautifulSoup(outer_html, 'html.parser')
+        
+        # Extract title
+        title = None
+        title_selectors_ordered = [
+            '[data-automation-id="jobTitle"]',
+            '[data-testid*="job"]',
+            '[class*="job-title"]', '[class*="jobTitle"]',
+            'h1', 'h2', 'h3', 'h4', 'h5',
+            'a[href*="job"]', 'a[href*="position"]',
+            '[class*="title"]',
+            'a'
+        ]
+        
+        for selector in title_selectors_ordered:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    title_text = elem.get_text(strip=True)
+                    if title_text and 3 <= len(title_text) <= 200:
+                        if not title or len(title_text) > len(title or ''):
+                            title = title_text
+            except Exception:
+                continue
+        
+        # Fallback title extraction
+        if not title:
+            all_text = soup.get_text(separator='\n', strip=True)
+            lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+            for line in lines:
+                if 5 <= len(line) <= 200:
+                    if not line.isupper() or len(line.split()) >= 2:
+                        title = line
+                        break
+        
+        if not title or len(title.strip()) < 3:
+            return None
+        
+        # Extract description
+        description = clean_text(text)
+        if len(description) > 500:
+            description = description[:500] + "..."
+        
+        # Extract URL from pre-fetched links
+        job_url = None
+        pre_fetched_links = element_data.get('links', [])
+        
+        for href in pre_fetched_links:
+            if not href:
+                continue
+            full_url = urljoin(base_url, href)
+            url_lower = full_url.lower()
+            
+            looks_like_job_url = any(pattern in url_lower for pattern in [
+                '/job/', '/jobs/', '/careers/', '/career/', '/openings/',
+                '/positions/', '/posting/', '/recruitment/', '/apply/', '/req/'
+            ])
+            
+            if looks_like_job_url:
+                job_url = full_url
+                break
+        
+        # Use first link if no job-specific URL found
+        if not job_url and pre_fetched_links:
+            job_url = urljoin(base_url, pre_fetched_links[0])
+        
+        # Extract location
+        location = extract_text_field(text, LOCATION_PATTERNS)
+        
+        # Extract employment type
+        employment_type = extract_dict_field(text, EMPLOYMENT_TYPE_PATTERNS)
+        
+        # Extract remote type
+        remote_type = extract_dict_field(text, REMOTE_TYPE_PATTERNS)
+        
+        # Extract salary
+        salary = None
+        for pattern in SALARY_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                salary = match.group(0)
+                break
+        
+        # Extract posting date
+        posted_date = None
+        for pattern in DATE_PATTERNS:
+            match = re.search(pattern, text)
+            if match:
+                posted_date = match.group(0)
+                break
+        
+        # Extract requirements
+        requirements = None
+        req_indicators = ['requirements', 'qualifications', 'you have', 'what you bring']
+        for indicator in req_indicators:
+            if indicator in text.lower():
+                idx = text.lower().find(indicator)
+                req_text = text[idx:idx+500]
+                requirements = clean_text(req_text)
+                break
+        
+        return Job(
+            title=clean_text(title),
+            company=company_name,
+            location=location,
+            description=description,
+            url=job_url,
+            remote_type=remote_type,
+            employment_type=employment_type,
+            salary=salary,
+            posted_date=posted_date,
+            requirements=requirements
+        )
+        
+    except Exception as e:
+        return None
+
 
 def extract_job_from_element(element, base_url: str, company_name: str) -> Optional[Job]:
     """Extract comprehensive job information from HTML element"""
@@ -2059,30 +2192,32 @@ async def detect_and_clear_no_results(driver) -> bool:
         if has_no_results:
             print("⚠️  Detected 'no results' page - attempting to clear filters...")
             
-            # Try to find and click "Clear All" or "Show All Jobs" buttons
-            clear_button_texts = [
-                'clear all', 'clear filters', 'reset filters', 
+            # Try to find and click "Clear All" or "Show All Jobs" buttons - OPTIMIZED
+            clear_button = driver.execute_script("""
+                const keywords = ['clear all', 'clear filters', 'reset filters', 
                 'show all jobs', 'view all jobs', 'see all jobs',
-                'remove filters', 'reset'
-            ]
+                                'remove filters', 'reset'];
+                const elements = [...document.querySelectorAll('button, a[role="button"], a')];
+                
+                for (const el of elements) {
+                    if (el.offsetParent === null) continue; // skip hidden
+                    const text = el.textContent.toLowerCase();
+                    if (keywords.some(kw => text.includes(kw))) {
+                        return el;
+                    }
+                }
+                return null;
+            """)
             
-            buttons = driver.find_elements(By.TAG_NAME, 'button')
-            links = driver.find_elements(By.TAG_NAME, 'a')
-            
-            for element in buttons + links:
+            if clear_button:
                 try:
-                    element_text = element.text.lower()
-                    if any(text in element_text for text in clear_button_texts):
-                        if element.is_displayed() and element.is_enabled():
-                            print(f"  Found button: '{element.text}' - clicking...")
-                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-                            await asyncio.sleep(0.5)
-                            element.click()
-                            await asyncio.sleep(3)
-                            print("  ✓ Clicked - page should reload with all jobs")
-                            return True
+                    print(f"  Found clear/reset button - clicking...")
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", clear_button)
+                    await asyncio.sleep(2)  # Reduced from 3s
+                    print("  ✓ Clicked - page should reload with all jobs")
+                    return True
                 except Exception:
-                    continue
+                    pass
             
             # Try to find search input and clear it
             try:
@@ -2109,72 +2244,81 @@ async def detect_and_clear_no_results(driver) -> bool:
 
 
 async def try_search_filter(driver, search_query: str) -> bool:
-    """Try to use search/filter inputs on the career page"""
+    """Try to use search/filter inputs on the career page - OPTIMIZED"""
     try:
         print(f"Looking for search filter to apply query: '{search_query}'")
         
-        # Common search input selectors
-        search_selectors = [
+        # Use JavaScript to find search input faster
+        search_input = driver.execute_script("""
+            const selectors = [
             'input[type="search"]',
             'input[placeholder*="search" i]',
             'input[placeholder*="find" i]',
             'input[name*="search" i]',
-            'input[name*="query" i]',
             'input[id*="search" i]',
-            'input[class*="search" i]',
             '[role="searchbox"]',
-            'input[type="text"]',  # Fallback
-        ]
-        
-        search_input = None
-        for selector in search_selectors:
-            try:
-                inputs = driver.find_elements(By.CSS_SELECTOR, selector)
-                for inp in inputs:
-                    if inp.is_displayed() and inp.is_enabled():
-                        search_input = inp
-                        break
-                if search_input:
-                    break
-            except Exception:
-                continue
+                'input[type="text"]'
+            ];
+            
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                for (const el of elements) {
+                    if (el.offsetParent !== null && !el.disabled) {
+                        return el;
+                    }
+                }
+            }
+            return null;
+        """)
         
         if search_input:
             print("Found search input - entering search query")
             search_input.clear()
             search_input.send_keys(search_query)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s
             
             # Try to submit search
             # Strategy 1: Press Enter
             try:
                 search_input.send_keys(Keys.RETURN)
                 print("Submitted search with Enter key")
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)  # Reduced from 3s
                 return True
             except Exception:
                 pass
             
-            # Strategy 2: Find and click search button
-            search_button_selectors = [
+            # Strategy 2: Find and click search button - OPTIMIZED
+            search_button = driver.execute_script("""
+                const selectors = [
                 'button[type="submit"]',
                 'button[aria-label*="search" i]',
-                'button:has(svg)',  # Icon buttons
                 '[class*="search"][class*="button"]',
                 '[class*="search-btn"]',
-            ]
+                    'button'
+                ];
+                
+                for (const selector of selectors) {
+                    const elements = document.querySelectorAll(selector);
+                    for (const el of elements) {
+                        if (el.offsetParent !== null && !el.disabled) {
+                            const text = el.textContent.toLowerCase();
+                            if (text.includes('search') || text.includes('find')) {
+                                return el;
+                            }
+                        }
+                    }
+                }
+                return null;
+            """)
             
-            for selector in search_button_selectors:
+            if search_button:
                 try:
-                    buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-                    for btn in buttons:
-                        if btn.is_displayed() and btn.is_enabled():
-                            btn.click()
-                            print("Clicked search button")
-                            await asyncio.sleep(3)
-                            return True
+                    search_button.click()
+                    print("Clicked search button")
+                    await asyncio.sleep(2)  # Reduced from 3s
+                    return True
                 except Exception:
-                    continue
+                    pass
             
             # If no explicit submit, just wait for auto-filter
             print("Waiting for auto-filter to apply")
@@ -2545,10 +2689,10 @@ async def scrape_with_selenium(
                 chrome_options.binary_location = chrome_path
             driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Set timeouts to prevent hanging
-        driver.set_page_load_timeout(60)  # Max 60 seconds for page load
-        driver.set_script_timeout(30)  # Max 30 seconds for script execution
-        driver.implicitly_wait(10)  # Max 10 seconds for element finding
+        # Set timeouts to prevent hanging - OPTIMIZED
+        driver.set_page_load_timeout(30)  # Reduced from 60s - Max 30 seconds for page load
+        driver.set_script_timeout(15)  # Reduced from 30s - Max 15 seconds for script execution
+        driver.implicitly_wait(5)  # Reduced from 10s - Max 5 seconds for element finding
         
         print(f"Loading career page: {url}")
         
@@ -2611,37 +2755,41 @@ async def scrape_with_selenium(
                 print("⚠️  Driver is unresponsive - aborting scrape")
                 return jobs
             
-            # Wait a bit for page to load
+            # Wait a bit for page to load (page already loaded from API check)
             print("Waiting for page to load...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)  # OPTIMIZED: Reduced from 2s - page already loaded
             
             # Check if we're on a "no results" page and try to clear filters
             cleared_filters = await detect_and_clear_no_results(driver)
             if cleared_filters:
                 await asyncio.sleep(2)  # Wait for page to reload
             
-            # Step 5: Try to click "View All Jobs" or "See All Openings" buttons
+            # Step 5: Try to click "View All Jobs" or "See All Openings" buttons - OPTIMIZED
             try:
-                view_all_texts = ['view all', 'see all', 'all jobs', 'all openings', 'browse jobs', 'job openings']
-                buttons = driver.find_elements(By.TAG_NAME, 'button')
-                links = driver.find_elements(By.TAG_NAME, 'a')
+                # Use JavaScript to find "View All" button faster
+                view_all_button = driver.execute_script("""
+                    const keywords = ['view all', 'see all', 'all jobs', 'all openings', 'browse jobs', 'job openings'];
+                    const jobKeywords = ['job', 'opening', 'position', 'career'];
+                    const elements = [...document.querySelectorAll('button, a[role="button"], a[href*="job"]')];
+                    
+                    for (const el of elements) {
+                        if (el.offsetParent === null) continue; // skip hidden
+                        const text = el.textContent.toLowerCase();
+                        const hasViewAll = keywords.some(kw => text.includes(kw));
+                        const hasJobKeyword = jobKeywords.some(kw => text.includes(kw));
+                        
+                        if (hasViewAll && hasJobKeyword) {
+                            return el;
+                        }
+                    }
+                    return null;
+                """)
                 
-                for element in buttons + links:
-                    try:
-                        element_text = element.text.lower()
-                        # Check if it's a "view all jobs" type button (but not "view all locations" etc.)
-                        if any(text in element_text for text in view_all_texts):
-                            if 'job' in element_text or 'opening' in element_text or 'position' in element_text or 'career' in element_text:
-                                if element.is_displayed() and element.is_enabled():
-                                    print(f"  Found 'View All' button: '{element.text}' - clicking...")
-                                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-                                    await asyncio.sleep(0.5)
-                                    element.click()
-                                    await asyncio.sleep(3)
-                                    print("  ✓ Clicked 'View All' button")
-                                    break
-                    except Exception:
-                        continue
+                if view_all_button:
+                    print(f"  Found 'View All' button - clicking...")
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", view_all_button)
+                    await asyncio.sleep(2)  # Reduced from 3s
+                    print("  ✓ Clicked 'View All' button")
             except Exception:
                 pass
             
@@ -2723,170 +2871,123 @@ async def scrape_with_selenium(
             
             print("\nExtracting job listings from page 1...")
             
-            # Extract jobs from page with comprehensive selectors
-            job_selectors = [
-                # ADP/Workday specific selectors FIRST (for workforcenow.adp.com)
-                '[data-automation-id="jobTitle"]',  # Workday - specific job title elements
-                '[aria-label*="job" i]',  # ADP elements with job in aria-label
-                '[id*="jobTitle"]', '[id*="job-title"]',  # Job title IDs
-                'div[class*="job-card"]', 'div[class*="jobCard"]',  # Job card containers
-                'a[href*="/job"]', 'a[href*="/req"]', 'a[href*="/recruitment"]',  # Job links
-                
-                # Board-specific selectors
-                '[data-ui="job"]', 'li[data-ui="job"]',  # Workable
-                '.BambooHR-ATS-Jobs-Item',  # BambooHR
-                '.postings-group',  # Greenhouse, Lever
-                '.posting',  # Lever
-                '.jv-job-list-item',  # Jobvite
-                '.opening-job',  # SmartRecruiters
-                '[class*="JobsList"]',  # Ashby
-                
-                # Shopify/theme-specific patterns
-                '[class*="collapsible"]', '[class*="accordion"]',
-                '[class*="collapsible-content"]', '[class*="accordion-content"]',
-                '[class*="collapsible-trigger"]', '[class*="accordion-trigger"]',
-                'details', 'details summary',  # HTML5 details element
-                
-                # Generic job containers
-                '[class*="job-list"]', '[class*="job-item"]', '[class*="job-card"]',
-                '[class*="job-posting"]', '[class*="jobPosting"]', '[class*="JobPosting"]',
-                '[id*="job-list"]', '[id*="job-item"]', '[id*="joblist"]',
-                
-                # Position/Opening containers
-                '[class*="position"]', '[class*="opening"]', '[class*="vacancy"]',
-                '[class*="career"]', '[class*="role"]',
-                
-                # More generic selectors
-                '.job-listing', '.job', '.position',
-                '[data-job-id]', '[data-posting-id]', '[data-position-id]',
-                
-                # Common HTML structures
-                'article[class*="job"]', 'li[class*="job"]', 'div[class*="job"]',
-                'article[class*="position"]', 'li[class*="position"]', 'div[class*="position"]',
-                'article[class*="career"]', 'li[class*="opening"]', 'div[class*="posting"]',
-                
-                # List items that might contain jobs
-                'ul[class*="job"] > li', 'ul[class*="position"] > li',
-                'ul[class*="opening"] > li', 'ul[class*="career"] > li',
-                
-                # Table rows (some sites use tables)
-                'table[class*="job"] tr', 'table[class*="career"] tr',
-                'tr[class*="job"]', 'tr[class*="position"]',
-                
-                # Headings that might be job titles (for expandable sections)
-                'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-                'strong', 'b',  # Bold text often used for job titles
-                
-                # Broader fallback - any link with job-like text
-                'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]', 'a[href*="opening"]',
-            ]
-            
-            elements = []
-            found_with_selector = {}
-            
-            for selector in job_selectors:
-                try:
-                    found = driver.find_elements(By.CSS_SELECTOR, selector)
-                    if found:
-                        elements.extend(found)
-                        found_with_selector[selector] = len(found)
-                except Exception as e:
-                    pass
-            
-            # Show which selectors found elements
-            if found_with_selector:
-                print(f"\nSelectors that found elements:")
-                for sel, count in list(found_with_selector.items())[:5]:  # Show top 5
-                    print(f"  • {sel}: {count} elements")
-            
-            # Remove duplicates by position and filter out header/navigation elements
-            unique_elements = []
-            seen_positions = set()
-            seen_text = set()
-            
-            # Text patterns that indicate headers/navigation (not actual jobs)
-            header_patterns = [
-                'current openings', 'all openings', 'job openings',
-                'search', 'filter', 'location', 'job type',
-                'select location', 'select job type', '0 items selected',
-                'view all', 'see all', 'browse jobs', 'explore careers'
-            ]
-            
-            for elem in elements:
-                try:
-                    elem_text_full = elem.text.strip()
-                    elem_text = elem_text_full.lower()[:200]  # First 200 chars
+            # OPTIMIZED: Use JavaScript to find all job elements in ONE query
+            job_elements_data = driver.execute_script("""
+                const selectors = [
+                    // Specific selectors (high priority)
+                    '[data-automation-id="jobTitle"]',
+                    '[data-ui="job"]', 'li[data-ui="job"]',
+                    '.BambooHR-ATS-Jobs-Item',
+                    '.postings-group', '.posting',
+                    '.jv-job-list-item', '.opening-job',
+                    '[data-job-id]', '[data-posting-id]',
                     
-                    # Skip if element text is header/navigation
-                    if any(pattern in elem_text for pattern in header_patterns):
-                        # Check if it's ONLY header text (not a job listing that happens to contain these words)
-                        if len(elem_text_full.split('\n')) < 3:  # Headers are usually single line or 2 lines
-                            continue  # Skip header/navigation elements
+                    // Generic job containers
+                    '[class*="job-card"]', '[class*="jobCard"]',
+                    '[class*="job-item"]', '[class*="job-posting"]',
+                    '[class*="jobPosting"]', '[class*="JobPosting"]',
+                    'article[class*="job"]', 'li[class*="job"]',
+                    'div[class*="job"]',
                     
-                    # Skip elements that are clearly search/filter UI
-                    if 'select location' in elem_text or 'select job type' in elem_text:
-                        continue
+                    // Position/Opening containers
+                    '[class*="position"]', '[class*="opening"]',
                     
-                    # Skip very short elements that are likely UI labels
-                    if len(elem_text) < 10 and any(ui_word in elem_text for ui_word in ['search', 'filter', 'location', 'type']):
-                        continue
+                    // Links
+                    'a[href*="/job"]', 'a[href*="/req"]',
+                    'a[href*="job"]', 'a[href*="position"]'
+                ];
+                
+                const foundElements = new Set();
+                const headerPatterns = ['current openings', 'all openings', 'job openings', 
+                                       'search', 'filter', 'select location', 'select job type'];
+                const jobIndicators = ['full time', 'part time', 'contract', 'remote', 
+                                      'manager', 'director', 'engineer', 'days ago'];
+                
+                // Find elements
+                for (const selector of selectors) {
+                    try {
+                        const elements = document.querySelectorAll(selector);
+                        elements.forEach(el => {
+                            if (el.offsetParent !== null) { // visible check
+                                foundElements.add(el);
+                            }
+                        });
+                    } catch (e) {}
+                }
+                
+                // Filter and deduplicate
+                const uniqueElements = [];
+                const seenPositions = new Set();
+                const seenTexts = new Set();
+                
+                foundElements.forEach(el => {
+                    const text = el.textContent.toLowerCase().substring(0, 200);
+                    const textKey = text.substring(0, 50);
                     
-                    # Prefer elements that contain job-like content (locations, dates, employment types)
-                    has_job_indicators = any(indicator in elem_text for indicator in [
-                        'full time', 'part time', 'contract', 'remote', 'hybrid',
-                        'days ago', 'ago', 'posted', 'location:', 'location',
-                        'manager', 'director', 'engineer', 'analyst', 'specialist',
-                        'sr.', 'sr ', 'senior', 'junior', 'lead', 'principal'
-                    ])
+                    // Skip headers/navigation
+                    const isHeader = headerPatterns.some(p => text.includes(p)) && 
+                                    text.split('\\n').length < 3;
+                    if (isHeader) return;
                     
-                    # Skip elements that don't have job indicators and are very short
-                    if not has_job_indicators and len(elem_text) < 30:
-                        continue
+                    // Skip short UI elements
+                    if (text.length < 10) return;
                     
-                    pos = elem.location
-                    pos_key = (pos['x'], pos['y'])
+                    // Check for job indicators
+                    const hasJobIndicators = jobIndicators.some(ind => text.includes(ind));
+                    if (!hasJobIndicators && text.length < 30) return;
                     
-                    # Also check for duplicate text content
-                    text_key = elem_text[:50]  # First 50 chars as key
+                    // Deduplicate by position
+                    const rect = el.getBoundingClientRect();
+                    const posKey = rect.x + ',' + rect.y;
                     
-                    if pos_key not in seen_positions and text_key not in seen_text:
-                        seen_positions.add(pos_key)
-                        seen_text.add(text_key)
-                        unique_elements.append(elem)
-                except Exception:
-                    continue
+                    if (!seenPositions.has(posKey) && !seenTexts.has(textKey)) {
+                        seenPositions.add(posKey);
+                        seenTexts.add(textKey);
+                        uniqueElements.push(el);
+                    }
+                });
+                
+                return uniqueElements;
+            """)
             
-            print(f"Found {len(unique_elements)} unique job elements (after filtering headers)")
+            elements = job_elements_data if job_elements_data else []
+            print(f"Found {len(elements)} unique job elements (after filtering)")
             
-            # Fallback: If no elements found with standard selectors, try text-based search
+            unique_elements = elements  # Already filtered by JavaScript
+            
+            # Fallback: If no elements found with standard selectors, try text-based search - OPTIMIZED
             if len(unique_elements) == 0:
                 print("\n⚠️  No elements found with standard selectors. Trying text-based fallback...")
                 try:
-                    # Look for elements containing common job title patterns
-                    job_title_patterns = [
-                        "Director", "Manager", "Engineer", "Developer", "Analyst",
-                        "Specialist", "Coordinator", "Assistant", "Associate",
-                        "Lead", "Senior", "Junior", "Principal", "Staff",
-                        "Consultant", "Architect", "Designer", "Scientist",
-                        "Technician", "Administrator", "Representative"
-                    ]
-                    
-                    fallback_elements = []
-                    for pattern in job_title_patterns[:5]:  # Try first 5 patterns
-                        try:
-                            # Find elements containing these job title keywords
-                            xpath_query = f"//*[contains(text(), '{pattern}') and string-length(text()) > 10 and string-length(text()) < 200]"
-                            found = driver.find_elements(By.XPATH, xpath_query)
-                            for elem in found:
-                                try:
-                                    text = elem.text.strip()
-                                    # Check if it looks like a job title
-                                    if is_valid_job_title(text) and text not in [e.text.strip() for e in fallback_elements]:
-                                        fallback_elements.append(elem)
-                                except:
-                                    continue
-                        except Exception:
-                            continue
+                    # Use JavaScript to find elements with job title patterns (much faster)
+                    fallback_elements = driver.execute_script("""
+                        const patterns = ['Director', 'Manager', 'Engineer', 'Developer', 'Analyst',
+                                        'Specialist', 'Coordinator', 'Assistant', 'Associate'];
+                        const found = new Set();
+                        
+                        // Search through all visible elements
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.offsetParent === null) continue; // skip hidden
+                            
+                            const text = el.textContent;
+                            if (text.length < 10 || text.length > 200) continue;
+                            
+                            // Check if contains job title pattern
+                            const hasPattern = patterns.some(p => text.includes(p));
+                            if (hasPattern) {
+                                // Avoid nested duplicates - prefer leaf nodes
+                                const isLeaf = el.children.length === 0 || 
+                                             [...el.children].every(child => child.offsetParent === null);
+                                if (isLeaf) {
+                                    found.add(el);
+                                    if (found.size >= 50) break; // Limit results
+                                }
+                            }
+                        }
+                        
+                        return Array.from(found);
+                    """)
                     
                     if fallback_elements:
                         print(f"  Found {len(fallback_elements)} potential job titles via text search")
@@ -2956,22 +3057,19 @@ async def scrape_with_selenium(
                 except Exception as e:
                     print(f"  Could not save debug file: {e}")
             
-            # Extract jobs - prioritize elements with links to job detail pages
+            # Extract jobs - prioritize elements with links to job detail pages - OPTIMIZED
             seen_titles = set()
             
-            # First pass: Extract jobs from elements that have links
-            elements_with_links = []
-            elements_without_links = []
+            # Use JavaScript to check which elements have links (much faster)
+            elements_link_status = driver.execute_script("""
+                return arguments[0].map(el => ({
+                    element: el,
+                    hasLink: el.tagName === 'A' || el.querySelector('a') !== null
+                }));
+            """, unique_elements)
             
-            for element in unique_elements:
-                try:
-                    has_link = element.find_elements(By.TAG_NAME, 'a')
-                    if has_link:
-                        elements_with_links.append(element)
-                    else:
-                        elements_without_links.append(element)
-                except Exception:
-                    elements_without_links.append(element)
+            elements_with_links = [item['element'] for item in elements_link_status if item['hasLink']]
+            elements_without_links = [item['element'] for item in elements_link_status if not item['hasLink']]
             
             print(f"  Elements with links: {len(elements_with_links)}, without links: {len(elements_without_links)}")
             
@@ -2979,15 +3077,34 @@ async def scrape_with_selenium(
             print(f"\n  Attempting to extract jobs from {len(elements_with_links + elements_without_links)} elements...")
             extraction_failures = 0
             
-            for i, element in enumerate(elements_with_links + elements_without_links):
+            # Pre-fetch all element data in one batch (MAJOR OPTIMIZATION)
+            all_elements = elements_with_links + elements_without_links
+            print(f"  Pre-fetching element data...")
+            
+            element_data_batch = driver.execute_script("""
+                return arguments[0].map(el => {
+                    const links = [...el.querySelectorAll('a[href]')];
+                    return {
+                        outerHTML: el.outerHTML,
+                        text: (el.textContent || '').trim(),
+                        textPreview: (el.textContent || '').trim().substring(0, 100),
+                        links: links.map(a => a.href)
+                    };
+                });
+            """, all_elements)
+            
+            print(f"  Extracting job data from elements...")
+            
+            for i, element in enumerate(all_elements):
                 if len(jobs) >= max_results:
                     break
                 
                 try:
-                    # Get element text for debugging
-                    element_text = element.text.strip()[:100] if element.text else "No text"
+                    # Get element data (already fetched)
+                    element_data = element_data_batch[i] if i < len(element_data_batch) else {}
+                    element_text = element_data.get('textPreview', 'No text')
                     
-                    job = extract_job_from_element(element, url, company_name)
+                    job = extract_job_from_element_optimized(element, element_data, url, company_name)
                     if job:
                         if job.title in seen_titles:
                             continue
