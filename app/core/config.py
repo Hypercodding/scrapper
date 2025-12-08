@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     
     ACCEPT_LANGUAGE: str = "en-US,en;q=0.9"
     
+    # Chrome driver management
+    CLEANUP_DRIVER_AFTER_SCRAPE: bool = True  # Kill Chrome completely after each scrape (prevents resource buildup)
+    DRIVER_IDLE_TIMEOUT: int = 60  # Seconds before killing idle driver (0 = keep alive indefinitely)
+    
     # JSearch API (for Indeed jobs without scraping)
     RAPIDAPI_KEY: str = ""  # Get free key at rapidapi.com
 
