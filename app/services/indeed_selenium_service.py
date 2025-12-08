@@ -7,6 +7,7 @@ import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.remote.remote_connection import RemoteConnection
 from urllib.parse import urlparse, quote_plus
 import os
 import json
@@ -23,12 +24,82 @@ from selenium.webdriver import ActionChains
 from app.models.job_model import Job
 from app.core.config import settings
 from app.core.proxy_manager import get_proxy_manager, reset_proxy_manager
+import urllib3
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+import requests
 
 _last_fetch = 0
 _request_lock = asyncio.Lock()
 _driver = None
 _driver_created_at = 0  # Track when driver was created for rotation
 _driver_last_used = 0  # Track when driver was last used for idle timeout
+
+
+def configure_driver_connection_pool(driver):
+    """
+    Configure the driver's connection pool to prevent exhaustion.
+    This must be called immediately after driver creation.
+    
+    Args:
+        driver: Selenium WebDriver instance
+    
+    Returns:
+        bool: True if configuration successful, False otherwise
+    """
+    try:
+        # Configure connection pool settings
+        pool_size = 20  # Increase from default 1 to handle concurrent requests
+        pool_timeout = 60.0  # Connection timeout in seconds
+        
+        # Configure retry strategy for transient failures
+        retry_strategy = Retry(
+            total=3,  # Total retries
+            connect=2,  # Connection retries  
+            read=2,  # Read retries
+            status=2,  # Status retries  
+            backoff_factor=0.5,  # Exponential backoff (0.5s, 1s, 2s)
+            status_forcelist=[408, 429, 500, 502, 503, 504],  # Retry on these status codes
+            allowed_methods=["GET", "POST", "DELETE"],  # Methods to retry
+            raise_on_status=False,  # Don't raise on status failures, just retry
+        )
+        
+        # Create HTTP adapter with connection pool and retry strategy
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,  # Number of connection pools
+            pool_maxsize=pool_size,  # Max connections per pool
+            max_retries=retry_strategy,  # Apply retry strategy
+            pool_block=False,  # Don't block when pool is full, raise instead
+        )
+        
+        # Access the underlying requests Session object
+        if hasattr(driver, 'command_executor'):
+            executor = driver.command_executor
+            
+            # The RemoteConnection uses a urllib3.PoolManager internally
+            # We need to recreate it with our custom settings
+            if hasattr(executor, '_conn'):
+                # Replace the PoolManager with one that has better settings
+                import urllib3
+                
+                # Create new PoolManager with our settings
+                executor._conn = urllib3.PoolManager(
+                    num_pools=pool_size,
+                    maxsize=pool_size,
+                    block=False,
+                    timeout=urllib3.Timeout(connect=30.0, read=pool_timeout),
+                    retries=retry_strategy,
+                )
+                
+                print(f"   ✓ Connection pool configured: size={pool_size}, timeout={pool_timeout}s, retries={retry_strategy.total}")
+                return True
+        
+        print(f"   ⚠️  Could not configure connection pool (driver structure unexpected)")
+        return False
+        
+    except Exception as e:
+        print(f"   ⚠️  Error configuring connection pool (non-critical): {e}")
+        return False
 
 
 def get_chrome_executable_path() -> Optional[str]:
@@ -635,11 +706,44 @@ def get_driver(force_new: bool = False):
                 chrome_options = ChromeOptions()
                 
                 # Essential headless arguments (tested and working)
-                chrome_options.add_argument("--headless")
+                chrome_options.add_argument("--headless=new")  # Use new headless mode (more stable)
                 chrome_options.add_argument("--no-sandbox")
                 chrome_options.add_argument("--disable-dev-shm-usage")
                 chrome_options.add_argument("--disable-gpu")
                 chrome_options.add_argument("--window-size=1920,1080")
+                
+                # Memory optimization to prevent crashes
+                chrome_options.add_argument("--disable-software-rasterizer")
+                chrome_options.add_argument("--disable-background-networking")
+                chrome_options.add_argument("--disable-background-timer-throttling")
+                chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+                chrome_options.add_argument("--disable-renderer-backgrounding")
+                chrome_options.add_argument("--disable-breakpad")
+                chrome_options.add_argument("--disable-component-extensions-with-background-pages")
+                chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process")
+                chrome_options.add_argument("--disable-ipc-flooding-protection")
+                chrome_options.add_argument("--disable-hang-monitor")
+                chrome_options.add_argument("--metrics-recording-only")
+                chrome_options.add_argument("--no-first-run")
+                chrome_options.add_argument("--mute-audio")
+                chrome_options.add_argument("--disable-web-security")  # Reduce security overhead
+                chrome_options.add_argument("--disable-features=VizDisplayCompositor")  # Reduce compositor overhead
+                
+                # Resource limits to prevent Chrome from consuming too much memory
+                # NOTE: Do NOT use --single-process as it causes instability and crashes
+                chrome_options.add_argument("--disable-features=site-per-process")  # Use fewer processes
+                chrome_options.add_argument("--process-per-site")  # Group sites in same process
+                chrome_options.add_argument("--disable-site-isolation-trials")
+                
+                # Memory limits
+                chrome_options.add_argument("--max-old-space-size=768")  # Limit JS heap to 768MB
+                chrome_options.add_argument("--js-flags=--max-old-space-size=768")
+                
+                # Disable unnecessary features that consume memory
+                chrome_options.add_argument("--disable-notifications")
+                chrome_options.add_argument("--disable-logging")
+                chrome_options.add_argument("--log-level=3")  # Only fatal errors
+                chrome_options.add_argument("--silent")
                 
                 # Add user agent
                 chrome_options.add_argument(f"user-agent={settings.USER_AGENT}")
@@ -699,7 +803,17 @@ def get_driver(force_new: bool = False):
                         print(f"   Chrome path: {chrome_path or 'auto-detect'}")
                         print(f"   ChromeDriver path: {chromedriver_path or 'auto-detect'}")
                         
+                        # Create driver
                         temp_driver = webdriver.Chrome(service=service, options=chrome_options)
+                        
+                        # ===== CRITICAL: Configure connection pool to prevent exhaustion =====
+                        configure_driver_connection_pool(temp_driver)
+                        
+                        # ===== CRITICAL: Configure timeouts to prevent hangs =====
+                        # Set aggressive timeouts to prevent Chrome from hanging
+                        temp_driver.set_page_load_timeout(60)  # Timeout for page loads (60s max)
+                        temp_driver.set_script_timeout(45)     # Timeout for execute_script calls (45s max)
+                        temp_driver.implicitly_wait(15)        # Implicit wait for element location (15s max)
                         
                         # Wait for Chrome to fully start
                         print("   Waiting for Chrome to initialize...")
@@ -1207,38 +1321,126 @@ def _scrape_sync_enhanced(
             
             # Navigate to the page with soft-retries and backoff when Cloudflare is detected
             retries = 0
+            max_navigation_retries = getattr(settings, "MAX_RETRIES", 3)
+            
             while True:
                 try:
                     print(f"   [SCRAPE] Attempting navigation to: {url}")
-                    driver.get(url)
+                    
+                    # Set a timeout for the navigation itself using threading
+                    import threading
+                    navigation_success = False
+                    navigation_error = None
+                    
+                    def navigate_with_timeout():
+                        nonlocal navigation_success, navigation_error
+                        try:
+                            driver.get(url)
+                            navigation_success = True
+                        except Exception as e:
+                            navigation_error = e
+                    
+                    # Start navigation in a separate thread
+                    nav_thread = threading.Thread(target=navigate_with_timeout)
+                    nav_thread.daemon = True
+                    nav_thread.start()
+                    nav_thread.join(timeout=60)  # 60 second timeout for navigation
+                    
+                    # Check if navigation succeeded
+                    if not navigation_success:
+                        if nav_thread.is_alive():
+                            # Navigation is still running - it's hung
+                            raise TimeoutError("Navigation timed out after 60 seconds")
+                        elif navigation_error:
+                            # Navigation thread raised an exception
+                            raise navigation_error
+                        else:
+                            # Thread finished but navigation_success not set
+                            raise Exception("Navigation failed for unknown reason")
+                    
                     print(f"✓ [SCRAPE] Navigation successful")
                     
-                    # Get page source after successful navigation
-                    page_html = driver.page_source or ""
-                    print(f"✓ [SCRAPE] Page source retrieved: {len(page_html)} characters")
+                    # Get page source after successful navigation with timeout protection
+                    try:
+                        # Add a short wait to ensure page is loaded
+                        time.sleep(0.5)
+                        page_html = driver.page_source or ""
+                        if not page_html:
+                            raise Exception("Page source is empty")
+                        print(f"✓ [SCRAPE] Page source retrieved: {len(page_html)} characters")
+                    except Exception as ps_error:
+                        print(f"⚠️  Warning: Could not get page source: {ps_error}")
+                        # Try one more time
+                        time.sleep(1.0)
+                        try:
+                            page_html = driver.page_source or ""
+                            if not page_html:
+                                raise Exception("Page source is still empty after retry")
+                            print(f"✓ [SCRAPE] Page source retrieved on retry: {len(page_html)} characters")
+                        except Exception as ps_error2:
+                            print(f"❌ Failed to get page source: {ps_error2}")
+                            raise Exception(f"Could not retrieve page source after navigation: {ps_error2}")
+                    
                     break  # Success, exit retry loop
                     
                 except Exception as nav_error:
                     error_msg = str(nav_error)
                     print(f"❌ [SCRAPE] Navigation failed: {error_msg}")
                     print(f"   Error type: {type(nav_error).__name__}")
-                    import traceback
-                    print(f"   Traceback:\n{traceback.format_exc()}")
                     
-                    if "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower():
+                    # Check for specific error types that require immediate recreation
+                    is_tab_crash = "tab crashed" in error_msg.lower() or "target frame detached" in error_msg.lower()
+                    is_connection_error = (
+                        "connection refused" in error_msg.lower() 
+                        or "remote end closed connection" in error_msg.lower()
+                        or "max retries exceeded" in error_msg.lower()
+                        or isinstance(nav_error, TimeoutError)
+                    )
+                    is_window_closed = "no such window" in error_msg.lower() or "target window already closed" in error_msg.lower()
+                    
+                    # Handle different error types
+                    if is_tab_crash or is_connection_error:
+                        print(f"⚠️  {'Tab crash' if is_tab_crash else 'Connection error'} detected - Chrome may be out of memory")
+                        
+                        # Cleanup current driver
+                        try:
+                            print(f"   Cleaning up crashed driver...")
+                            if hasattr(driver, 'service') and driver.service:
+                                if hasattr(driver.service, 'process') and driver.service.process:
+                                    if driver.service.process.poll() is None:
+                                        driver.service.process.kill()
+                            driver.quit()
+                        except:
+                            pass
+                        finally:
+                            _driver = None  # global already declared at function start
+                        
+                        # Clean up zombie processes
+                        cleanup_zombie_processes(aggressive=True)
+                        
+                        if retries < max_navigation_retries:
+                            retries += 1
+                            print(f"   Recreating driver and retrying ({retries}/{max_navigation_retries})...")
+                            time.sleep(5.0)  # Wait for resources to be released
+                            driver = get_driver(force_new=True)
+                            continue
+                        else:
+                            raise Exception(f"Navigation failed after {max_navigation_retries} attempts due to Chrome crashes/connection issues")
+                    
+                    elif is_window_closed:
                         is_headless = os.environ.get("FORCE_HEADLESS", "").lower() in ("1", "true", "yes") or not os.environ.get("DISPLAY")
                         if is_headless:
-                            print("⚠️  Browser window closed during navigation (macOS headless limitation)")
-                            print("⚠️  This is expected on macOS - headless mode will work on Railway (Linux)")
-                            raise Exception("Browser window closed during navigation. This is a macOS limitation with undetected_chromedriver in headless mode. On Railway (Linux), this works correctly.")
+                            print("⚠️  Browser window closed during navigation (headless environment)")
+                            raise Exception("Browser window closed during navigation in headless mode")
                         else:
                             print("⚠️  Browser window closed during navigation (non-headless mode)")
-                            raise Exception("Browser window closed during navigation. This may indicate a Chrome/ChromeDriver compatibility issue. Try updating Chrome or ChromeDriver.")
+                            raise Exception("Browser window closed during navigation. This may indicate a Chrome/ChromeDriver compatibility issue.")
+                    
                     else:
-                        # For other errors, check if it's a retryable error
-                        if retries < getattr(settings, "MAX_RETRIES", 3):
+                        # For other errors, retry with simple backoff
+                        if retries < max_navigation_retries:
                             retries += 1
-                            print(f"⚠️  Retrying navigation ({retries}/{getattr(settings, 'MAX_RETRIES', 3)})...")
+                            print(f"⚠️  Retrying navigation ({retries}/{max_navigation_retries})...")
                             time.sleep(2.0)
                             continue
                         else:
