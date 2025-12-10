@@ -1585,16 +1585,19 @@ def extract_job_from_element_optimized(element, element_data: dict, base_url: st
 def extract_job_from_element(element, base_url: str, company_name: str) -> Optional[Job]:
     """Extract comprehensive job information from HTML element"""
     try:
-        soup = BeautifulSoup(element.get_attribute('outerHTML'), 'html.parser')
+        # Get outerHTML (this will fail fast for stale elements)
+        try:
+            outer_html = element.get_attribute('outerHTML')
+            if not outer_html:
+                return None
+        except Exception:
+            return None  # Stale element or other Selenium error
+        
+        soup = BeautifulSoup(outer_html, 'html.parser')
         text = soup.get_text(separator=' ', strip=True)
         
-        # Also get text directly from Selenium element (might be more reliable)
-        try:
-            element_text = element.text.strip()
-            if element_text and len(element_text) > len(text):
-                text = element_text  # Use Selenium text if it's more complete
-        except:
-            pass  # Fall back to BeautifulSoup text
+        # Skip getting text from Selenium element as it can be slow/hang
+        # Just use BeautifulSoup text which is already available from outerHTML
         
         # Extract title - be more lenient, extract first and validate later
         title = None
@@ -2083,7 +2086,7 @@ async def navigate_to_next_page(driver) -> bool:
         return False
 
 
-async def handle_pagination(driver, max_pages: int = 10) -> List[int]:
+async def handle_pagination(driver, max_pages: int = 5) -> List[int]:
     """
     Comprehensive pagination handler that collects jobs from all pages
     
@@ -2504,7 +2507,10 @@ async def extract_jobs_from_current_page(
     """
     page_jobs = []
     
+    print("  🔍 Starting job extraction from current page...")
+    
     try:
+        print("  📋 Preparing job selectors...")
         # Comprehensive job selectors
         job_selectors = [
             # Board-specific selectors FIRST (most accurate)
@@ -2557,20 +2563,75 @@ async def extract_jobs_from_current_page(
             'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]', 'a[href*="opening"]',
         ]
         
-        elements = []
-        for selector in job_selectors:
-            try:
-                found = driver.find_elements(By.CSS_SELECTOR, selector)
-                if found:
-                    elements.extend(found)
-            except Exception:
-                continue
+        print(f"  🔎 Searching for job elements using {len(job_selectors)} selectors...")
+        print(f"  ⚡ Using fast JavaScript-based element search...")
         
-        # Remove duplicates by position
+        # OPTIMIZED: Use JavaScript to find all elements at once (much faster)
+        js_script = """
+        const selectors = arguments[0];
+        const allElements = new Set();
+        
+        // Track progress
+        console.log('Starting element search with ' + selectors.length + ' selectors...');
+        
+        for (let i = 0; i < selectors.length; i++) {
+            try {
+                // Log every 10 selectors
+                if (i % 10 === 0) {
+                    console.log('Processed ' + i + '/' + selectors.length + ' selectors...');
+                }
+                
+                const elements = document.querySelectorAll(selectors[i]);
+                elements.forEach(el => allElements.add(el));
+                
+                // Stop early if we have enough elements
+                if (allElements.size > 300) {
+                    console.log('Found enough elements (' + allElements.size + '), stopping search');
+                    break;
+                }
+            } catch (e) {
+                // Skip invalid selectors
+            }
+        }
+        
+        console.log('Total elements found: ' + allElements.size);
+        return Array.from(allElements);
+        """
+        
+        try:
+            print(f"  ⏳ Executing JavaScript search (this may take a moment)...")
+            elements = driver.execute_script(js_script, job_selectors)
+            print(f"  ✅ JavaScript search complete: found {len(elements)} elements")
+        except Exception as e:
+            print(f"  ⚠️  JavaScript search failed ({e}), falling back to Python method...")
+            # Fallback to Python method with timeout protection
+            elements = []
+            for idx, selector in enumerate(job_selectors[:30]):  # Limit to first 30 selectors
+                try:
+                    if idx % 5 == 0:
+                        print(f"  Checking selector {idx+1}/30...")
+                    found = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if found:
+                        elements.extend(found)
+                        if len(elements) > 300:  # Stop if we have enough
+                            print(f"  Found enough elements ({len(elements)}), stopping search")
+                            break
+                except Exception:
+                    continue
+        
+        print(f"  Found {len(elements)} total elements, removing duplicates...")
+        
+        # Remove duplicates by position (with progress tracking and limits)
         unique_elements = []
         seen_positions = set()
-        for elem in elements:
+        max_elements_to_process = 500  # Limit to prevent hanging
+        
+        for idx, elem in enumerate(elements[:max_elements_to_process]):
             try:
+                # Progress tracking every 50 elements
+                if idx > 0 and idx % 50 == 0:
+                    print(f"  Processing element {idx}/{min(len(elements), max_elements_to_process)}...")
+                
                 pos = elem.location
                 pos_key = (pos['x'], pos['y'])
                 if pos_key not in seen_positions:
@@ -2578,6 +2639,8 @@ async def extract_jobs_from_current_page(
                     unique_elements.append(elem)
             except Exception:
                 continue
+        
+        print(f"  Filtered to {len(unique_elements)} unique elements")
         
         # Fallback: If no elements found, try text-based search
         if len(unique_elements) == 0:
@@ -2599,36 +2662,96 @@ async def extract_jobs_from_current_page(
                     continue
         
         # Extract jobs from elements
-        elements_with_links = []
-        elements_without_links = []
+        print(f"  Categorizing {len(unique_elements)} elements by link presence...")
         
-        for element in unique_elements:
-            try:
-                has_link = element.find_elements(By.TAG_NAME, 'a')
-                if has_link:
-                    elements_with_links.append(element)
-                else:
+        # OPTIMIZED: Use JavaScript to categorize elements by link presence (much faster)
+        try:
+            js_categorize = """
+            const elements = arguments[0];
+            const withLinks = [];
+            const withoutLinks = [];
+            
+            for (let i = 0; i < elements.length; i++) {
+                try {
+                    const hasLink = elements[i].querySelector('a') !== null;
+                    if (hasLink) {
+                        withLinks.push(i);  // Store index, not element
+                    } else {
+                        withoutLinks.push(i);
+                    }
+                } catch (e) {
+                    withoutLinks.push(i);
+                }
+            }
+            
+            return {withLinks: withLinks, withoutLinks: withoutLinks};
+            """
+            
+            result = driver.execute_script(js_categorize, unique_elements)
+            
+            elements_with_links = [unique_elements[i] for i in result['withLinks']]
+            elements_without_links = [unique_elements[i] for i in result['withoutLinks']]
+            
+            print(f"  ✅ Categorization complete (JS): {len(elements_with_links)} with links, {len(elements_without_links)} without")
+            
+        except Exception as e:
+            print(f"  ⚠️ JavaScript categorization failed ({e}), using fallback method...")
+            # Fallback to Python with better progress tracking
+            elements_with_links = []
+            elements_without_links = []
+            
+            for idx, element in enumerate(unique_elements):
+                try:
+                    if idx > 0 and idx % 10 == 0:
+                        print(f"  Categorizing element {idx}/{len(unique_elements)}...")
+                    
+                    has_link = element.find_elements(By.TAG_NAME, 'a')
+                    if has_link:
+                        elements_with_links.append(element)
+                    else:
+                        elements_without_links.append(element)
+                except Exception:
                     elements_without_links.append(element)
-            except Exception:
-                elements_without_links.append(element)
+        
+        
+        print(f"  Extracting jobs from {len(elements_with_links) + len(elements_without_links)} elements...")
         
         # Process elements with links first
-        for element in elements_with_links + elements_without_links:
+        all_elements = elements_with_links + elements_without_links
+        total_elements = len(all_elements)
+        
+        for idx, element in enumerate(all_elements):
             if len(page_jobs) >= max_results:
+                print(f"  ✅ Reached max results limit ({max_results})")
                 break
             
-            job = extract_job_from_element(element, url, company_name)
-            if job:
-                if job.title in seen_titles:
-                    continue
-                if not is_valid_job_entry(job):
-                    continue
-                
-                seen_titles.add(job.title)
-                page_jobs.append(job)
+            # Progress tracking every 10 elements
+            if idx > 0 and idx % 10 == 0:
+                print(f"  📊 Progress: {idx}/{total_elements} elements processed, {len(page_jobs)} jobs found...")
+            
+            try:
+                job = extract_job_from_element(element, url, company_name)
+                if job:
+                    if job.title in seen_titles:
+                        continue
+                    if not is_valid_job_entry(job):
+                        continue
+                    
+                    # Don't add to seen_titles here - let the calling code handle it
+                    # This prevents duplicate filtering issues in pagination
+                    page_jobs.append(job)
+            except Exception as e:
+                # Skip problematic elements
+                if idx % 10 == 0:  # Only log occasionally to avoid spam
+                    print(f"  ⚠️ Skipped element {idx} due to error: {str(e)[:50]}")
+                continue
+        
+        print(f"  ✅ Extraction complete: Found {len(page_jobs)} jobs on this page")
         
     except Exception as e:
-        print(f"  Error extracting jobs from page: {e}")
+        print(f"  ❌ Error extracting jobs from page: {e}")
+        import traceback
+        traceback.print_exc()
     
     return page_jobs
 
@@ -3148,6 +3271,7 @@ async def scrape_with_selenium(
                 print(f"\n{'='*60}")
                 print(f"Handling pagination to collect more jobs...")
                 print(f"Current jobs: {len(jobs)}, Target: {max_results}")
+                print(f"⚠️  Pagination limited to maximum 5 pages")
                 print(f"{'='*60}")
                 
                 # Detect pagination (make sure we're in default content, not in an iframe)
@@ -3174,7 +3298,7 @@ async def scrape_with_selenium(
                         
                         # Start from page 2 if we're on page 1
                         start_page = 2 if current_page == 1 else current_page + 1
-                        pages_to_scrape = list(range(start_page, min(total_pages + 1, 20)))  # Limit to 20 pages
+                        pages_to_scrape = list(range(start_page, min(total_pages + 1, 6)))  # Limit to 5 pages (1-5)
                         
                         for page_num in pages_to_scrape:
                             if len(jobs) >= max_results:
@@ -3191,10 +3315,17 @@ async def scrape_with_selenium(
                             await expand_collapsible_sections(driver, max_expansions=10)  # Reduced from 20
                             await asyncio.sleep(1)  # Reduced from 2 seconds
                             
-                            # Extract jobs from this page using the same logic
-                            page_jobs = await extract_jobs_from_current_page(
-                                driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
-                            )
+                            # Extract jobs from this page using the same logic (with timeout)
+                            try:
+                                page_jobs = await asyncio.wait_for(
+                                    extract_jobs_from_current_page(
+                                        driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
+                                    ),
+                                    timeout=60.0  # 60 second timeout for extraction
+                                )
+                            except asyncio.TimeoutError:
+                                print(f"  ⚠️ Extraction timed out after 60 seconds, moving to next page")
+                                page_jobs = []
                             
                             # Add page jobs to main jobs list
                             for job in page_jobs:
@@ -3211,7 +3342,7 @@ async def scrape_with_selenium(
                         consecutive_failures = 0
                         max_consecutive_failures = 2
                         
-                        while len(jobs) < max_results and page_num < 20:  # Limit to 20 pages
+                        while len(jobs) < max_results and page_num < 6:  # Limit to 5 pages
                             page_num += 1
                             print(f"\n📄 Extracting jobs from page {page_num}...")
                             
@@ -3230,10 +3361,17 @@ async def scrape_with_selenium(
                             await expand_collapsible_sections(driver, max_expansions=10)  # Reduced from 20
                             await asyncio.sleep(1)  # Reduced from 2 seconds
                             
-                            # Extract jobs from this page
-                            page_jobs = await extract_jobs_from_current_page(
-                                driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
-                            )
+                            # Extract jobs from this page (with timeout)
+                            try:
+                                page_jobs = await asyncio.wait_for(
+                                    extract_jobs_from_current_page(
+                                        driver, url, company_name, max_results - len(jobs), seen_titles, iframe_switched
+                                    ),
+                                    timeout=60.0  # 60 second timeout for extraction
+                                )
+                            except asyncio.TimeoutError:
+                                print(f"  ⚠️ Extraction timed out after 60 seconds, moving to next page")
+                                page_jobs = []
                             
                             # Add page jobs to main jobs list
                             for job in page_jobs:
