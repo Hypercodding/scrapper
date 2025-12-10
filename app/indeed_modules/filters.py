@@ -1,3 +1,6 @@
+"""Filter functions for Indeed job listings."""
+from datetime import datetime, timedelta
+import re
 from typing import Optional
 from app.models.job_model import Job
 # filters.py
@@ -5,7 +8,7 @@ from app.models.job_model import Job
 
 
 
-def matches_location_filter_indeed(job: Job, location_filter: Optional[str]) -> bool:    
+def matches_location_filter_indeed(job: Job, location_filter: Optional[str]) -> bool:
     """Check if job matches the location filter for Indeed with comprehensive location support like ZipRecruiter.
         
         Since we're using Indeed's URL-based location filtering, be very permissive here.
@@ -99,7 +102,6 @@ def matches_salary_filter_indeed(job: Job, salary_min: Optional[int], salary_max
     salary_text = job.salary_range.lower()
     
     # Look for salary patterns and extract numbers
-    import re
     salary_patterns = [
         r'\$?(\d+(?:,\d{3})*(?:k|k)?)\s*-\s*\$?(\d+(?:,\d{3})*(?:k|k)?)',
         r'\$?(\d+(?:,\d{3})*(?:k|k)?)\s*/\s*(?:year|yr|hour|hr)',
@@ -185,8 +187,7 @@ def matches_date_filter_indeed(job: Job, days_old: Optional[int]) -> bool:
     if not job.posted_date:
         return True  # Don't filter out jobs without date info
     
-    from datetime import datetime, timedelta
-    import re
+
     
     try:
         # Parse the posted date from various formats
