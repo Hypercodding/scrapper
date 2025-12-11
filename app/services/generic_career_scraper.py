@@ -3397,23 +3397,170 @@ async def scrape_with_selenium(
         print(f"Returning {len(jobs)} jobs collected before timeout")
     
     except Exception as e:
-        print(f"Error in Selenium scraping: {e}")
+        error_msg = str(e)
+        print(f"Error in Selenium scraping: {error_msg}")
+        print(f"Error type: {type(e).__name__}")
         import traceback
         traceback.print_exc()
+        
+        # Check if it's a connection pool or resource exhaustion error - these are CRITICAL
+        pool_error_keywords = [
+            'connection pool', 'max retries', 'session not created', 
+            'invalid session', 'pool full', 'too many open files',
+            'cannot allocate memory', 'resource temporarily unavailable',
+            'connection refused', 'connection reset', 'broken pipe'
+        ]
+        
+        is_pool_error = any(keyword in error_msg.lower() for keyword in pool_error_keywords)
+        
+        if is_pool_error:
+            print("🚨 CRITICAL: CONNECTION POOL/RESOURCE EXHAUSTION ERROR DETECTED!")
+            print("   This error can cause Railway deployment to crash.")
+            print("   Performing emergency cleanup...")
     
     finally:
+        # CRITICAL: ALWAYS cleanup driver after every scrape to prevent pool exhaustion
+        # This is MANDATORY to prevent Railway deployment crashes
+        print("🧹 [GENERIC SCRAPER] MANDATORY cleanup: Closing browser after scrape operation")
+        
         if driver:
+            # Step 1: Try graceful quit first
             try:
                 driver.quit()
+                print("   ✓ Driver quit successfully")
             except Exception as e:
-                print(f"Error closing driver: {e}")
-                # Force kill if needed
-                try:
-                    driver.service.process.kill()
-                except:
-                    pass
+                print(f"   ⚠️  Error closing driver: {e}")
+            
+            # Step 2: Force kill any remaining processes (even if quit succeeded)
+            try:
+                if hasattr(driver, 'service') and driver.service:
+                    if hasattr(driver.service, 'process') and driver.service.process:
+                        if driver.service.process.poll() is None:
+                            print("   ⚠️  ChromeDriver process still alive, force terminating...")
+                            driver.service.process.terminate()
+                            try:
+                                driver.service.process.wait(timeout=5)
+                                print("   ✓ ChromeDriver process terminated")
+                            except:
+                                print("   ⚠️  Terminate failed, force killing...")
+                                driver.service.process.kill()
+                                print("   ✓ ChromeDriver process killed")
+            except Exception as kill_error:
+                print(f"   ⚠️  Error terminating driver process: {kill_error}")
+            
+            # Step 3: Give system time to release all resources
+            try:
+                time.sleep(1.0)
+                print("   ✓ Resource release delay complete")
+            except:
+                pass
+            
+            print("✓ [GENERIC SCRAPER] Browser cleanup complete - all Chrome resources freed")
+        else:
+            print("⚠️  [GENERIC SCRAPER] No driver to cleanup (already None)")
     
     return jobs
+
+
+def matches_job_title(scraped_title: str, customer_query: str) -> bool:
+    """
+    Smart job title matching that ensures all words from customer query 
+    appear together in the scraped title.
+    
+    Rules:
+    - All words from customer_query must appear in scraped_title
+    - Words must appear in close proximity (as a phrase or with minimal separation)
+    - Example: query "customer care" matches "customer care manager", "senior customer care"
+      but NOT "customer manager" or "care customer" (words not together)
+    
+    Args:
+        scraped_title: The job title from the scraped job posting
+        customer_query: The customer's search query (single job title)
+    
+    Returns:
+        True if the scraped title matches the query criteria
+    """
+    if not scraped_title or not customer_query:
+        return False
+    
+    # Normalize both strings
+    scraped_lower = scraped_title.lower().strip()
+    query_lower = customer_query.lower().strip()
+    
+    # Split query into words
+    query_words = query_lower.split()
+    
+    # If query is empty after split, no match
+    if not query_words:
+        return False
+    
+    # Strategy 1: Check if the complete phrase exists (ideal match)
+    if query_lower in scraped_lower:
+        return True
+    
+    # Strategy 2: Check if all words appear in order with at most 1 word gap between consecutive query words
+    # This handles cases like "customer care manager" for query "customer care"
+    # but rejects "care customer" or "software development engineer" (too much separation)
+    
+    # Find all positions of each query word in the scraped title
+    scraped_words = scraped_lower.split()
+    
+    # Check if all query words exist in scraped title
+    for query_word in query_words:
+        if query_word not in scraped_lower:
+            return False
+    
+    # Find positions of each query word
+    word_positions = {}
+    for query_word in query_words:
+        positions = []
+        for idx, scraped_word in enumerate(scraped_words):
+            if query_word in scraped_word:
+                positions.append(idx)
+        word_positions[query_word] = positions
+    
+    # Check if there's a valid arrangement where all query words appear in order and close together
+    def check_positions_in_order_and_proximity(query_words_list, word_positions_dict, max_gap=1):
+        """
+        Check if we can find positions where:
+        1. All words appear in the same order as the query
+        2. Each consecutive pair is within max_gap of each other
+        """
+        from itertools import product
+        
+        # Get positions for each query word
+        positions_lists = [word_positions_dict[word] for word in query_words_list]
+        
+        if not all(positions_lists):
+            return False
+        
+        # Try all combinations of positions
+        for pos_combo in product(*positions_lists):
+            # Check if positions are in ascending order (maintaining query word order)
+            is_ordered = all(pos_combo[i] < pos_combo[i + 1] for i in range(len(pos_combo) - 1))
+            
+            if not is_ordered:
+                continue
+            
+            # Check if consecutive positions are within max_gap
+            all_close = True
+            for i in range(len(pos_combo) - 1):
+                gap = pos_combo[i + 1] - pos_combo[i]
+                if gap > max_gap + 1:  # +1 because consecutive words have gap of 1
+                    all_close = False
+                    break
+            
+            if all_close:
+                return True
+        
+        return False
+    
+    # Check if words appear in order and consecutively (no words in between)
+    # max_gap=0 means consecutive words only (semantic gap of 0 words between)
+    if check_positions_in_order_and_proximity(query_words, word_positions, max_gap=0):
+        return True
+    
+    return False
 
 
 async def scrape_generic_career_page(
@@ -3428,7 +3575,7 @@ async def scrape_generic_career_page(
     Args:
         url: Career page URL
         max_results: Maximum number of jobs to return
-        search_query: Optional search term to filter jobs
+        search_query: Optional search term to filter jobs (can be comma-separated for multiple titles)
         use_undetected: Use undetected-chromedriver for anti-bot protection
         
     Returns:
@@ -3458,24 +3605,31 @@ async def scrape_generic_career_page(
     # Filter by search query
     if search_query and jobs:
         print(f"\nFiltering {len(jobs)} jobs by search query: '{search_query}'")
-        search_lower = search_query.lower()
+        
+        # Parse multiple job titles (comma-separated)
+        job_titles = [title.strip() for title in search_query.split(',') if title.strip()]
+        print(f"Parsed {len(job_titles)} job title(s) to search for:")
+        for idx, title in enumerate(job_titles, 1):
+            print(f"  {idx}. '{title}'")
+        
         filtered_jobs = []
         
         for job in jobs:
-            searchable_text = ' '.join(filter(None, [
-                job.title,
-                job.description,
-                job.location,
-                job.employment_type,
-                job.remote_type,
-                job.requirements
-            ])).lower()
+            job_matched = False
+            matched_query = None
             
-            if search_lower in searchable_text:
+            # Try to match against each job title query
+            for query_title in job_titles:
+                if matches_job_title(job.title, query_title):
+                    job_matched = True
+                    matched_query = query_title
+                    break
+            
+            if job_matched:
                 filtered_jobs.append(job)
-                print(f"  ✓ Matched: {job.title}")
+                print(f"  ✓ Matched '{matched_query}': {job.title}")
         
-        print(f"Found {len(filtered_jobs)} jobs matching '{search_query}'")
+        print(f"Found {len(filtered_jobs)} jobs matching search criteria")
         jobs = filtered_jobs
     elif not search_query and jobs:
         print(f"\nNo search query provided - returning all {len(jobs)} jobs found")

@@ -1,9 +1,16 @@
 
 from fastapi import APIRouter, Query, HTTPException, Body
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
-from app.services.indeed_selenium_service import scrape_indeed_selenium, CloudflareBlockedError # pylint: disable=import-error
+from app.services.indeed_selenium_service import (
+    scrape_indeed_selenium, 
+    CloudflareBlockedError,
+    force_cleanup_all,
+    check_chrome_process_count,
+    cleanup_zombie_processes,
+    cleanup_global_driver
+) # pylint: disable=import-error
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
 from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
@@ -349,3 +356,140 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
 
     await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
+
+
+@router.get("/health/detailed", response_model=Dict[str, Any])
+async def health_check_detailed():
+    """
+    Detailed health check endpoint for monitoring browser pool and system resources
+    
+    Returns:
+    - chrome_processes: Number of active Chrome/ChromeDriver processes
+    - status: "healthy" if process count is low, "warning" if moderate, "critical" if high
+    - recommendations: Actions to take based on health status
+    """
+    process_count = check_chrome_process_count()
+    
+    # Determine health status
+    if process_count == 0:
+        status = "healthy"
+        message = "No Chrome processes running"
+        recommendations = []
+    elif process_count <= 5:
+        status = "healthy"
+        message = f"{process_count} Chrome process(es) running (normal)"
+        recommendations = []
+    elif process_count <= 15:
+        status = "warning"
+        message = f"{process_count} Chrome processes running (elevated)"
+        recommendations = [
+            "Consider running /api/health/cleanup to free resources",
+            "Monitor for increasing process counts"
+        ]
+    else:
+        status = "critical"
+        message = f"{process_count} Chrome processes running (CRITICAL)"
+        recommendations = [
+            "URGENT: Run /api/health/cleanup immediately",
+            "Check for scraping operations that didn't complete properly",
+            "Consider restarting the application if cleanup doesn't help"
+        ]
+    
+    return {
+        "status": status,
+        "message": message,
+        "chrome_processes": process_count,
+        "recommendations": recommendations,
+        "service": settings.PROJECT_NAME
+    }
+
+
+@router.post("/health/cleanup", response_model=Dict[str, Any])
+async def emergency_cleanup():
+    """
+    Emergency cleanup endpoint to force close all Chrome resources
+    
+    Use this when:
+    - You get "pool full" errors
+    - Health check shows high process count
+    - Application seems stuck or unresponsive
+    - After deployment to ensure clean state
+    
+    This endpoint will:
+    1. Close all active browser instances
+    2. Kill all zombie Chrome/ChromeDriver processes
+    3. Reset connection pools
+    4. Free all system resources
+    
+    Returns:
+    - processes_before: Chrome process count before cleanup
+    - processes_after: Chrome process count after cleanup
+    - processes_killed: Number of processes cleaned up
+    - status: Success or error information
+    """
+    try:
+        # Get initial process count
+        processes_before = check_chrome_process_count()
+        
+        # Perform force cleanup
+        print("🚨 EMERGENCY CLEANUP requested via API endpoint")
+        processes_after = force_cleanup_all()
+        
+        processes_killed = processes_before - processes_after
+        
+        return {
+            "status": "success",
+            "message": "Emergency cleanup completed successfully",
+            "processes_before": processes_before,
+            "processes_after": processes_after,
+            "processes_killed": processes_killed,
+            "recommendation": "All Chrome resources freed. System is ready for new scraping operations."
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Emergency cleanup failed: {str(e)}"
+        )
+
+
+@router.post("/health/cleanup-soft", response_model=Dict[str, Any])
+async def soft_cleanup():
+    """
+    Soft cleanup endpoint - less aggressive than emergency cleanup
+    
+    This endpoint:
+    1. Closes the global driver instance if it exists
+    2. Cleans up zombie processes (non-aggressive)
+    3. Preserves resources where possible
+    
+    Use this for:
+    - Routine maintenance
+    - After a series of scraping operations
+    - When you want to free resources without force-killing
+    
+    Returns cleanup statistics
+    """
+    try:
+        processes_before = check_chrome_process_count()
+        
+        # Close global driver
+        cleanup_global_driver()
+        
+        # Non-aggressive zombie cleanup
+        killed = cleanup_zombie_processes(aggressive=False)
+        
+        processes_after = check_chrome_process_count()
+        
+        return {
+            "status": "success",
+            "message": "Soft cleanup completed successfully",
+            "processes_before": processes_before,
+            "processes_after": processes_after,
+            "zombies_killed": killed,
+            "recommendation": "Resources cleaned up gracefully."
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Soft cleanup failed: {str(e)}"
+        )
