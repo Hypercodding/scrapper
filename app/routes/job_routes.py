@@ -493,3 +493,49 @@ async def soft_cleanup():
             status_code=500,
             detail=f"Soft cleanup failed: {str(e)}"
         )
+
+
+@router.get("/health/throttle-status", response_model=Dict[str, Any])
+async def get_throttle_status_endpoint():
+    """
+    Get scraping throttle status - shows parallel execution limits
+    
+    This endpoint shows:
+    - How many scraping operations can run in parallel
+    - How many are currently running
+    - How many more can be started
+    - Detected Railway plan
+    
+    Useful for:
+    - Understanding if your requests will queue
+    - Monitoring parallel execution capacity
+    - Debugging slow response times
+    
+    Note: Throttling is optional. If not enabled in your scrapers,
+    this will show the recommended limits but they won't be enforced.
+    """
+    try:
+        from app.core.throttle import get_throttle_status
+        status = get_throttle_status()
+        
+        # Add interpretation
+        if status["active_scrapes"] == 0:
+            status["interpretation"] = "No scraping operations currently running"
+        elif status["available_slots"] > 0:
+            status["interpretation"] = f"{status['active_scrapes']} scrape(s) running, capacity for {status['available_slots']} more"
+        else:
+            status["interpretation"] = f"At capacity: {status['active_scrapes']} scrape(s) running, new requests will queue"
+        
+        return status
+    except ImportError:
+        # Throttling not implemented yet
+        return {
+            "status": "not_implemented",
+            "message": "Throttling module not enabled yet",
+            "recommendation": "See PARALLEL_SCRAPING_GUIDE.md for implementation instructions"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get throttle status: {str(e)}"
+        )

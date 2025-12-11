@@ -3581,73 +3581,77 @@ async def scrape_generic_career_page(
     Returns:
         List of Job objects
     """
-    company_name = extract_company_name_from_url(url)
-    print(f"\n{'='*80}")
-    print(f"Starting scrape for: {company_name}")
-    print(f"URL: {url}")
-    print(f"Search query: {search_query if search_query else 'None (will return all jobs)'}")
-    print(f"{'='*80}\n")
+    # CRITICAL: Acquire throttle to prevent resource exhaustion from concurrent requests
+    from app.core.throttle import get_scraping_throttle
     
-    # Detect job board
-    job_board = detect_job_board(url)
-    if job_board:
-        print(f"Detected job board: {job_board['name']}")
-    
-    # Scrape jobs
-    jobs = await scrape_with_selenium(
-        url=url,
-        company_name=company_name,
-        max_results=max_results * 2,  # Get extra to filter
-        search_query=search_query,
-        use_undetected=use_undetected
-    )
-    
-    # Filter by search query
-    if search_query and jobs:
-        print(f"\nFiltering {len(jobs)} jobs by search query: '{search_query}'")
+    async with get_scraping_throttle():
+        company_name = extract_company_name_from_url(url)
+        print(f"\n{'='*80}")
+        print(f"Starting scrape for: {company_name}")
+        print(f"URL: {url}")
+        print(f"Search query: {search_query if search_query else 'None (will return all jobs)'}")
+        print(f"{'='*80}\n")
         
-        # Parse multiple job titles (comma-separated)
-        job_titles = [title.strip() for title in search_query.split(',') if title.strip()]
-        print(f"Parsed {len(job_titles)} job title(s) to search for:")
-        for idx, title in enumerate(job_titles, 1):
-            print(f"  {idx}. '{title}'")
+        # Detect job board
+        job_board = detect_job_board(url)
+        if job_board:
+            print(f"Detected job board: {job_board['name']}")
         
-        filtered_jobs = []
+        # Scrape jobs
+        jobs = await scrape_with_selenium(
+            url=url,
+            company_name=company_name,
+            max_results=max_results * 2,  # Get extra to filter
+            search_query=search_query,
+            use_undetected=use_undetected
+        )
         
-        for job in jobs:
-            job_matched = False
-            matched_query = None
+        # Filter by search query
+        if search_query and jobs:
+            print(f"\nFiltering {len(jobs)} jobs by search query: '{search_query}'")
             
-            # Try to match against each job title query
-            for query_title in job_titles:
-                if matches_job_title(job.title, query_title):
-                    job_matched = True
-                    matched_query = query_title
-                    break
+            # Parse multiple job titles (comma-separated)
+            job_titles = [title.strip() for title in search_query.split(',') if title.strip()]
+            print(f"Parsed {len(job_titles)} job title(s) to search for:")
+            for idx, title in enumerate(job_titles, 1):
+                print(f"  {idx}. '{title}'")
             
-            if job_matched:
-                filtered_jobs.append(job)
-                print(f"  ✓ Matched '{matched_query}': {job.title}")
+            filtered_jobs = []
+            
+            for job in jobs:
+                job_matched = False
+                matched_query = None
+                
+                # Try to match against each job title query
+                for query_title in job_titles:
+                    if matches_job_title(job.title, query_title):
+                        job_matched = True
+                        matched_query = query_title
+                        break
+                
+                if job_matched:
+                    filtered_jobs.append(job)
+                    print(f"  ✓ Matched '{matched_query}': {job.title}")
+            
+            print(f"Found {len(filtered_jobs)} jobs matching search criteria")
+            jobs = filtered_jobs
+        elif not search_query and jobs:
+            print(f"\nNo search query provided - returning all {len(jobs)} jobs found")
         
-        print(f"Found {len(filtered_jobs)} jobs matching search criteria")
-        jobs = filtered_jobs
-    elif not search_query and jobs:
-        print(f"\nNo search query provided - returning all {len(jobs)} jobs found")
-    
-    # Apply final validation filter to catch any remaining invalid entries
-    if jobs:
-        print(f"\nApplying final validation filter...")
-        jobs = filter_invalid_jobs(jobs)
-        print(f"Jobs after final filtering: {len(jobs)}")
-    
-    # Return limited results
-    final_jobs = jobs[:max_results]
-    
-    print(f"\n{'='*80}")
-    print(f"Scraping complete: {len(final_jobs)} jobs extracted")
-    print(f"{'='*80}\n")
-    
-    return final_jobs
+        # Apply final validation filter to catch any remaining invalid entries
+        if jobs:
+            print(f"\nApplying final validation filter...")
+            jobs = filter_invalid_jobs(jobs)
+            print(f"Jobs after final filtering: {len(jobs)}")
+        
+        # Return limited results
+        final_jobs = jobs[:max_results]
+        
+        print(f"\n{'='*80}")
+        print(f"Scraping complete: {len(final_jobs)} jobs extracted")
+        print(f"{'='*80}\n")
+        
+        return final_jobs
 
 
 async def scrape_multiple_career_pages(

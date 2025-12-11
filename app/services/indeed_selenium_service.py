@@ -1140,20 +1140,24 @@ async def scrape_indeed_selenium(
     Returns:
         List of Job objects with detailed information
     """
-    global _last_fetch
+    # CRITICAL: Acquire throttle to prevent resource exhaustion from concurrent requests
+    from app.core.throttle import get_scraping_throttle
     
-    # Rate limiting
-    async with _request_lock:
-        now = time.monotonic()
-        jitter = random.uniform(0, 0.75)
-        wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_fetch = time.monotonic()
-    
-    # Run the scraping in a thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _scrape_sync_enhanced, query, location, max_results, job_type, salary_min, salary_max, experience_level, employment_type, days_old)
+    async with get_scraping_throttle():
+        global _last_fetch
+        
+        # Rate limiting
+        async with _request_lock:
+            now = time.monotonic()
+            jitter = random.uniform(0, 0.75)
+            wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _last_fetch = time.monotonic()
+        
+        # Run the scraping in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _scrape_sync_enhanced, query, location, max_results, job_type, salary_min, salary_max, experience_level, employment_type, days_old)
 
 
 def _scrape_sync_enhanced(
