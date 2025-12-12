@@ -22,13 +22,13 @@ router = APIRouter()
 
 class CareerPageRequest(BaseModel):
     url: str
-    max_results: Optional[int] = 20
+    max_results: Optional[int] = None
     search_query: Optional[str] = None
 
 
 class MultipleCareerPagesRequest(BaseModel):
     urls: List[str]
-    max_results_per_url: Optional[int] = 20
+    max_results_per_url: Optional[int] = None
     search_query: Optional[str] = None
     total_max_results: Optional[int] = None
 
@@ -237,14 +237,15 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
     Request Body:
     {
         "url": "https://example.com/careers",
-        "max_results": 20,
-        "search_query": "software engineer" (optional)
+        "max_results": null,  // Optional: null = get all jobs (default), or specify number like 50
+        "search_query": "software engineer"  // Optional: filter by keyword
     }
     
     Features:
     - Automatically follows job board links (Greenhouse, Lever, Dayforce, etc.)
     - Extracts actual job titles from job boards
     - Optional search_query to filter jobs by keyword
+    - No limit on jobs by default (gets all jobs from up to 5 pages)
     
     Returns:
     - List of Job objects with actual job titles, company, location, description, etc.
@@ -266,7 +267,7 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
 @router.get("/jobs/scrape-url-get", response_model=List[Job])
 async def scrape_career_page_url_get(
     url: str = Query(..., description="Career page URL to scrape"),
-    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+    max_results: Optional[int] = Query(None, description="Maximum number of results (None = get all jobs from up to 5 pages)"),
     search_query: Optional[str] = Query(None, description="Search/filter jobs by keyword (e.g., 'software engineer', 'sales')")
 ):
     """
@@ -280,12 +281,13 @@ async def scrape_career_page_url_get(
     - Supports search/filtering by keyword
     
     Example usage:
-    /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers&max_results=20
+    /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers
+    /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers&max_results=50
     /api/jobs/scrape-url-get?url=https://www.burton.com/us/en/careers&search_query=designer
     
     Parameters:
     - url: Career page URL to scrape
-    - max_results: Maximum number of results (default: 20)
+    - max_results: Maximum number of results (None = get all jobs from up to 5 pages)
     - search_query: Optional keyword to filter jobs (searches in title, description, location)
     
     Returns:
@@ -320,9 +322,9 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
             "https://company2.com/careers",
             "https://company3.com/careers"
         ],
-        "max_results_per_url": 20,
-        "search_query": "software engineer",  // optional
-        "total_max_results": 50  // optional - limits total results across all URLs
+        "max_results_per_url": null,  // Optional: null = get all jobs per URL (default)
+        "search_query": "software engineer",  // Optional: filter by keyword
+        "total_max_results": 50  // Optional: limits total results across all URLs
     }
     
     Features:

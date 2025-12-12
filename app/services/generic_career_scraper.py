@@ -1847,34 +1847,96 @@ async def detect_pagination(driver) -> Dict[str, Any]:
     }
     
     try:
+        print("  🔍 Starting pagination detection...")
+        
         # Look for pagination container
         pagination_selectors = [
             '.pagination', '[class*="pagination"]', '[class*="paging"]',
             '[class*="page-navigation"]', '[role="navigation"]',
-            'nav[aria-label*="pagination"]', 'nav[aria-label*="Pagination"]'
+            'nav[aria-label*="pagination"]', 'nav[aria-label*="Pagination"]',
+            'div[class*="pagination"]', 'ul[class*="pagination"]'
         ]
         
+        print(f"  📋 Searching for pagination using {len(pagination_selectors)} selectors...")
+        
         pagination_container = None
-        for selector in pagination_selectors:
+        for idx, selector in enumerate(pagination_selectors):
             try:
                 containers = driver.find_elements(By.CSS_SELECTOR, selector)
+                print(f"    Selector {idx+1}: '{selector}' found {len(containers)} container(s)")
+                
                 for container in containers:
-                    container_text = container.text.lower()
-                    if any(keyword in container_text for keyword in ['page', 'next', 'prev', '1', '2', '3']):
-                        pagination_container = container
-                        break
+                    try:
+                        # Check if container is displayed
+                        if not container.is_displayed():
+                            continue
+                        
+                        container_text = container.text.lower()
+                        print(f"      Container text sample: '{container_text[:100]}'...")
+                        
+                        if any(keyword in container_text for keyword in ['page', 'next', 'prev', '1', '2', '3']):
+                            pagination_container = container
+                            print(f"      ✅ Found pagination container with selector: '{selector}'")
+                            break
+                    except Exception as container_err:
+                        print(f"      ⚠️ Error checking container: {str(container_err)[:50]}")
+                        continue
+                
                 if pagination_container:
                     break
-            except Exception:
+            except Exception as selector_err:
+                print(f"    ⚠️ Selector {idx+1} error: {str(selector_err)[:50]}")
                 continue
         
         if not pagination_container:
-            return pagination_info
+            print("  ❌ No pagination container found")
+            # Try JavaScript-based detection as fallback
+            try:
+                print("  🔄 Trying JavaScript-based pagination detection...")
+                js_pagination_check = """
+                // Look for pagination elements
+                const paginationKeywords = ['next', 'previous', 'prev', 'page'];
+                const allLinks = document.querySelectorAll('a, button');
+                let foundPagination = false;
+                
+                for (let link of allLinks) {
+                    const text = link.textContent.toLowerCase();
+                    const hasKeyword = paginationKeywords.some(kw => text.includes(kw));
+                    const isNumber = /^\d+$/.test(text.trim());
+                    
+                    if (hasKeyword || isNumber) {
+                        foundPagination = true;
+                        break;
+                    }
+                }
+                
+                return foundPagination;
+                """
+                has_pagination_js = driver.execute_script(js_pagination_check)
+                
+                if has_pagination_js:
+                    print("    ✅ JavaScript detected pagination elements (but container not found)")
+                    # Set has_next to true to allow next_only pagination
+                    pagination_info['has_next'] = True
+                    pagination_info['type'] = 'next_only'
+                    return pagination_info
+                else:
+                    print("    ❌ No pagination found via JavaScript either")
+                    return pagination_info
+            except Exception as js_err:
+                print(f"    ⚠️ JavaScript detection failed: {str(js_err)[:50]}")
+                return pagination_info
         
         # Get all pagination links and buttons
-        pagination_links = pagination_container.find_elements(By.TAG_NAME, 'a')
-        pagination_buttons = pagination_container.find_elements(By.TAG_NAME, 'button')
-        all_elements = pagination_links + pagination_buttons
+        print("  📊 Analyzing pagination elements...")
+        try:
+            pagination_links = pagination_container.find_elements(By.TAG_NAME, 'a')
+            pagination_buttons = pagination_container.find_elements(By.TAG_NAME, 'button')
+            all_elements = pagination_links + pagination_buttons
+            print(f"    Found {len(pagination_links)} links and {len(pagination_buttons)} buttons")
+        except Exception as elem_err:
+            print(f"    ⚠️ Error getting pagination elements: {elem_err}")
+            return pagination_info
         
         # Detect numbered pagination
         page_numbers = []
@@ -1882,10 +1944,24 @@ async def detect_pagination(driver) -> Dict[str, Any]:
         has_next = False
         has_prev = False
         
-        for elem in all_elements:
+        print(f"  🔢 Checking {len(all_elements)} pagination elements...")
+        checked_count = 0
+        
+        for idx, elem in enumerate(all_elements):
             try:
-                if not elem.is_displayed():
-                    continue
+                # Add timeout protection - skip if taking too long
+                if idx > 0 and idx % 10 == 0:
+                    print(f"    Processed {idx}/{len(all_elements)} elements...")
+                
+                # Check visibility (with exception handling)
+                try:
+                    if not elem.is_displayed():
+                        continue
+                except:
+                    # If is_displayed() fails, assume element is visible
+                    pass
+                
+                checked_count += 1
                 
                 elem_text = elem.text.strip()
                 elem_aria = elem.get_attribute('aria-label') or ''
@@ -1895,6 +1971,7 @@ async def detect_pagination(driver) -> Dict[str, Any]:
                     page_num = int(elem_text)
                     if 1 <= page_num <= 999:  # Reasonable page number range
                         page_numbers.append(page_num)
+                        print(f"      Found page number: {page_num}")
                         
                         # Check if it's the current/active page
                         classes = elem.get_attribute('class') or ''
@@ -1903,6 +1980,7 @@ async def detect_pagination(driver) -> Dict[str, Any]:
                             'selected' in classes.lower() or aria_current == 'page' or
                             'bold' in classes.lower() or elem.tag_name == 'strong'):
                             current_page = page_num
+                            print(f"      ✅ Current page detected: {current_page}")
                 
                 # Check for next button
                 if ('next' in elem_text.lower() or '>' in elem_text or
@@ -1912,14 +1990,21 @@ async def detect_pagination(driver) -> Dict[str, Any]:
                     aria_disabled = elem.get_attribute('aria-disabled')
                     if 'disabled' not in classes.lower() and aria_disabled != 'true':
                         has_next = True
+                        print(f"      ✅ Active 'Next' button found")
                 
                 # Check for previous button
                 if ('prev' in elem_text.lower() or '<' in elem_text or
                     'prev' in elem_aria.lower() or 'previous' in elem_text.lower()):
                     has_prev = True
+                    print(f"      ✅ 'Previous' button found")
                     
-            except Exception:
+            except Exception as check_err:
+                # Log but continue
+                if idx % 10 == 0:  # Only log occasionally
+                    print(f"      ⚠️ Error checking element {idx}: {str(check_err)[:40]}")
                 continue
+        
+        print(f"  ✅ Checked {checked_count} visible pagination elements")
         
         # Determine pagination type
         if page_numbers:
@@ -1927,15 +2012,22 @@ async def detect_pagination(driver) -> Dict[str, Any]:
             pagination_info['page_numbers'] = sorted(set(page_numbers))
             pagination_info['current_page'] = current_page
             pagination_info['total_pages'] = max(page_numbers) if page_numbers else None
+            print(f"  📄 Numbered pagination detected: {len(set(page_numbers))} pages, current={current_page}")
         elif has_next:
             pagination_info['type'] = 'next_only'
+            print(f"  ➡️ Next-only pagination detected")
+        else:
+            print(f"  ❌ No valid pagination detected (has_next={has_next}, page_numbers={page_numbers})")
         
         pagination_info['has_next'] = has_next
         pagination_info['has_prev'] = has_prev
         
     except Exception as e:
-        print(f"Error detecting pagination: {e}")
+        print(f"  ❌ Error detecting pagination: {e}")
+        import traceback
+        print(f"  Traceback: {traceback.format_exc()[:200]}")
     
+    print(f"  📊 Final pagination info: {pagination_info}")
     return pagination_info
 
 
@@ -2600,66 +2692,91 @@ async def extract_jobs_from_current_page(
         
         try:
             print(f"  ⏳ Executing JavaScript search (this may take a moment)...")
+            # Set a script timeout to prevent hanging
+            driver.set_script_timeout(30)  # 30 second timeout for script execution
             elements = driver.execute_script(js_script, job_selectors)
-            print(f"  ✅ JavaScript search complete: found {len(elements)} elements")
+            print(f"  ✅ JavaScript search complete: found {len(elements) if elements else 0} elements")
         except Exception as e:
-            print(f"  ⚠️  JavaScript search failed ({e}), falling back to Python method...")
+            print(f"  ⚠️  JavaScript search failed ({str(e)[:100]}), falling back to Python method...")
             # Fallback to Python method with timeout protection
             elements = []
             for idx, selector in enumerate(job_selectors[:30]):  # Limit to first 30 selectors
                 try:
                     if idx % 5 == 0:
-                        print(f"  Checking selector {idx+1}/30...")
+                        print(f"    Checking selector {idx+1}/30...")
                     found = driver.find_elements(By.CSS_SELECTOR, selector)
                     if found:
+                        print(f"      Selector '{selector}' found {len(found)} elements")
                         elements.extend(found)
                         if len(elements) > 300:  # Stop if we have enough
-                            print(f"  Found enough elements ({len(elements)}), stopping search")
+                            print(f"    Found enough elements ({len(elements)}), stopping search")
                             break
-                except Exception:
+                except Exception as sel_err:
+                    if idx % 10 == 0:  # Log occasionally
+                        print(f"      ⚠️ Selector error: {str(sel_err)[:50]}")
                     continue
         
-        print(f"  Found {len(elements)} total elements, removing duplicates...")
+        print(f"  📦 Found {len(elements) if elements else 0} total elements, removing duplicates...")
         
         # Remove duplicates by position (with progress tracking and limits)
         unique_elements = []
         seen_positions = set()
         max_elements_to_process = 500  # Limit to prevent hanging
+        skip_count = 0
         
-        for idx, elem in enumerate(elements[:max_elements_to_process]):
+        for idx, elem in enumerate(elements[:max_elements_to_process] if elements else []):
             try:
                 # Progress tracking every 50 elements
                 if idx > 0 and idx % 50 == 0:
-                    print(f"  Processing element {idx}/{min(len(elements), max_elements_to_process)}...")
+                    print(f"    Deduplicating: {idx}/{min(len(elements), max_elements_to_process)} processed, {len(unique_elements)} unique...")
                 
                 pos = elem.location
                 pos_key = (pos['x'], pos['y'])
                 if pos_key not in seen_positions:
                     seen_positions.add(pos_key)
                     unique_elements.append(elem)
-            except Exception:
+                else:
+                    skip_count += 1
+            except Exception as pos_err:
+                # If location fails, still include element
+                if idx % 50 == 0:
+                    print(f"      ⚠️ Position error at idx {idx}: {str(pos_err)[:40]}")
+                unique_elements.append(elem)
                 continue
         
-        print(f"  Filtered to {len(unique_elements)} unique elements")
+        print(f"  ✅ Filtered to {len(unique_elements)} unique elements (skipped {skip_count} duplicates)")
         
         # Fallback: If no elements found, try text-based search
         if len(unique_elements) == 0:
+            print("  🔄 No elements found with selectors, trying text-based fallback...")
             job_title_patterns = ["Director", "Manager", "Engineer", "Developer", "Analyst",
                                 "Specialist", "Coordinator", "Assistant", "Associate"]
             
-            for pattern in job_title_patterns[:5]:
+            for idx, pattern in enumerate(job_title_patterns[:5]):
                 try:
+                    print(f"    Searching for pattern '{pattern}'...")
                     xpath_query = f"//*[contains(text(), '{pattern}') and string-length(text()) > 10 and string-length(text()) < 200]"
                     found = driver.find_elements(By.XPATH, xpath_query)
+                    print(f"      Found {len(found)} potential matches")
+                    
+                    valid_count = 0
                     for elem in found:
                         try:
                             text = elem.text.strip()
                             if is_valid_job_title(text):
                                 unique_elements.append(elem)
+                                valid_count += 1
                         except:
                             continue
-                except Exception:
+                    print(f"      Added {valid_count} valid job titles")
+                except Exception as pattern_err:
+                    print(f"      ⚠️ Pattern search error: {str(pattern_err)[:50]}")
                     continue
+            
+            if len(unique_elements) > 0:
+                print(f"  ✅ Fallback found {len(unique_elements)} potential job elements")
+            else:
+                print(f"  ❌ Fallback search found no job elements")
         
         # Extract jobs from elements
         print(f"  Categorizing {len(unique_elements)} elements by link presence...")
@@ -3286,9 +3403,12 @@ async def scrape_with_selenium(
             
             # Now handle pagination and extract jobs from each page
             if len(jobs) < max_results:
+                # Always limit pagination to 5 pages
+                max_pagination_pages = 5
+                
                 print(f"\n{'='*60}")
                 print(f"Handling pagination to collect more jobs...")
-                print(f"Current jobs: {len(jobs)}, Target: {max_results}")
+                print(f"Current jobs: {len(jobs)}, Target: {max_results if max_results < 999999 else 'ALL'}")
                 print(f"⚠️  Pagination limited to maximum 5 pages")
                 print(f"{'='*60}")
                 
@@ -3316,7 +3436,10 @@ async def scrape_with_selenium(
                         
                         # Start from page 2 if we're on page 1
                         start_page = 2 if current_page == 1 else current_page + 1
-                        pages_to_scrape = list(range(start_page, min(total_pages + 1, 6)))  # Limit to 5 pages (1-5)
+                        
+                        # Always limit to max_pagination_pages (5 pages)
+                        pages_to_scrape = list(range(start_page, min(total_pages + 1, max_pagination_pages + 1)))
+                        print(f"  📚 Will scrape pages {start_page} to {min(total_pages, max_pagination_pages)} (limited to {max_pagination_pages} pages)")
                         
                         for page_num in pages_to_scrape:
                             if len(jobs) >= max_results:
@@ -3355,12 +3478,13 @@ async def scrape_with_selenium(
                             print(f"  Found {len(page_jobs)} jobs on page {page_num} (Total: {len(jobs)})")
                     
                     elif pagination_info['has_next'] or pagination_info['type'] == 'next_only':
-                        # Next-only pagination
+                        # Next-only pagination - always limit to max_pagination_pages
                         page_num = 1
                         consecutive_failures = 0
                         max_consecutive_failures = 2
                         
-                        while len(jobs) < max_results and page_num < 6:  # Limit to 5 pages
+                        print(f"  ➡️ Next-only pagination: Will scrape up to {max_pagination_pages} pages")
+                        while len(jobs) < max_results and page_num < (max_pagination_pages + 1):  # Limit to max_pagination_pages
                             page_num += 1
                             print(f"\n📄 Extracting jobs from page {page_num}...")
                             
@@ -3583,7 +3707,7 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
 
 async def scrape_generic_career_page(
     url: str,
-    max_results: int = 20,
+    max_results: Optional[int] = None,
     search_query: Optional[str] = None,
     use_undetected: bool = False
 ) -> List[Job]:
@@ -3592,13 +3716,17 @@ async def scrape_generic_career_page(
     
     Args:
         url: Career page URL
-        max_results: Maximum number of jobs to return
+        max_results: Maximum number of jobs to return (None = get all jobs)
         search_query: Optional search term to filter jobs (can be comma-separated for multiple titles)
         use_undetected: Use undetected-chromedriver for anti-bot protection
         
     Returns:
         List of Job objects
     """
+    # Set max_results to unlimited if not specified
+    if max_results is None:
+        max_results = 999999  # Large number to get all jobs
+        print(f"ℹ️  No max_results specified - will scrape ALL available jobs")
     # CRITICAL: Acquire throttle to prevent resource exhaustion from concurrent requests
     from app.core.throttle import get_scraping_throttle
     
@@ -3674,7 +3802,7 @@ async def scrape_generic_career_page(
 
 async def scrape_multiple_career_pages(
     urls: List[str],
-    max_results_per_url: int = 20,
+    max_results_per_url: Optional[int] = None,
     search_query: Optional[str] = None,
     use_undetected: bool = False,
     total_max_results: Optional[int] = None
@@ -3684,7 +3812,7 @@ async def scrape_multiple_career_pages(
     
     Args:
         urls: List of career page URLs to scrape
-        max_results_per_url: Maximum number of jobs to extract per URL
+        max_results_per_url: Maximum number of jobs to extract per URL (None = get all jobs)
         search_query: Optional search term to filter jobs
         use_undetected: Use undetected-chromedriver for anti-bot protection
         total_max_results: Optional total maximum results across all URLs
@@ -3692,6 +3820,10 @@ async def scrape_multiple_career_pages(
     Returns:
         Combined list of Job objects from all URLs
     """
+    # Set max_results_per_url to unlimited if not specified
+    if max_results_per_url is None:
+        max_results_per_url = 999999  # Large number to get all jobs
+        print(f"ℹ️  No max_results_per_url specified - will scrape ALL available jobs per URL")
     all_jobs = []
     successful_scrapes = 0
     failed_scrapes = 0
@@ -3839,9 +3971,13 @@ async def scrape_with_requests_fallback(url: str, company_name: str, max_results
 
 async def scrape_with_retry_strategies(
     url: str,
-    max_results: int = 20,
+    max_results: Optional[int] = None,
     search_query: Optional[str] = None
 ) -> List[Job]:
+    # Set max_results to unlimited if not specified
+    if max_results is None:
+        max_results = 999999  # Large number to get all jobs
+        print(f"ℹ️  No max_results specified - will scrape ALL available jobs")
     """
     Scrape with multiple fallback strategies
     
