@@ -200,6 +200,50 @@ def check_chrome_process_count() -> int:
         return -1
 
 
+def check_system_resources() -> dict:
+    """
+    Check system resource availability (memory, file descriptors, processes).
+    Returns a dictionary with resource information and warnings.
+    """
+    from typing import Any, Dict
+    resources: Dict[str, Any] = {
+        'memory_available': 'unknown',
+        'memory_percent': 'unknown',
+        'chrome_processes': 0,
+        'warnings': []
+    }
+    
+    try:
+        import psutil
+        
+        # Check memory
+        mem = psutil.virtual_memory()
+        resources['memory_available'] = f"{mem.available / (1024**3):.2f} GB"
+        resources['memory_percent'] = f"{mem.percent}%"
+        
+        # Warn if memory is low
+        if mem.percent > 90:
+            resources['warnings'].append(f"⚠️  CRITICAL: Memory usage at {mem.percent}% - Chrome may crash!")
+        elif mem.percent > 80:
+            resources['warnings'].append(f"⚠️  WARNING: Memory usage at {mem.percent}% - approaching limits")
+        
+        # Check Chrome processes
+        chrome_count = check_chrome_process_count()
+        resources['chrome_processes'] = chrome_count
+        
+        if chrome_count > 20:
+            resources['warnings'].append(f"⚠️  CRITICAL: {chrome_count} Chrome processes running - resource leak detected!")
+        elif chrome_count > 10:
+            resources['warnings'].append(f"⚠️  WARNING: {chrome_count} Chrome processes running - cleanup recommended")
+        
+    except ImportError:
+        resources['warnings'].append("⚠️  psutil not installed - cannot check system resources")
+    except Exception as e:
+        resources['warnings'].append(f"⚠️  Error checking resources: {e}")
+    
+    return resources
+
+
 def cleanup_zombie_processes(aggressive: bool = False):
     """
     Clean up any zombie Chrome/ChromeDriver processes.
@@ -790,7 +834,23 @@ def get_driver(force_new: bool = False):
                 max_retries = 3
                 temp_driver = None  # Track temporary driver for cleanup
                 
+                # Check system resources before attempting driver creation
+                resources = check_system_resources()
+                if resources['warnings']:
+                    print("⚠️  Resource warnings detected:")
+                    for warning in resources['warnings']:
+                        print(f"   {warning}")
+                    print(f"   Memory available: {resources['memory_available']}, Memory used: {resources['memory_percent']}")
+                    print(f"   Chrome processes: {resources['chrome_processes']}")
+                    
+                    # If critical warnings, do proactive cleanup
+                    if any('CRITICAL' in w for w in resources['warnings']):
+                        print("   Running proactive cleanup due to critical resource warnings...")
+                        cleanup_zombie_processes(aggressive=True)
+                        time.sleep(2.0)
+                
                 for retry in range(max_retries):
+                    service = None  # Track service for cleanup
                     try:
                         if use_webdriver_manager and not chromedriver_path:
                             # Use webdriver_manager to get the right ChromeDriver version
@@ -839,25 +899,40 @@ def get_driver(force_new: bool = False):
                         print(f"❌ Attempt {retry + 1} failed: {error_msg}")
                         print(f"   Error type: {type(init_error).__name__}")
                         
-                        # Always cleanup temp_driver on failure
+                        # CRITICAL: Always cleanup on failure - both driver and service
+                        # Cleanup in reverse order: driver first, then service
                         if temp_driver:
                             try:
                                 print(f"   Cleaning up failed driver instance...")
                                 temp_driver.quit()
-                                # Also ensure service process is terminated
-                                if hasattr(temp_driver, 'service') and temp_driver.service:
-                                    if hasattr(temp_driver.service, 'process') and temp_driver.service.process:
-                                        if temp_driver.service.process.poll() is None:
-                                            temp_driver.service.process.terminate()
-                                            try:
-                                                temp_driver.service.process.wait(timeout=5)
-                                            except:
-                                                temp_driver.service.process.kill()  # Force kill if terminate fails
-                                print(f"   ✓ Failed driver cleaned up")
-                            except Exception as cleanup_error:
-                                print(f"   ⚠️  Error during cleanup: {cleanup_error}")
+                                print(f"   ✓ Driver quit called")
+                            except Exception as quit_error:
+                                print(f"   ⚠️  Error during driver.quit(): {quit_error}")
                             finally:
                                 temp_driver = None
+                        
+                        # Clean up service process separately (even if driver cleanup failed)
+                        if service:
+                            try:
+                                if hasattr(service, 'process') and service.process:
+                                    if service.process.poll() is None:
+                                        print(f"   Terminating service process (PID: {service.process.pid})...")
+                                        service.process.terminate()
+                                        try:
+                                            service.process.wait(timeout=3)
+                                            print(f"   ✓ Service process terminated")
+                                        except:
+                                            print(f"   ⚠️  Terminate timeout, force killing...")
+                                            service.process.kill()
+                                            try:
+                                                service.process.wait(timeout=2)
+                                                print(f"   ✓ Service process killed")
+                                            except:
+                                                print(f"   ⚠️  Service process may still be running")
+                            except Exception as service_cleanup_error:
+                                print(f"   ⚠️  Error during service cleanup: {service_cleanup_error}")
+                        
+                        print(f"   ✓ Cleanup completed for failed attempt")
                         
                         if retry < max_retries - 1:
                             # Clean up any remaining zombie processes before retry
@@ -900,8 +975,14 @@ def get_driver(force_new: bool = False):
                             elif "connection pool" in error_msg.lower() or "max retries" in error_msg.lower():
                                 # Connection pool exhaustion
                                 raise Exception(f"Connection pool exhausted ({process_count} Chrome processes active). Too many Chrome instances are running. Try: 1) Close unused Chrome windows 2) Restart the application 3) Run cleanup_zombie_processes(). Error: {error_msg}")
-                            elif "session not created" in error_msg.lower() or "invalid session" in error_msg.lower():
-                                raise Exception(f"Failed to create Chrome session. This may indicate connection pool exhaustion or resource limits. Try restarting the application. Error: {error_msg}")
+                            elif "session not created" in error_msg.lower() or "chrome.*exited" in error_msg.lower() or "invalid session" in error_msg.lower():
+                                # Chrome crashed during startup - likely resource exhaustion
+                                raise Exception(
+                                    f"Chrome instance exited during startup ({process_count} processes before attempt). "
+                                    f"This typically indicates: 1) Memory exhaustion (insufficient RAM/swap) 2) Too many processes 3) System resource limits (ulimit) 4) Missing libraries (ldd /usr/bin/google-chrome). "
+                                    f"Solutions: 1) Restart application/container 2) Increase memory limits 3) Reduce concurrent requests 4) Check 'ulimit -a' and 'free -h'. "
+                                    f"Error: {error_msg}"
+                                )
                             else:
                                 raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
                 
@@ -1331,35 +1412,31 @@ def _scrape_sync_enhanced(
                 try:
                     print(f"   [SCRAPE] Attempting navigation to: {url}")
                     
-                    # Set a timeout for the navigation itself using threading
-                    import threading
-                    navigation_success = False
-                    navigation_error = None
-                    
-                    def navigate_with_timeout():
-                        nonlocal navigation_success, navigation_error
-                        try:
-                            driver.get(url)
-                            navigation_success = True
-                        except Exception as e:
-                            navigation_error = e
-                    
-                    # Start navigation in a separate thread
-                    nav_thread = threading.Thread(target=navigate_with_timeout)
-                    nav_thread.daemon = True
-                    nav_thread.start()
-                    nav_thread.join(timeout=60)  # 60 second timeout for navigation
+                    # Use driver's built-in page load timeout instead of threading (more reliable)
+                    try:
+                        driver.get(url)
+                        navigation_success = True
+                        navigation_error = None
+                    except Exception as nav_err:
+                        navigation_success = False
+                        navigation_error = nav_err
+                        # If navigation fails due to timeout or error, cleanup may be needed
+                        if "timeout" in str(nav_err).lower():
+                            print(f"⚠️  Navigation timeout detected, attempting to stop page load...")
+                            try:
+                                # Try to stop the page load
+                                driver.execute_script("window.stop();")
+                                time.sleep(1.0)
+                            except:
+                                pass
                     
                     # Check if navigation succeeded
                     if not navigation_success:
-                        if nav_thread.is_alive():
-                            # Navigation is still running - it's hung
-                            raise TimeoutError("Navigation timed out after 60 seconds")
-                        elif navigation_error:
-                            # Navigation thread raised an exception
+                        if navigation_error:
+                            # Navigation raised an exception
                             raise navigation_error
                         else:
-                            # Thread finished but navigation_success not set
+                            # Unknown navigation failure
                             raise Exception("Navigation failed for unknown reason")
                     
                     print(f"✓ [SCRAPE] Navigation successful")

@@ -2768,6 +2768,7 @@ async def scrape_with_selenium(
     jobs = []
     driver = None
     
+    service = None  # Track service for cleanup on failure
     try:
         # Setup Chrome options
         chrome_options = Options()
@@ -2804,13 +2805,30 @@ async def scrape_with_selenium(
         if use_undetected:
             print("Using undetected-chromedriver for anti-bot protection")
             chrome_path = get_chrome_executable_path()
-            driver = uc.Chrome(options=chrome_options, browser_executable_path=chrome_path)
+            try:
+                driver = uc.Chrome(options=chrome_options, browser_executable_path=chrome_path)
+            except Exception as uc_error:
+                print(f"❌ Failed to create undetected Chrome driver: {uc_error}")
+                # If driver creation failed, ensure no orphaned processes
+                raise
         else:
-            service = Service(ChromeDriverManager().install())
-            chrome_path = get_chrome_executable_path()
-            if chrome_path:
-                chrome_options.binary_location = chrome_path
-            driver = webdriver.Chrome(service=service, options=chrome_options)
+            try:
+                service = Service(ChromeDriverManager().install())
+                chrome_path = get_chrome_executable_path()
+                if chrome_path:
+                    chrome_options.binary_location = chrome_path
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            except Exception as driver_error:
+                print(f"❌ Failed to create Chrome driver: {driver_error}")
+                # Clean up service if it was created but driver creation failed
+                if service and hasattr(service, 'process') and service.process:
+                    try:
+                        if service.process.poll() is None:
+                            service.process.terminate()
+                            service.process.wait(timeout=3)
+                    except:
+                        pass
+                raise
         
         # Set timeouts to prevent hanging - OPTIMIZED
         driver.set_page_load_timeout(30)  # Reduced from 60s - Max 30 seconds for page load
