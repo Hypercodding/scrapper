@@ -176,6 +176,33 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 
+def get_chromedriver_path() -> Optional[str]:
+    """
+    Get ChromeDriver executable path based on environment.
+    Checks CHROMEDRIVER_PATH env var first (set in Railway Dockerfile), 
+    then common installation paths.
+    This ensures we use the pre-installed ChromeDriver that matches Chrome version.
+    """
+    # Check environment variable first (set in Railway Dockerfile)
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path and os.path.exists(chromedriver_path):
+        return chromedriver_path
+    
+    # Common paths (Railway Dockerfile installs to /usr/local/bin/chromedriver)
+    paths = [
+        "/usr/local/bin/chromedriver",  # Railway/Docker installation
+        "/usr/bin/chromedriver",
+        "/usr/local/share/chromedriver",
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    
+    # If not found, return None and let ChromeDriverManager download it
+    return None
+
+
 def get_random_user_agent() -> str:
     """Return a random user agent"""
     return random.choice(USER_AGENTS)
@@ -3056,8 +3083,11 @@ async def scrape_with_selenium(
     driver = None
     
     service = None  # Track service for cleanup on failure
+    max_retries = 3
+    retry_delay = 2
+    
     try:
-        # Setup Chrome options
+        # Setup Chrome options with enhanced stability for containerized environments
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -3068,8 +3098,10 @@ async def scrape_with_selenium(
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_argument(f'user-agent={get_random_user_agent()}')
         chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--remote-debugging-port=9222')
-        chrome_options.add_argument('--remote-debugging-address=0.0.0.0')
+        # Use random port to avoid conflicts
+        debug_port = random.randint(9000, 9999)
+        chrome_options.add_argument(f'--remote-debugging-port={debug_port}')
+        chrome_options.add_argument('--remote-debugging-address=127.0.0.1')  # Changed from 0.0.0.0 for security
         chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--disable-background-networking')
         chrome_options.add_argument('--disable-background-timer-throttling')
@@ -3085,37 +3117,135 @@ async def scrape_with_selenium(
         chrome_options.add_argument('--no-first-run')
         chrome_options.add_argument('--safebrowsing-disable-auto-update')
         chrome_options.add_argument('--password-store=basic')
+        # Additional stability options for containerized environments (Railway)
+        chrome_options.add_argument('--disable-web-security')
+        chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+        chrome_options.add_argument('--disable-ipc-flooding-protection')
+        chrome_options.add_argument('--disable-logging')
+        chrome_options.add_argument('--log-level=3')  # Only fatal errors
+        # Railway-specific: Memory and resource optimizations
+        chrome_options.add_argument('--disable-background-downloads')
+        chrome_options.add_argument('--disable-component-update')
+        chrome_options.add_argument('--disable-domain-reliability')
+        chrome_options.add_argument('--disable-remote-fonts')  # Reduce memory usage
+        chrome_options.add_argument('--disable-notifications')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+        # Add preference to avoid crashes
+        chrome_options.add_experimental_option('prefs', {
+            'profile.default_content_setting_values.notifications': 2,
+            'profile.default_content_settings.popups': 0,
+        })
         
         # Use undetected-chromedriver for anti-bot protection
         if use_undetected:
             print("Using undetected-chromedriver for anti-bot protection")
             chrome_path = get_chrome_executable_path()
-            try:
-                driver = uc.Chrome(options=chrome_options, browser_executable_path=chrome_path)
-            except Exception as uc_error:
-                print(f"❌ Failed to create undetected Chrome driver: {uc_error}")
-                # If driver creation failed, ensure no orphaned processes
-                raise
+            for attempt in range(max_retries):
+                try:
+                    driver = uc.Chrome(
+                        options=chrome_options,
+                        browser_executable_path=chrome_path,
+                        use_subprocess=True,
+                        version_main=None,  # Auto-detect version
+                        driver_executable_path=None  # Auto-detect driver
+                    )
+                    break  # Success
+                except Exception as uc_error:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️  Attempt {attempt + 1} failed, retrying in {retry_delay}s: {uc_error}")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"❌ Failed to create undetected Chrome driver after {max_retries} attempts: {uc_error}")
+                        raise
         else:
-            try:
-                service = Service(ChromeDriverManager().install())
-                chrome_path = get_chrome_executable_path()
-                if chrome_path:
-                    chrome_options.binary_location = chrome_path
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            except Exception as driver_error:
-                print(f"❌ Failed to create Chrome driver: {driver_error}")
-                # Clean up service if it was created but driver creation failed
-                if service and hasattr(service, 'process') and service.process:
-                    try:
-                        if service.process.poll() is None:
-                            service.process.terminate()
-                            service.process.wait(timeout=3)
-                    except:
-                        pass
-                raise
+            # Standard Selenium ChromeDriver with retry logic
+            for attempt in range(max_retries):
+                try:
+                    # Get ChromeDriver path - prefer pre-installed (Railway) over ChromeDriverManager
+                    chromedriver_path = get_chromedriver_path()
+                    
+                    if chromedriver_path:
+                        # Use pre-installed ChromeDriver (from Railway Dockerfile)
+                        print(f"✅ Using pre-installed ChromeDriver at: {chromedriver_path}")
+                        if not os.access(chromedriver_path, os.X_OK):
+                            os.chmod(chromedriver_path, 0o755)  # Ensure execute permissions
+                    else:
+                        # Fallback to ChromeDriverManager if not found
+                        print("⚠️  Pre-installed ChromeDriver not found, downloading via ChromeDriverManager...")
+                        try:
+                            chromedriver_path = ChromeDriverManager().install()
+                            if chromedriver_path and os.path.exists(chromedriver_path):
+                                os.chmod(chromedriver_path, 0o755)  # Ensure execute permissions
+                                print(f"✅ Downloaded ChromeDriver to: {chromedriver_path}")
+                        except Exception as install_error:
+                            print(f"⚠️  ChromeDriverManager install failed: {install_error}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_delay)
+                                continue
+                            raise
+                    
+                    # Create service with logging for debugging
+                    service_log_path = '/tmp/chromedriver.log' if os.path.exists('/tmp') else None
+                    service = Service(
+                        chromedriver_path,
+                        log_path=service_log_path
+                    )
+                    
+                    chrome_path = get_chrome_executable_path()
+                    if chrome_path:
+                        if not os.path.exists(chrome_path):
+                            raise FileNotFoundError(f"Chrome binary not found at: {chrome_path}")
+                        if not os.access(chrome_path, os.X_OK):
+                            raise PermissionError(f"Chrome binary is not executable: {chrome_path}")
+                        chrome_options.binary_location = chrome_path
+                        print(f"✅ Using Chrome binary at: {chrome_path}")
+                    else:
+                        print("⚠️  Chrome binary path not found, using system default")
+                    
+                    # Create driver with explicit timeout
+                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                    break  # Success
+                    
+                except Exception as driver_error:
+                    error_msg = str(driver_error)
+                    print(f"⚠️  Driver creation attempt {attempt + 1}/{max_retries} failed: {error_msg}")
+                    
+                    # Clean up service if it was created
+                    if service and hasattr(service, 'process') and service.process:
+                        try:
+                            if service.process.poll() is None:
+                                service.process.terminate()
+                                service.process.wait(timeout=3)
+                        except:
+                            pass
+                    service = None
+                    
+                    if attempt < max_retries - 1:
+                        print(f"   Retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"❌ Failed to create Chrome driver after {max_retries} attempts")
+                        print(f"   Error type: {type(driver_error).__name__}")
+                        # Try fallback to undetected-chromedriver if not already using it
+                        if not use_undetected:
+                            print("   Attempting fallback to undetected-chromedriver...")
+                            try:
+                                chrome_path = get_chrome_executable_path()
+                                driver = uc.Chrome(
+                                    options=chrome_options,
+                                    browser_executable_path=chrome_path,
+                                    use_subprocess=True,
+                                    version_main=None,
+                                    driver_executable_path=None
+                                )
+                                print("   ✅ Fallback to undetected-chromedriver successful")
+                                break  # Success with fallback
+                            except Exception as fallback_error:
+                                print(f"   ❌ Fallback also failed: {fallback_error}")
+                                raise driver_error  # Raise original error
+                        else:
+                            raise
         
         # Set timeouts to prevent hanging - OPTIMIZED
         driver.set_page_load_timeout(30)  # Reduced from 60s - Max 30 seconds for page load
