@@ -630,6 +630,99 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
                 _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
 
 
+@router.get("/jobs/scrape-url-async-get", response_model=ScrapeJobResponse)
+async def scrape_career_page_url_async_get(
+    url: str = Query(..., description="Career page URL to scrape"),
+    max_results: Optional[int] = Query(None, description="Maximum number of results (None = get all jobs from up to 5 pages)"),
+    search_query: Optional[str] = Query(None, description="Search/filter jobs by keyword (e.g., 'software engineer', 'sales')")
+):
+    """
+    Scrape jobs from any company career page URL (Async Job Pattern - GET method)
+    
+    ⚡ USE THIS ENDPOINT FOR LONG-RUNNING REQUESTS (e.g., from n8n)
+    
+    This endpoint returns immediately with a job_id, allowing you to poll for results.
+    This prevents timeout issues when scraping takes longer than 15 minutes.
+    
+    Query Parameters:
+    - url: Career page URL to scrape (required)
+    - max_results: Maximum number of results (optional, None = get all jobs)
+    - search_query: Filter jobs by keyword (optional)
+    
+    Example:
+    GET /api/jobs/scrape-url-async-get?url=https://monday.com/careers&search_query=Customer%20Success
+    
+    Response:
+    {
+        "job_id": "uuid-string",
+        "status": "pending",
+        "message": "Job created successfully",
+        "status_url": "/api/jobs/scrape-status/{job_id}",
+        "estimated_time": "5-30 minutes"
+    }
+    
+    How to use:
+    1. Call this endpoint - it returns immediately with job_id
+    2. Poll /api/jobs/scrape-status/{job_id} every 10-30 seconds
+    3. When status is "completed", the result contains the jobs
+    4. When status is "failed", check the error field
+    """
+    # Create request object from query parameters
+    request = CareerPageRequest(url=url, max_results=max_results, search_query=search_query)
+    
+    # Generate unique job ID
+    job_id = str(uuid.uuid4())
+    
+    # Check cache first
+    cache_key = f"generic_career:{request.url}:{request.max_results}:{request.search_query}"
+    cached = await get_cache(cache_key)
+    if cached:
+        # Cache hit - return immediately
+        async with _get_job_lock():
+            _job_storage[job_id] = {
+                "job_id": job_id,
+                "status": JobStatus.COMPLETED,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "result": cached,
+                "progress": {"source": "cache", "jobs_found": len(cached)}
+            }
+        
+        return ScrapeJobResponse(
+            job_id=job_id,
+            status=JobStatus.COMPLETED,
+            message="Results found in cache",
+            status_url=f"/api/jobs/scrape-status/{job_id}",
+            estimated_time="immediate"
+        )
+    
+    # Create job record
+    async with _get_job_lock():
+        _job_storage[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": None,
+            "url": request.url,
+            "max_results": request.max_results,
+            "search_query": request.search_query,
+            "result": None,
+            "error": None,
+            "progress": None
+        }
+    
+    # Start background task
+    asyncio.create_task(_process_scrape_job(job_id, request.url, request.max_results, request.search_query))
+    
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Job created successfully. Poll the status_url to get results.",
+        status_url=f"/api/jobs/scrape-status/{job_id}",
+        estimated_time="5-30 minutes (depending on page complexity)"
+    )
+
+
 @router.post("/jobs/scrape-url-async", response_model=ScrapeJobResponse)
 async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
     """
