@@ -602,7 +602,27 @@ def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
         # Also check for URLs ending with job ID or location
         url_ends_with_job_pattern = bool(re.search(r'/(job|jobs|careers?|openings?|positions?)/[^/?]+/?$', url_lower))
         
-        if url_has_job_pattern or url_has_numeric_id or url_has_job_path or url_ends_with_job_pattern:
+        # Filter out search/filter URLs (not actual job detail pages)
+        # Only reject if URL has actual query parameters indicating a search/filter page
+        # Workday URLs ending with /job/ are valid even without job ID
+        has_query_params = '?' in url_lower
+        is_search_url = False
+        
+        if has_query_params:
+            # Check if query params indicate a search/filter page
+            query_params_to_reject = ['query=', 'search=', 'filter=', 'q=', 'split_view=true']
+            url_query_part = url_lower.split('?')[1] if '?' in url_lower else ''
+            is_search_url = any(param in url_query_part for param in query_params_to_reject)
+        
+        if is_search_url:
+            if debug:
+                print(f"       ❌ Failed: URL is search/filter page, not job detail: '{job.url[:80]}'")
+            return False
+        
+        # Workday-specific: URLs ending with /job/ (even without job ID) are valid job detail pages
+        is_workday_job_url = bool(re.search(r'/job/?$', url_lower)) or bool(re.search(r'/job/\w', url_lower))
+        
+        if url_has_job_pattern or url_has_numeric_id or url_has_job_path or url_ends_with_job_pattern or is_workday_job_url:
             has_job_url = True
             if debug:
                 print(f"       ✅ URL looks like job URL: '{job.url[:80]}'")
@@ -621,10 +641,28 @@ def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
             return False
         
         # Reject very obvious non-job titles only
-        obvious_non_jobs = ['view all', 'all jobs']  # Minimal list
+        obvious_non_jobs = [
+            'view all', 'all jobs', 'protomaps', 'openstreetmap', 
+            'map', 'maps', 'copyright', 'dipartimenti', 'sedi tutto'
+        ]
+        
+        # Check if title is exactly one of these or contains them as standalone words
         if title_lower in obvious_non_jobs:
             if debug:
-                print(f"       ❌ Failed: Title is obvious navigation")
+                print(f"       ❌ Failed: Title is obvious non-job: '{job.title}'")
+            return False
+        
+        # Also check if title contains map/copyright attributions
+        map_indicators = ['protomaps', 'openstreetmap', '© openstreetmap', '© openstreet', 'leaflet', 'mapbox']
+        if any(indicator in title_lower for indicator in map_indicators):
+            if debug:
+                print(f"       ❌ Failed: Title appears to be map attribution: '{job.title}'")
+            return False
+        
+        # Check if title is just a department/category header (often single word or very generic)
+        if len(title_lower.split()) <= 2 and title_lower in ['dipartimenti', 'sedi tutto', '8 offerte', 'offerte']:
+            if debug:
+                print(f"       ❌ Failed: Title appears to be category header: '{job.title}'")
             return False
         
         # If job has URL and title doesn't match obvious non-job patterns, ACCEPT IT
@@ -1082,7 +1120,6 @@ async def enhanced_search_functionality(driver, search_query: str) -> bool:
         try:
             search_input.send_keys(Keys.RETURN)
             logger.info("Submitted search with Enter key")
-            await asyncio.sleep(3)
             search_submitted = True
         except Exception:
             pass
@@ -1106,7 +1143,6 @@ async def enhanced_search_functionality(driver, search_query: str) -> bool:
                         if btn.is_displayed() and btn.is_enabled():
                             btn.click()
                             logger.info("Clicked search button")
-                            await asyncio.sleep(3)
                             search_submitted = True
                             break
                     if search_submitted:
@@ -1117,13 +1153,12 @@ async def enhanced_search_functionality(driver, search_query: str) -> bool:
         # Method 3: Wait for auto-filter/autocomplete
         if not search_submitted:
             logger.info("Waiting for auto-filter to apply")
-            await asyncio.sleep(2)
             search_submitted = True
         
         if search_submitted:
-            logger.info("✓ Search completed successfully")
-            # Wait for results to load
-            await asyncio.sleep(2)
+            logger.info("✓ Search submitted - waiting for results to load...")
+            # Use intelligent waiting to verify search results actually loaded
+            await wait_for_search_results(driver, search_query, max_wait=10)
             return True
         
         return False
@@ -1683,26 +1718,36 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
         job_url = None
         
         # Try multiple strategies to find the job URL
-        # Strategy 1: Find all links and pick the one that looks like a job URL
-        all_links = soup.find_all('a', href=True)
-        for link in all_links:
-            href = link.get('href')
-            if not href:
-                continue
-            full_url = urljoin(base_url, href)
-            url_lower = full_url.lower()
-            
-            # Check if this looks like a job URL
-            looks_like_job_url = any(pattern in url_lower for pattern in [
-                '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
-                '/positions/', '/position/', '/postings/', '/posting/',
-                '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
-                '/recruitment/', '/apply/', '/req/'  # ADP/Workday patterns
-            ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment)/', url_lower)
-            
-            if looks_like_job_url:
-                job_url = full_url
-                break
+        # Strategy 1 (Priority): For Workday, find the jobTitle link specifically
+        workday_title_link = soup.select_one('[data-automation-id="jobTitle"]')
+        if workday_title_link and workday_title_link.name == 'a':
+            href = workday_title_link.get('href')
+            if href:
+                job_url = urljoin(base_url, href)
+                # If URL is incomplete (ends with /job/), it's still valid for Workday
+                # Don't try to complete it - validation will accept it
+        
+        # Strategy 2: Find all links and pick the one that looks like a job URL
+        if not job_url:
+            all_links = soup.find_all('a', href=True)
+            for link in all_links:
+                href = link.get('href')
+                if not href:
+                    continue
+                full_url = urljoin(base_url, href)
+                url_lower = full_url.lower()
+                
+                # Check if this looks like a job URL
+                looks_like_job_url = any(pattern in url_lower for pattern in [
+                    '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+                    '/positions/', '/position/', '/postings/', '/posting/',
+                    '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+                    '/recruitment/', '/apply/', '/req/'  # ADP/Workday patterns
+                ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment)/', url_lower)
+                
+                if looks_like_job_url:
+                    job_url = full_url
+                    break
         
         # Strategy 2: If no job-like URL found, use the first link
         if not job_url and all_links:
@@ -1714,32 +1759,43 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
         # Strategy 3: Use Selenium to find links directly from the element
         if not job_url:
             try:
-                # Find all links within this element using Selenium
-                links_in_element = element.find_elements(By.TAG_NAME, 'a')
-                for link_elem in links_in_element:
+                # For Workday, prioritize the jobTitle link
+                workday_title_link = element.find_elements(By.CSS_SELECTOR, '[data-automation-id="jobTitle"]')
+                if workday_title_link and len(workday_title_link) > 0:
                     try:
-                        href = link_elem.get_attribute('href')
+                        href = workday_title_link[0].get_attribute('href')
                         if href:
-                            full_url = urljoin(base_url, href) if not href.startswith('http') else href
-                            url_lower = full_url.lower()
-                            
-                            # Check if this looks like a job URL
-                            looks_like_job_url = any(pattern in url_lower for pattern in [
-                                '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
-                                '/positions/', '/position/', '/postings/', '/posting/',
-                                '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
-                                '/recruitment/', '/apply/', '/req/', '/mdf/'  # ADP/Workday patterns
-                            ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment|mdf)/', url_lower)
-                            
-                            if looks_like_job_url:
-                                job_url = full_url
-                                break
-                            
-                            # If no job-like URL but this is the first link, use it anyway
-                            if not job_url:
-                                job_url = full_url
+                            job_url = href if href.startswith('http') else urljoin(base_url, href)
                     except:
-                        continue
+                        pass
+                
+                # Find all links within this element using Selenium
+                if not job_url:
+                    links_in_element = element.find_elements(By.TAG_NAME, 'a')
+                    for link_elem in links_in_element:
+                        try:
+                            href = link_elem.get_attribute('href')
+                            if href:
+                                full_url = urljoin(base_url, href) if not href.startswith('http') else href
+                                url_lower = full_url.lower()
+                                
+                                # Check if this looks like a job URL
+                                looks_like_job_url = any(pattern in url_lower for pattern in [
+                                    '/job/', '/jobs/', '/careers/', '/career/', '/openings/', '/opening/',
+                                    '/positions/', '/position/', '/postings/', '/posting/',
+                                    '/vacancies/', '/vacancy/', '/opportunities/', '/opportunity/',
+                                    '/recruitment/', '/apply/', '/req/', '/mdf/'  # ADP/Workday patterns
+                                ]) or re.search(r'/(careers|jobs|job|openings|positions|recruitment|mdf)/', url_lower)
+                                
+                                if looks_like_job_url:
+                                    job_url = full_url
+                                    break
+                                
+                                # If no job-like URL but this is the first link, use it anyway
+                                if not job_url:
+                                    job_url = full_url
+                        except:
+                            continue
             except:
                 pass
         
@@ -2338,8 +2394,114 @@ async def detect_and_clear_no_results(driver) -> bool:
         return False
 
 
+async def wait_for_search_results(driver, search_query: str, max_wait: int = 10) -> bool:
+    """
+    Intelligently wait for search results to load after submitting a search query.
+    Verifies that the search actually took effect before proceeding.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        search_query: The search query that was submitted
+        max_wait: Maximum time to wait in seconds
+    
+    Returns:
+        True if search results appear to have loaded, False otherwise
+    """
+    try:
+        # Capture initial state before search
+        initial_url = driver.current_url
+        initial_page_source = driver.execute_script("return document.body.innerText;")[:500].lower()
+        
+        # Wait for page to start updating (URL change or content change)
+        print(f"Waiting for search results to load for query: '{search_query}'...")
+        start_time = time.time()
+        check_interval = 0.5
+        
+        while time.time() - start_time < max_wait:
+            await asyncio.sleep(check_interval)
+            
+            current_url = driver.current_url
+            current_page_source = driver.execute_script("return document.body.innerText;")[:500].lower()
+            
+            # Check if URL changed (some sites update URL on search)
+            if current_url != initial_url:
+                print(f"  ✓ URL changed - search may have applied")
+                await asyncio.sleep(2)  # Give page time to fully render
+                return True
+            
+            # Check if page content changed (indicates search is filtering)
+            if current_page_source != initial_page_source:
+                print(f"  ✓ Page content changed - search may have applied")
+                
+                # Additional verification: check if search query appears in visible text
+                # (Some sites show "Results for: Sales Coordinator" or similar)
+                query_lower = search_query.lower()
+                if query_lower in current_page_source:
+                    print(f"  ✓ Search query found in page content")
+                    await asyncio.sleep(2)  # Give page time to fully render
+                    return True
+                
+                # Check if job listings are visible and different
+                job_elements = driver.execute_script("""
+                    const selectors = [
+                        '[data-automation-id="jobTitle"]',
+                        '[data-ui="job"]',
+                        'a[href*="/job"]',
+                        '[class*="job-card"]',
+                        '[class*="job-item"]'
+                    ];
+                    const elements = [];
+                    for (const sel of selectors) {
+                        const found = document.querySelectorAll(sel);
+                        found.forEach(el => {
+                            if (el.offsetParent !== null) elements.push(el);
+                        });
+                    }
+                    return elements.length;
+                """)
+                
+                if job_elements > 0:
+                    print(f"  ✓ Found {job_elements} visible job elements - search results loaded")
+                    await asyncio.sleep(2)  # Give page time to fully render
+                    return True
+                
+                # Content changed but not sure if it's search results - wait a bit more
+                await asyncio.sleep(1)
+                return True
+            
+            # Check if loading indicators disappeared
+            loading_indicators = driver.execute_script("""
+                const loadingSelectors = [
+                    '[class*="loading"]',
+                    '[class*="spinner"]',
+                    '[aria-busy="true"]'
+                ];
+                for (const sel of loadingSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent !== null) return true;
+                }
+                return false;
+            """)
+            
+            if not loading_indicators and time.time() - start_time > 2:
+                # No loading indicators and waited at least 2 seconds
+                print(f"  ✓ Loading indicators cleared - assuming search completed")
+                await asyncio.sleep(1)
+                return True
+        
+        # Timeout - search may not have worked, but proceed anyway
+        print(f"  ⚠️  Timeout waiting for search results (waited {max_wait}s) - proceeding anyway")
+        await asyncio.sleep(2)  # Give it one more moment
+        return False
+        
+    except Exception as e:
+        print(f"  ⚠️  Error waiting for search results: {e}")
+        await asyncio.sleep(2)  # Fallback: just wait a bit
+        return False
+
+
 async def try_search_filter(driver, search_query: str) -> bool:
-    """Try to use search/filter inputs on the career page - OPTIMIZED"""
+    """Try to use search/filter inputs on the career page - ENHANCED with proper wait verification"""
     try:
         print(f"Looking for search filter to apply query: '{search_query}'")
         
@@ -2369,56 +2531,64 @@ async def try_search_filter(driver, search_query: str) -> bool:
         if search_input:
             print("Found search input - entering search query")
             search_input.clear()
+            await asyncio.sleep(0.3)
             search_input.send_keys(search_query)
-            await asyncio.sleep(0.5)  # Reduced from 1s
+            await asyncio.sleep(0.5)
             
             # Try to submit search
+            search_submitted = False
+            
             # Strategy 1: Press Enter
             try:
                 search_input.send_keys(Keys.RETURN)
                 print("Submitted search with Enter key")
-                await asyncio.sleep(2)  # Reduced from 3s
-                return True
+                search_submitted = True
             except Exception:
                 pass
             
             # Strategy 2: Find and click search button - OPTIMIZED
-            search_button = driver.execute_script("""
-                const selectors = [
-                'button[type="submit"]',
-                'button[aria-label*="search" i]',
-                '[class*="search"][class*="button"]',
-                '[class*="search-btn"]',
-                    'button'
-                ];
-                
-                for (const selector of selectors) {
-                    const elements = document.querySelectorAll(selector);
-                    for (const el of elements) {
-                        if (el.offsetParent !== null && !el.disabled) {
-                            const text = el.textContent.toLowerCase();
-                            if (text.includes('search') || text.includes('find')) {
-                                return el;
+            if not search_submitted:
+                search_button = driver.execute_script("""
+                    const selectors = [
+                    'button[type="submit"]',
+                    'button[aria-label*="search" i]',
+                    '[class*="search"][class*="button"]',
+                    '[class*="search-btn"]',
+                        'button'
+                    ];
+                    
+                    for (const selector of selectors) {
+                        const elements = document.querySelectorAll(selector);
+                        for (const el of elements) {
+                            if (el.offsetParent !== null && !el.disabled) {
+                                const text = el.textContent.toLowerCase();
+                                if (text.includes('search') || text.includes('find')) {
+                                    return el;
+                                }
                             }
                         }
                     }
-                }
-                return null;
-            """)
+                    return null;
+                """)
+                
+                if search_button:
+                    try:
+                        search_button.click()
+                        print("Clicked search button")
+                        search_submitted = True
+                    except Exception:
+                        pass
             
-            if search_button:
-                try:
-                    search_button.click()
-                    print("Clicked search button")
-                    await asyncio.sleep(2)  # Reduced from 3s
-                    return True
-                except Exception:
-                    pass
-            
-            # If no explicit submit, just wait for auto-filter
-            print("Waiting for auto-filter to apply")
-            await asyncio.sleep(2)
-            return True
+            # Now wait intelligently for search results to actually load
+            if search_submitted:
+                # Wait for search results to load with verification
+                await wait_for_search_results(driver, search_query, max_wait=10)
+                return True
+            else:
+                # If no explicit submit, wait for auto-filter but with verification
+                print("Waiting for auto-filter to apply")
+                await wait_for_search_results(driver, search_query, max_wait=8)
+                return True
         else:
             print("No search filter found on page")
             return False
@@ -3130,7 +3300,70 @@ async def scrape_with_selenium(
             print("\nExtracting job listings from page 1...")
             
             # OPTIMIZED: Use JavaScript to find all job elements in ONE query
+            # ENHANCED: Better handling for Workday and other job boards
             job_elements_data = driver.execute_script("""
+                // Workday-specific: Find parent containers for jobs
+                const workdayJobTitles = document.querySelectorAll('[data-automation-id="jobTitle"]');
+                const workdayJobs = [];
+                if (workdayJobTitles.length > 0) {
+                    // For each job title link, find its parent container (usually li or div)
+                    workdayJobTitles.forEach(titleLink => {
+                        if (titleLink.offsetParent === null) return; // skip hidden
+                        
+                        // Find parent container - go up the DOM tree to find list item or container
+                        let parent = titleLink.parentElement;
+                        let container = null;
+                        let depth = 0;
+                        const maxDepth = 5;
+                        
+                        while (parent && depth < maxDepth) {
+                            const tagName = parent.tagName.toLowerCase();
+                            const className = (parent.className || '').toLowerCase();
+                            
+                            // Look for list items or containers that likely hold a single job
+                            if (tagName === 'li' || 
+                                tagName === 'article' ||
+                                (tagName === 'div' && (className.includes('item') || className.includes('card') || className.includes('job'))) ||
+                                parent.hasAttribute('data-job-id') ||
+                                parent.hasAttribute('data-posting-id')) {
+                                container = parent;
+                                break;
+                            }
+                            
+                            parent = parent.parentElement;
+                            depth++;
+                        }
+                        
+                        // Use container if found, otherwise use the link itself
+                        const jobElement = container || titleLink;
+                        if (jobElement.offsetParent !== null) {
+                            workdayJobs.push(jobElement);
+                        }
+                    });
+                }
+                
+                // If we found Workday jobs, return them (avoid duplicates)
+                if (workdayJobs.length > 0) {
+                    // Deduplicate Workday jobs
+                    const uniqueWorkdayJobs = [];
+                    const seenWorkdayTexts = new Set();
+                    
+                    workdayJobs.forEach(el => {
+                        const text = el.textContent.toLowerCase().substring(0, 100);
+                        const textKey = text.substring(0, 50).trim();
+                        
+                        if (textKey.length >= 10 && !seenWorkdayTexts.has(textKey)) {
+                            seenWorkdayTexts.add(textKey);
+                            uniqueWorkdayJobs.push(el);
+                        }
+                    });
+                    
+                    if (uniqueWorkdayJobs.length > 0) {
+                        return uniqueWorkdayJobs;
+                    }
+                }
+                
+                // Fallback to standard selectors for other job boards
                 const selectors = [
                     // Specific selectors (high priority)
                     '[data-automation-id="jobTitle"]',
@@ -3159,7 +3392,7 @@ async def scrape_with_selenium(
                 const headerPatterns = ['current openings', 'all openings', 'job openings', 
                                        'search', 'filter', 'select location', 'select job type'];
                 const jobIndicators = ['full time', 'part time', 'contract', 'remote', 
-                                      'manager', 'director', 'engineer', 'days ago'];
+                                      'manager', 'director', 'engineer', 'days ago', 'coordinator'];
                 
                 // Find elements
                 for (const selector of selectors) {
@@ -3194,9 +3427,9 @@ async def scrape_with_selenium(
                     const hasJobIndicators = jobIndicators.some(ind => text.includes(ind));
                     if (!hasJobIndicators && text.length < 30) return;
                     
-                    // Deduplicate by position
+                    // Deduplicate by position AND text (more lenient)
                     const rect = el.getBoundingClientRect();
-                    const posKey = rect.x + ',' + rect.y;
+                    const posKey = Math.round(rect.x/10) + ',' + Math.round(rect.y/10); // Round to avoid exact match issues
                     
                     if (!seenPositions.has(posKey) && !seenTexts.has(textKey)) {
                         seenPositions.add(posKey);
@@ -3210,6 +3443,21 @@ async def scrape_with_selenium(
             
             elements = job_elements_data if job_elements_data else []
             print(f"Found {len(elements)} unique job elements (after filtering)")
+            
+            # Debug: Log job titles if we found any Workday jobs
+            if len(elements) > 0:
+                try:
+                    job_titles_found = driver.execute_script("""
+                        return arguments[0].map(el => {
+                            const titleEl = el.querySelector('[data-automation-id="jobTitle"]');
+                            if (titleEl) return titleEl.textContent.trim();
+                            return el.textContent.trim().substring(0, 60);
+                        });
+                    """, elements)
+                    if job_titles_found:
+                        print(f"  Job titles found: {job_titles_found}")
+                except:
+                    pass
             
             unique_elements = elements  # Already filtered by JavaScript
             
@@ -3629,6 +3877,32 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     scraped_lower = scraped_title.lower().strip()
     query_lower = customer_query.lower().strip()
     
+    # Handle common abbreviations and variations
+    # Map abbreviations to full words in scraped title for better matching
+    abbreviation_map = {
+        'jr': 'junior',
+        'sr': 'senior',
+        'coord': 'coordinator',
+        'mgr': 'manager',
+        'asst': 'assistant',
+        'spec': 'specialist',
+        'dev': 'developer',
+        'eng': 'engineer',
+        'admin': 'administrator',
+        'exec': 'executive',
+        'dir': 'director',
+        'mktg': 'marketing',
+        'prod': 'product',
+        'tech': 'technical',
+        'anal': 'analyst'
+    }
+    
+    # Replace abbreviations in scraped title for matching
+    scraped_for_matching = scraped_lower
+    for abbrev, full in abbreviation_map.items():
+        # Replace standalone abbreviations (word boundaries)
+        scraped_for_matching = re.sub(r'\b' + re.escape(abbrev) + r'\b', full, scraped_for_matching)
+    
     # Split query into words
     query_words = query_lower.split()
     
@@ -3636,29 +3910,36 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     if not query_words:
         return False
     
-    # Strategy 1: Check if the complete phrase exists (ideal match)
-    if query_lower in scraped_lower:
+    # Strategy 1: Check if the complete phrase exists (ideal match) - use normalized version for abbreviations
+    if query_lower in scraped_for_matching or query_lower in scraped_lower:
         return True
     
     # Strategy 2: Check if all words appear in order with at most 1 word gap between consecutive query words
     # This handles cases like "customer care manager" for query "customer care"
     # but rejects "care customer" or "software development engineer" (too much separation)
     
-    # Find all positions of each query word in the scraped title
+    # Find all positions of each query word in the scraped title (use normalized version)
+    scraped_words_normalized = scraped_for_matching.split()
     scraped_words = scraped_lower.split()
     
-    # Check if all query words exist in scraped title
+    # Check if all query words exist in scraped title (check both normalized and original)
     for query_word in query_words:
-        if query_word not in scraped_lower:
+        if query_word not in scraped_for_matching and query_word not in scraped_lower:
             return False
     
-    # Find positions of each query word
+    # Find positions of each query word (check both normalized and original versions)
     word_positions = {}
     for query_word in query_words:
         positions = []
-        for idx, scraped_word in enumerate(scraped_words):
+        # Check normalized version first (handles abbreviations)
+        for idx, scraped_word in enumerate(scraped_words_normalized):
             if query_word in scraped_word:
                 positions.append(idx)
+        # Also check original version if not found
+        if not positions:
+            for idx, scraped_word in enumerate(scraped_words):
+                if query_word in scraped_word:
+                    positions.append(idx)
         word_positions[query_word] = positions
     
     # Check if there's a valid arrangement where all query words appear in order and close together
@@ -3743,34 +4024,70 @@ async def scrape_generic_career_page(
         if job_board:
             print(f"Detected job board: {job_board['name']}")
         
-        # Scrape jobs
-        jobs = await scrape_with_selenium(
-            url=url,
-            company_name=company_name,
-            max_results=max_results * 2,  # Get extra to filter
-            search_query=search_query,
-            use_undetected=use_undetected
-        )
-        
-        # Filter by search query
-        if search_query and jobs:
-            print(f"\nFiltering {len(jobs)} jobs by search query: '{search_query}'")
-            
-            # Parse multiple job titles (comma-separated)
+        # Parse multiple job titles if comma-separated
+        job_titles = []
+        if search_query:
             job_titles = [title.strip() for title in search_query.split(',') if title.strip()]
-            print(f"Parsed {len(job_titles)} job title(s) to search for:")
+            print(f"\n📋 Parsed {len(job_titles)} job title(s) from search query:")
             for idx, title in enumerate(job_titles, 1):
                 print(f"  {idx}. '{title}'")
+        
+        # BEST PRACTICE: Search each title separately and combine results
+        # This is more reliable than searching all at once (comma-separated queries may not work on all sites)
+        all_jobs = []
+        seen_job_keys = set()  # For deduplication: (title_lower, company_lower)
+        
+        if job_titles and len(job_titles) > 1:
+            print(f"\n🔍 Searching each title separately (best practice for multiple titles)...")
+            
+            for idx, title in enumerate(job_titles, 1):
+                print(f"\n{'='*60}")
+                print(f"Search {idx}/{len(job_titles)}: '{title}'")
+                print(f"{'='*60}")
+                
+                # Search for this specific title
+                title_jobs = await scrape_with_selenium(
+                    url=url,
+                    company_name=company_name,
+                    max_results=max_results * 2,  # Get extra per search
+                    search_query=title,  # Single title, not comma-separated
+                    use_undetected=use_undetected
+                )
+                
+                print(f"  Found {len(title_jobs)} jobs for '{title}'")
+                
+                # Add unique jobs to combined list (but don't filter yet - will filter after all searches)
+                for job in title_jobs:
+                    # Create deduplication key
+                    job_key = (
+                        (job.title or '').lower().strip(),
+                        (job.company or company_name or '').lower().strip()
+                    )
+                    
+                    if job_key not in seen_job_keys:
+                        seen_job_keys.add(job_key)
+                        all_jobs.append(job)
+                        print(f"    ✓ Added: {job.title}")
+                    else:
+                        print(f"    ⊘ Duplicate skipped: {job.title}")
+                
+                # Small delay between searches to avoid rate limiting
+                if idx < len(job_titles):
+                    await asyncio.sleep(1)
+            
+            # CRITICAL: Filter combined results to ensure they match at least one search query
+            # This prevents irrelevant results from being included
+            print(f"\n🔍 Filtering combined results to ensure relevance...")
+            print(f"   Checking {len(all_jobs)} jobs against {len(job_titles)} search term(s)...")
             
             filtered_jobs = []
-            
-            for job in jobs:
+            for job in all_jobs:
                 job_matched = False
                 matched_query = None
                 
-                # Try to match against each job title query
+                # Check if job matches any of the search queries
                 for query_title in job_titles:
-                    if matches_job_title(job.title, query_title):
+                    if matches_job_title(job.title or '', query_title):
                         job_matched = True
                         matched_query = query_title
                         break
@@ -3778,11 +4095,36 @@ async def scrape_generic_career_page(
                 if job_matched:
                     filtered_jobs.append(job)
                     print(f"  ✓ Matched '{matched_query}': {job.title}")
+                else:
+                    print(f"  ✗ Filtered out (doesn't match any search term): {job.title}")
             
-            print(f"Found {len(filtered_jobs)} jobs matching search criteria")
             jobs = filtered_jobs
-        elif not search_query and jobs:
-            print(f"\nNo search query provided - returning all {len(jobs)} jobs found")
+            print(f"\n✅ Final results: {len(jobs)} jobs matching search criteria (filtered from {len(all_jobs)} total)")
+            
+        elif job_titles and len(job_titles) == 1:
+            # Single title - search normally
+            print(f"\n🔍 Searching for single title: '{job_titles[0]}'")
+            jobs = await scrape_with_selenium(
+                url=url,
+                company_name=company_name,
+                max_results=max_results * 2,
+                search_query=job_titles[0],
+                use_undetected=use_undetected
+            )
+        else:
+            # No search query - get all jobs
+            print(f"\n📋 No search query - scraping all available jobs")
+            jobs = await scrape_with_selenium(
+                url=url,
+                company_name=company_name,
+                max_results=max_results,
+                search_query=None,
+                use_undetected=use_undetected
+            )
+        
+        # Note: No need for post-filtering since we already searched each title separately
+        if not search_query and jobs:
+            print(f"\n✓ Returning all {len(jobs)} jobs found (no search filter)")
         
         # Apply final validation filter to catch any remaining invalid entries
         if jobs:
