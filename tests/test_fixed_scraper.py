@@ -33,16 +33,18 @@ async def test_basic_scraping():
     print()
     
     try:
-        jobs = await scrape_indeed_selenium(
-            query="Software Engineer",
-            location="San Francisco, CA",
-            max_results=5,
-            job_type=None,
-            salary_min=None,
-            salary_max=None,
-            experience_level=None,
-            employment_type=None,
-            days_old=None
+        # Call synchronous scraper in thread pool
+        jobs = await asyncio.to_thread(
+            scrape_indeed_selenium,
+            "Software Engineer",
+            "San Francisco, CA",
+            5,  # max_results
+            None,  # job_type
+            None,  # salary_min
+            None,  # salary_max
+            None,  # experience_level
+            None,  # employment_type
+            None   # days_old
         )
         
         print(f"\n✅ SUCCESS! Found {len(jobs)} jobs")
@@ -89,12 +91,18 @@ async def test_with_filters():
     print("=" * 60)
     
     try:
-        jobs = await scrape_indeed_selenium(
-            query="Python Developer",
-            location="Remote",
-            max_results=3,
-            days_old=7,
-            experience_level="Mid-Senior"
+        # Call synchronous scraper in thread pool
+        jobs = await asyncio.to_thread(
+            scrape_indeed_selenium,
+            "Python Developer",
+            "Remote",
+            3,  # max_results
+            None,  # job_type
+            None,  # salary_min
+            None,  # salary_max
+            "Mid-Senior",  # experience_level
+            None,  # employment_type
+            7  # days_old
         )
         
         print(f"\n✅ Found {len(jobs)} jobs with filters")

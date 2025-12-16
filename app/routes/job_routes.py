@@ -147,7 +147,10 @@ async def get_jobs(
         return cached
 
     try:
-        jobs = await scrape_indeed_selenium(
+        # Call synchronous scraper in thread pool to avoid blocking event loop
+        # The scraper itself is fully synchronous and scrapes URLs one after another
+        jobs = await asyncio.to_thread(
+            scrape_indeed_selenium,
             query, location, max_results, job_type, 
             salary_min, salary_max, experience_level, employment_type, days_old
         )
@@ -168,7 +171,8 @@ async def get_jobs(
 async def indeed_self_test(q: str = Query("python developer"), l: Optional[str] = Query("remote")):
     """Quickly test Indeed scraping with small limits to verify Cloudflare workarounds."""
     try:
-        jobs = await scrape_indeed_selenium(q, l, max_results=5)
+        # Call synchronous scraper in thread pool to avoid blocking event loop
+        jobs = await asyncio.to_thread(scrape_indeed_selenium, q, l, max_results=5)
         return {
             "ok": True,
             "count": len(jobs),

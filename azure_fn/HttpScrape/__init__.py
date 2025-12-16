@@ -18,7 +18,8 @@ async def handle(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         max_results = 10
 
-    data = await scrape_indeed_selenium(query, location, max_results)
+    # Call synchronous scraper in thread pool
+    data = await asyncio.to_thread(scrape_indeed_selenium, query, location, max_results)
     payload = [d.model_dump() if hasattr(d, "model_dump") else d.__dict__ for d in data]
     return func.HttpResponse(json.dumps(payload), mimetype="application/json", status_code=200)
 

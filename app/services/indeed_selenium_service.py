@@ -1,6 +1,6 @@
 import time
-import asyncio
 import random
+import threading
 import re
 from typing import Optional, List
 import undetected_chromedriver as uc
@@ -30,7 +30,7 @@ from requests.adapters import HTTPAdapter
 import requests
 
 _last_fetch = 0
-_request_lock = asyncio.Lock()
+_request_lock = threading.Lock()
 _driver = None
 _driver_created_at = 0  # Track when driver was created for rotation
 _driver_last_used = 0  # Track when driver was last used for idle timeout
@@ -1193,7 +1193,7 @@ def get_driver(force_new: bool = False):
     return _driver
 
 
-async def scrape_indeed_selenium(
+def scrape_indeed_selenium(
     query: str, 
     location: Optional[str] = None, 
     max_results: int = 20, 
@@ -1206,6 +1206,9 @@ async def scrape_indeed_selenium(
 ) -> List[Job]:
     """
     Enhanced Indeed scraper using Selenium with comprehensive data extraction and advanced filtering.
+    
+    NOTE: This function is now fully synchronous to ensure sequential scraping and proper resource cleanup.
+    URLs are scraped one after another, and all resources are cleared at the end of each scraping operation.
     
     Args:
         query: Job search query (e.g., "python developer")
@@ -1221,24 +1224,20 @@ async def scrape_indeed_selenium(
     Returns:
         List of Job objects with detailed information
     """
-    # CRITICAL: Acquire throttle to prevent resource exhaustion from concurrent requests
-    from app.core.throttle import get_scraping_throttle
+    global _last_fetch
     
-    async with get_scraping_throttle():
-        global _last_fetch
-        
-        # Rate limiting
-        async with _request_lock:
-            now = time.monotonic()
-            jitter = random.uniform(0, 0.75)
-            wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            _last_fetch = time.monotonic()
-        
-        # Run the scraping in a thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _scrape_sync_enhanced, query, location, max_results, job_type, salary_min, salary_max, experience_level, employment_type, days_old)
+    # Rate limiting (synchronous with thread lock)
+    with _request_lock:
+        now = time.monotonic()
+        jitter = random.uniform(0, 0.75)
+        wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
+        if wait > 0:
+            time.sleep(wait)
+        _last_fetch = time.monotonic()
+    
+    # Call the synchronous scraping function directly
+    # This ensures sequential execution and proper resource cleanup
+    return _scrape_sync_enhanced(query, location, max_results, job_type, salary_min, salary_max, experience_level, employment_type, days_old)
 
 
 def _scrape_sync_enhanced(
@@ -1253,7 +1252,7 @@ def _scrape_sync_enhanced(
     days_old: Optional[int] = None
 ) -> List[Job]:
     """Enhanced synchronous scraping function with comprehensive data extraction and advanced filtering."""
-    global _driver  # Declare global at the top of the function
+    global _driver, _driver_last_used, _driver_created_at  # Declare all globals at the top of the function
     driver = None  # Initialize driver to None for cleanup
     
     # Check for too many Chrome processes before starting
@@ -1268,7 +1267,10 @@ def _scrape_sync_enhanced(
     
     try:
         print(f"🔍 [SCRAPE] Starting scrape: query='{query}', location='{location}', max_results={max_results}")
-        driver = get_driver()
+        # CRITICAL: Always force a new driver for each scrape to prevent resource leaks
+        # This ensures each URL is scraped with a fresh browser instance
+        print("🔄 [SCRAPE] Forcing new driver instance for this scrape...")
+        driver = get_driver(force_new=True)
         print("✓ [SCRAPE] Driver obtained successfully")
         
         # Verify driver is still alive before starting
@@ -1886,19 +1888,21 @@ def _scrape_sync_enhanced(
     finally:
         # CRITICAL: ALWAYS cleanup driver after every scrape to prevent pool exhaustion
         # This is MANDATORY regardless of settings to prevent Railway deployment crashes
-        global _driver_last_used
+        # Each URL must be scraped one after another with complete resource cleanup
+        # Note: globals already declared at function top, no need to redeclare here
         
-        print("🧹 [SCRAPE] MANDATORY cleanup: Closing browser after scrape operation")
+        print("🧹 [SCRAPE] MANDATORY cleanup: Closing browser and clearing ALL resources after scrape operation")
         
+        # Step 1: Clean up the driver instance used in this scrape
         if driver:
-            # Step 1: Try graceful quit first
+            # Step 1a: Try graceful quit first
             try:
                 driver.quit()
                 print("   ✓ Driver quit successfully")
             except Exception as cleanup_error:
                 print(f"   ⚠️  Error during driver.quit(): {cleanup_error}")
             
-            # Step 2: Force kill any remaining processes (even if quit succeeded)
+            # Step 1b: Force kill any remaining processes (even if quit succeeded)
             try:
                 if hasattr(driver, 'service') and driver.service:
                     if hasattr(driver.service, 'process') and driver.service.process:
@@ -1911,37 +1915,71 @@ def _scrape_sync_enhanced(
                             except:
                                 print("   ⚠️  Terminate failed, force killing...")
                                 driver.service.process.kill()
-                                print("   ✓ ChromeDriver process killed")
+                                try:
+                                    driver.service.process.wait(timeout=2)
+                                    print("   ✓ ChromeDriver process killed")
+                                except:
+                                    print("   ⚠️  Process may still be running")
             except Exception as kill_error:
                 print(f"   ⚠️  Error terminating driver process: {kill_error}")
-            
-            # Step 3: ALWAYS reset global driver (critical!)
-            try:
-                _driver = None
-                print("   ✓ Global driver reset")
-            except Exception as reset_error:
-                print(f"   ⚠️  Error resetting global driver: {reset_error}")
-            
-            # Step 4: Run aggressive zombie cleanup to catch any orphaned processes
-            try:
-                killed = cleanup_zombie_processes(aggressive=True)
-                if killed > 0:
-                    print(f"   ✓ Cleaned up {killed} orphaned Chrome process(es)")
-                else:
-                    print("   ✓ No orphaned processes found")
-            except Exception as zombie_error:
-                print(f"   ⚠️  Error during zombie cleanup: {zombie_error}")
-            
-            # Step 5: Give system time to release all resources
-            try:
-                time.sleep(1.0)
-                print("   ✓ Resource release delay complete")
-            except:
-                pass
-            
-            print("✓ [SCRAPE] Browser cleanup complete - all Chrome resources freed")
-        else:
-            print("⚠️  [SCRAPE] No driver to cleanup (already None)")
+        
+        # Step 2: ALWAYS reset global driver (critical for preventing resource leaks!)
+        try:
+            if _driver is not None:
+                # If global driver is different from local driver, clean it up too
+                if _driver != driver:
+                    try:
+                        _driver.quit()
+                    except:
+                        pass
+                    try:
+                        if hasattr(_driver, 'service') and _driver.service:
+                            if hasattr(_driver.service, 'process') and _driver.service.process:
+                                if _driver.service.process.poll() is None:
+                                    _driver.service.process.kill()
+                    except:
+                        pass
+            _driver = None
+            _driver_created_at = 0
+            _driver_last_used = 0
+            print("   ✓ Global driver reset and cleared")
+        except Exception as reset_error:
+            print(f"   ⚠️  Error resetting global driver: {reset_error}")
+        
+        # Step 3: Run aggressive zombie cleanup to catch any orphaned processes
+        try:
+            killed = cleanup_zombie_processes(aggressive=True)
+            if killed > 0:
+                print(f"   ✓ Cleaned up {killed} orphaned Chrome process(es)")
+            else:
+                print("   ✓ No orphaned processes found")
+        except Exception as zombie_error:
+            print(f"   ⚠️  Error during zombie cleanup: {zombie_error}")
+        
+        # Step 4: Give system time to release all resources (critical for preventing resource exhaustion)
+        try:
+            time.sleep(2.0)  # Increased wait time to ensure resources are fully released
+            print("   ✓ Resource release delay complete")
+        except:
+            pass
+        
+        # Step 5: Verify cleanup by checking process count
+        try:
+            process_count = check_chrome_process_count()
+            if process_count > 0:
+                print(f"   ⚠️  WARNING: {process_count} Chrome processes still running after cleanup")
+                if process_count > 5:
+                    print(f"   Running additional aggressive cleanup...")
+                    cleanup_zombie_processes(aggressive=True)
+                    time.sleep(1.0)
+                    final_count = check_chrome_process_count()
+                    print(f"   Final process count: {final_count}")
+            else:
+                print("   ✓ All Chrome processes cleaned up successfully")
+        except Exception as verify_error:
+            print(f"   ⚠️  Error verifying cleanup: {verify_error}")
+        
+        print("✓ [SCRAPE] Complete resource cleanup finished - ready for next scrape")
     
     # Mark proxy as successful if scraping completed
     try:
