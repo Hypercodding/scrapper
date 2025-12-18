@@ -18,7 +18,6 @@ from app.services.indeed_selenium_service import (
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
 from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
-from app.core.caching import get_cache, set_cache # pylint: disable=import-error
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -87,7 +86,7 @@ async def get_jobs(
     experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
     employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
     days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
-    max_results: int = Query(20, description="Maximum number of results (default: 20)")
+    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
 ):
     """
     Get jobs from Indeed using enhanced browser automation (Selenium)
@@ -141,11 +140,6 @@ async def get_jobs(
     - 7 - Jobs posted in last 7 days
     - 1 - Jobs posted today
     """
-    cache_key = f"indeed_selenium_enhanced:{query}:{location}:{job_type}:{salary_min}:{salary_max}:{experience_level}:{employment_type}:{days_old}:{max_results}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         # Call synchronous scraper in thread pool to avoid blocking event loop
         # The scraper itself is fully synchronous and scrapes URLs one after another
@@ -163,7 +157,6 @@ async def get_jobs(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -201,17 +194,11 @@ async def get_ziprecruiter_jobs(
     
     This may work better than Indeed as ZipRecruiter has less aggressive anti-scraping measures.
     """
-    cache_key = f"ziprecruiter:{query}:{location}:{max_results}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         jobs = await scrape_ziprecruiter(query, location, max_results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -250,17 +237,11 @@ async def get_ziprecruiter_enhanced_jobs(
     - Industry and company size
     - Job ID for tracking
     """
-    cache_key = f"ziprecruiter_enhanced:{query}:{location}:{job_type}:{max_results}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         jobs = await scrape_ziprecruiter_enhanced(query, location, max_results, job_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -298,17 +279,11 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
     Returns:
     - List of Job objects with actual job titles, company, location, description, etc.
     """
-    cache_key = f"generic_career:{request.url}:{request.max_results}:{request.search_query}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping {request.url}: {str(e)}")
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -341,17 +316,11 @@ async def scrape_career_page_url_get(
     Returns:
     - List of Job objects with actual job titles, company, location, description, etc.
     """
-    cache_key = f"generic_career:{url}:{max_results}:{search_query}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         jobs = await scrape_generic_career_page(url, max_results, search_query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping {url}: {str(e)}")
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -387,13 +356,6 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
     - Combined and deduplicated list of Job objects from all URLs
     - Jobs are deduplicated based on title + company
     """
-    # Create cache key from sorted URLs
-    urls_key = ":".join(sorted(request.urls))
-    cache_key = f"generic_career_multi:{urls_key}:{request.max_results_per_url}:{request.search_query}:{request.total_max_results}"
-    cached = await get_cache(cache_key)
-    if cached:
-        return cached
-
     try:
         jobs = await scrape_multiple_career_pages(
             urls=request.urls,
@@ -404,7 +366,6 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping multiple URLs: {str(e)}")
 
-    await set_cache(cache_key, jobs, settings.CACHE_TTL)
     return jobs
 
 
@@ -599,23 +560,8 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
             _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
     
     try:
-        # Check cache first
-        cache_key = f"generic_career:{url}:{max_results}:{search_query}"
-        cached = await get_cache(cache_key)
-        if cached:
-            async with _get_job_lock():
-                if job_id in _job_storage:
-                    _job_storage[job_id]["status"] = JobStatus.COMPLETED
-                    _job_storage[job_id]["result"] = cached
-                    _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
-                    _job_storage[job_id]["progress"] = {"source": "cache", "jobs_found": len(cached)}
-            return
-        
         # Perform scraping
         jobs = await scrape_generic_career_page(url, max_results, search_query)
-        
-        # Cache results
-        await set_cache(cache_key, jobs, settings.CACHE_TTL)
         
         # Update job status
         async with _get_job_lock():
@@ -676,29 +622,6 @@ async def scrape_career_page_url_async_get(
     
     # Generate unique job ID
     job_id = str(uuid.uuid4())
-    
-    # Check cache first
-    cache_key = f"generic_career:{request.url}:{request.max_results}:{request.search_query}"
-    cached = await get_cache(cache_key)
-    if cached:
-        # Cache hit - return immediately
-        async with _get_job_lock():
-            _job_storage[job_id] = {
-                "job_id": job_id,
-                "status": JobStatus.COMPLETED,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
-                "result": cached,
-                "progress": {"source": "cache", "jobs_found": len(cached)}
-            }
-        
-        return ScrapeJobResponse(
-            job_id=job_id,
-            status=JobStatus.COMPLETED,
-            message="Results found in cache",
-            status_url=f"/api/jobs/scrape-status/{job_id}",
-            estimated_time="immediate"
-        )
     
     # Create job record
     async with _get_job_lock():
@@ -770,29 +693,6 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
     """
     # Generate unique job ID
     job_id = str(uuid.uuid4())
-    
-    # Check cache first
-    cache_key = f"generic_career:{request.url}:{request.max_results}:{request.search_query}"
-    cached = await get_cache(cache_key)
-    if cached:
-        # Cache hit - return immediately
-        async with _get_job_lock():
-            _job_storage[job_id] = {
-                "job_id": job_id,
-                "status": JobStatus.COMPLETED,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
-                "result": cached,
-                "progress": {"source": "cache", "jobs_found": len(cached)}
-            }
-        
-        return ScrapeJobResponse(
-            job_id=job_id,
-            status=JobStatus.COMPLETED,
-            message="Results found in cache",
-            status_url=f"/api/jobs/scrape-status/{job_id}",
-            estimated_time="immediate"
-        )
     
     # Create job record
     async with _get_job_lock():
@@ -900,3 +800,5 @@ async def delete_scrape_job(job_id: str):
         del _job_storage[job_id]
     
     return {"message": f"Job {job_id} deleted successfully", "status": "success"}
+
+
