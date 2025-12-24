@@ -1,22 +1,25 @@
 
 from fastapi import APIRouter, Query, HTTPException, Body
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from datetime import datetime
 from enum import Enum
 import asyncio
 import uuid
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
+from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status # pylint: disable=import-error
+from app.core.browser_executor import hard_kill_all_browsers, verify_cleanup # pylint: disable=import-error
 from app.services.indeed_selenium_service import (
     scrape_indeed_selenium, 
     CloudflareBlockedError,
-    force_cleanup_all,
-    check_chrome_process_count,
-    cleanup_zombie_processes,
-    cleanup_global_driver
+    check_chrome_process_count
 ) # pylint: disable=import-error
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
+from app.services.simplyhired_selenium_service import (
+    scrape_simplyhired_selenium,
+    CloudflareBlockedError as SimplyHiredCloudflareBlockedError
+) # pylint: disable=import-error
 from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
 from pydantic import BaseModel
 
@@ -74,6 +77,24 @@ class ScrapeJobStatusResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = None
     result: Optional[List[Job]] = None
     error: Optional[str] = None
+
+
+async def _execute_sync_scrape(
+    scrape_func: Callable,
+    *args,
+    **kwargs
+):
+    """
+    Execute a synchronous scraping function with single-concurrency enforcement.
+    
+    This wrapper ensures:
+    1. Only one scrape runs at a time (global lock)
+    2. Cleanup happens even for sync functions
+    3. Proper error handling
+    """
+    async with scrape_execution_context():
+        # Execute sync function in thread pool
+        return await asyncio.to_thread(scrape_func, *args, **kwargs)
 
 
 @router.get("/jobs", response_model=List[Job])
@@ -141,12 +162,21 @@ async def get_jobs(
     - 1 - Jobs posted today
     """
     try:
-        # Call synchronous scraper in thread pool to avoid blocking event loop
-        # The scraper itself is fully synchronous and scrapes URLs one after another
-        jobs = await asyncio.to_thread(
+        # Execute with single-concurrency enforcement and guaranteed cleanup
+        jobs = await _execute_sync_scrape(
             scrape_indeed_selenium,
             query, location, max_results, job_type, 
             salary_min, salary_max, experience_level, employment_type, days_old
+        )
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
         )
     except CloudflareBlockedError as e:
         # Indeed is blocked - return clear error with solution
@@ -164,12 +194,24 @@ async def get_jobs(
 async def indeed_self_test(q: str = Query("python developer"), l: Optional[str] = Query("remote")):
     """Quickly test Indeed scraping with small limits to verify Cloudflare workarounds."""
     try:
-        # Call synchronous scraper in thread pool to avoid blocking event loop
-        jobs = await asyncio.to_thread(scrape_indeed_selenium, q, l, max_results=5)
+        jobs = await _execute_sync_scrape(scrape_indeed_selenium, q, l, max_results=5)
         return {
             "ok": True,
             "count": len(jobs),
             "note": "If count is 0 repeatedly, Cloudflare may still be blocking.",
+        }
+    except ScrapeInProgressError as e:
+        return {
+            "ok": False,
+            "busy": True,
+            "detail": str(e),
+            "hint": "Another scrape is in progress. Please wait and try again.",
+        }
+    except ScrapeTimeoutError as e:
+        return {
+            "ok": False,
+            "timeout": True,
+            "detail": str(e),
         }
     except CloudflareBlockedError as e:
         return {
@@ -195,7 +237,18 @@ async def get_ziprecruiter_jobs(
     This may work better than Indeed as ZipRecruiter has less aggressive anti-scraping measures.
     """
     try:
-        jobs = await scrape_ziprecruiter(query, location, max_results)
+        async with scrape_execution_context():
+            jobs = await scrape_ziprecruiter(query, location, max_results)
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -238,7 +291,109 @@ async def get_ziprecruiter_enhanced_jobs(
     - Job ID for tracking
     """
     try:
-        jobs = await scrape_ziprecruiter_enhanced(query, location, max_results, job_type)
+        async with scrape_execution_context():
+            jobs = await scrape_ziprecruiter_enhanced(query, location, max_results, job_type)
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return jobs
+
+
+@router.get("/jobs/simplyhired", response_model=List[Job])
+async def get_simplyhired_jobs(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location (flexible format). Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California'"),
+    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
+    salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
+    salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
+    experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
+    employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
+    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+):
+    """
+    Get jobs from SimplyHired using enhanced browser automation (Selenium)
+    
+    ⭐ ENHANCED VERSION: Comprehensive data extraction and advanced filtering!
+    
+    Features:
+    - Extracts salary ranges, company URLs, job descriptions
+    - Job types, experience levels, benefits, requirements, skills
+    - Dynamic location filtering (flexible format)
+    - Salary range filtering
+    - Experience level filtering
+    - Employment type filtering
+    - Date filtering
+    - Pagination support for more results
+    
+    Location Filter (Dynamic):
+    - Accepts any location format that SimplyHired supports
+    - Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'
+    - 'San Francisco, CA', 'London, UK', 'Toronto, ON', etc.
+    - Any valid location string will be URL-encoded and passed to SimplyHired
+    
+    Job Type Filter:
+    - 'remote' - Remote jobs only
+    - 'hybrid' - Hybrid jobs only  
+    - 'onsite' or 'on-site' - On-site jobs only
+    
+    Salary Filters:
+    - salary_min: Minimum salary (e.g., 50000)
+    - salary_max: Maximum salary (e.g., 100000)
+    
+    Experience Level Filter:
+    - 'intern' / 'internship' - Internship jobs
+    - 'assistant' - Assistant-level jobs
+    - 'entry' / 'junior' - Entry-level jobs
+    - 'mid' / 'mid-senior' - Mid-level jobs
+    - 'senior' - Senior-level jobs
+    - 'director' / 'manager' - Director/Manager-level jobs
+    - 'executive' - Executive-level jobs
+    
+    Employment Type Filter:
+    - 'full-time' - Full-time jobs
+    - 'part-time' - Part-time jobs
+    - 'contract' - Contract jobs
+    - 'internship' - Internship jobs
+    
+    Date Filter:
+    - days_old: Filter jobs posted within last N days
+    - 30 - Jobs posted in last 30 days
+    - 7 - Jobs posted in last 7 days
+    - 1 - Jobs posted today
+    """
+    try:
+        jobs = await _execute_sync_scrape(
+            scrape_simplyhired_selenium,
+            query, location, max_results, job_type,
+            salary_min, salary_max, experience_level, employment_type, days_old
+        )
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
+    except SimplyHiredCloudflareBlockedError as e:
+        # SimplyHired is blocked - return clear error with solution
+        raise HTTPException(
+            status_code=503,
+            detail=f"SimplyHired blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Wait and retry 3) Use alternative endpoints"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -280,7 +435,18 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
     - List of Job objects with actual job titles, company, location, description, etc.
     """
     try:
-        jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
+        async with scrape_execution_context():
+            jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping {request.url}: {str(e)}")
 
@@ -317,7 +483,18 @@ async def scrape_career_page_url_get(
     - List of Job objects with actual job titles, company, location, description, etc.
     """
     try:
-        jobs = await scrape_generic_career_page(url, max_results, search_query)
+        async with scrape_execution_context():
+            jobs = await scrape_generic_career_page(url, max_results, search_query)
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping {url}: {str(e)}")
 
@@ -357,11 +534,22 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
     - Jobs are deduplicated based on title + company
     """
     try:
-        jobs = await scrape_multiple_career_pages(
-            urls=request.urls,
-            max_results_per_url=request.max_results_per_url,
-            search_query=request.search_query,
-            total_max_results=request.total_max_results
+        async with scrape_execution_context():
+            jobs = await scrape_multiple_career_pages(
+                urls=request.urls,
+                max_results_per_url=request.max_results_per_url,
+                search_query=request.search_query,
+                total_max_results=request.total_max_results
+            )
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error scraping multiple URLs: {str(e)}")
@@ -427,33 +615,28 @@ async def emergency_cleanup():
     - After deployment to ensure clean state
     
     This endpoint will:
-    1. Close all active browser instances
-    2. Kill all zombie Chrome/ChromeDriver processes
-    3. Reset connection pools
-    4. Free all system resources
+    1. Hard-kill all Chrome/ChromeDriver processes (OS-level)
+    2. Verify cleanup
+    3. Free all system resources
     
     Returns:
-    - processes_before: Chrome process count before cleanup
-    - processes_after: Chrome process count after cleanup
-    - processes_killed: Number of processes cleaned up
+    - processes_killed: Number of processes killed
+    - cleanup_verified: Whether cleanup was successful
     - status: Success or error information
     """
     try:
-        # Get initial process count
-        processes_before = check_chrome_process_count()
-        
-        # Perform force cleanup
+        # Perform hard-kill cleanup
         print("🚨 EMERGENCY CLEANUP requested via API endpoint")
-        processes_after = force_cleanup_all()
+        processes_killed = hard_kill_all_browsers()
         
-        processes_killed = processes_before - processes_after
+        # Verify cleanup
+        cleanup_verified = verify_cleanup()
         
         return {
             "status": "success",
             "message": "Emergency cleanup completed successfully",
-            "processes_before": processes_before,
-            "processes_after": processes_after,
             "processes_killed": processes_killed,
+            "cleanup_verified": cleanup_verified,
             "recommendation": "All Chrome resources freed. System is ready for new scraping operations."
         }
     except Exception as e:
@@ -466,43 +649,57 @@ async def emergency_cleanup():
 @router.post("/health/cleanup-soft", response_model=Dict[str, Any])
 async def soft_cleanup():
     """
-    Soft cleanup endpoint - less aggressive than emergency cleanup
+    Soft cleanup endpoint - uses hard-kill for reliability
+    
+    Note: This endpoint now uses hard-kill to ensure complete cleanup
+    on Railway's constrained environment. The "soft" designation is kept
+    for API compatibility.
     
     This endpoint:
-    1. Closes the global driver instance if it exists
-    2. Cleans up zombie processes (non-aggressive)
-    3. Preserves resources where possible
-    
-    Use this for:
-    - Routine maintenance
-    - After a series of scraping operations
-    - When you want to free resources without force-killing
+    1. Hard-kills all Chrome/ChromeDriver processes
+    2. Verifies cleanup
     
     Returns cleanup statistics
     """
     try:
-        processes_before = check_chrome_process_count()
-        
-        # Close global driver
-        cleanup_global_driver()
-        
-        # Non-aggressive zombie cleanup
-        killed = cleanup_zombie_processes(aggressive=False)
-        
-        processes_after = check_chrome_process_count()
+        # Use hard-kill for reliability (especially important on Railway)
+        processes_killed = hard_kill_all_browsers()
+        cleanup_verified = verify_cleanup()
         
         return {
             "status": "success",
-            "message": "Soft cleanup completed successfully",
-            "processes_before": processes_before,
-            "processes_after": processes_after,
-            "zombies_killed": killed,
-            "recommendation": "Resources cleaned up gracefully."
+            "message": "Cleanup completed successfully",
+            "processes_killed": processes_killed,
+            "cleanup_verified": cleanup_verified,
+            "recommendation": "All Chrome resources freed."
         }
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Soft cleanup failed: {str(e)}"
+            detail=f"Cleanup failed: {str(e)}"
+        )
+
+
+@router.get("/health/execution-status", response_model=Dict[str, Any])
+async def get_execution_status_endpoint():
+    """
+    Get current scraping execution status.
+    
+    Returns:
+    - scrape_in_progress: Whether a scrape is currently running
+    - elapsed_seconds: How long the current scrape has been running (if any)
+    - timeout_seconds: Maximum timeout for scraping operations
+    """
+    try:
+        status = get_execution_status()
+        return {
+            **status,
+            "message": "Scrape in progress" if status["scrape_in_progress"] else "No scrape in progress"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get execution status: {str(e)}"
         )
 
 
@@ -560,8 +757,9 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
             _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
     
     try:
-        # Perform scraping
-        jobs = await scrape_generic_career_page(url, max_results, search_query)
+        # Perform scraping with single-concurrency enforcement
+        async with scrape_execution_context():
+            jobs = await scrape_generic_career_page(url, max_results, search_query)
         
         # Update job status
         async with _get_job_lock():

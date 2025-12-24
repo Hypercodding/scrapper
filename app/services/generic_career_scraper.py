@@ -36,6 +36,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from app.models.job_model import Job
 from app.core.config import settings
+from app.core.browser_executor import cleanup_browser, hard_kill_all_browsers
 
 # Setup logging (configure only if not already configured)
 if not logging.getLogger().handlers:
@@ -3944,40 +3945,16 @@ async def scrape_with_selenium(
         print("🧹 [GENERIC SCRAPER] MANDATORY cleanup: Closing browser after scrape operation")
         
         if driver:
-            # Step 1: Try graceful quit first
-            try:
-                driver.quit()
-                print("   ✓ Driver quit successfully")
-            except Exception as e:
-                print(f"   ⚠️  Error closing driver: {e}")
-            
-            # Step 2: Force kill any remaining processes (even if quit succeeded)
-            try:
-                if hasattr(driver, 'service') and driver.service:
-                    if hasattr(driver.service, 'process') and driver.service.process:
-                        if driver.service.process.poll() is None:
-                            print("   ⚠️  ChromeDriver process still alive, force terminating...")
-                            driver.service.process.terminate()
-                            try:
-                                driver.service.process.wait(timeout=5)
-                                print("   ✓ ChromeDriver process terminated")
-                            except:
-                                print("   ⚠️  Terminate failed, force killing...")
-                                driver.service.process.kill()
-                                print("   ✓ ChromeDriver process killed")
-            except Exception as kill_error:
-                print(f"   ⚠️  Error terminating driver process: {kill_error}")
-            
-            # Step 3: Give system time to release all resources
-            try:
-                time.sleep(1.0)
-                print("   ✓ Resource release delay complete")
-            except:
-                pass
-            
+            # Use centralized browser cleanup with hard process termination
+            cleanup_browser(driver)
             print("✓ [GENERIC SCRAPER] Browser cleanup complete - all Chrome resources freed")
         else:
             print("⚠️  [GENERIC SCRAPER] No driver to cleanup (already None)")
+        
+        # Final hard-kill of all browser processes (safety net)
+        killed = hard_kill_all_browsers()
+        if killed > 0:
+            print(f"   ✓ Hard-killed {killed} additional browser process(es)")
     
     return jobs
 
@@ -4201,8 +4178,18 @@ async def scrape_generic_career_page(
                     else:
                         print(f"    ⊘ Duplicate skipped: {job.title}")
                 
-                # Small delay between searches to avoid rate limiting
+                # CRITICAL: Explicit cleanup after each search query to prevent resource accumulation
+                # scrape_with_selenium should already cleanup in its finally block, but this ensures
+                # any remaining processes are killed before the next search
                 if idx < len(job_titles):
+                    print(f"  🧹 Cleaning up resources after search {idx}/{len(job_titles)}...")
+                    killed = hard_kill_all_browsers()
+                    if killed > 0:
+                        print(f"     ✓ Hard-killed {killed} browser process(es)")
+                    await asyncio.sleep(1.0)  # Allow system to release resources
+                    
+                    # Small delay between searches to avoid rate limiting
+                    print(f"  Waiting 1 second before next search...")
                     await asyncio.sleep(1)
             
             # CRITICAL: Filter combined results to ensure they match at least one search query
@@ -4342,6 +4329,15 @@ async def scrape_multiple_career_pages(
             
             print(f"📊 Progress: {len(all_jobs)} total jobs collected so far")
             
+            # CRITICAL: Explicit cleanup after each URL to prevent resource accumulation
+            # This ensures resources return to baseline after each URL, preventing 
+            # resource exhaustion when processing multiple URLs in one API call
+            print(f"\n🧹 Cleaning up resources after URL {index}/{len(urls)}...")
+            killed = hard_kill_all_browsers()
+            if killed > 0:
+                print(f"   ✓ Hard-killed {killed} browser process(es) after URL {index}")
+            await asyncio.sleep(1.0)  # Allow system to release resources
+            
             # Add a small delay between URLs to be respectful
             if index < len(urls):
                 print(f"\nWaiting 3 seconds before next URL...")
@@ -4351,6 +4347,18 @@ async def scrape_multiple_career_pages(
             failed_scrapes += 1
             print(f"\n❌ URL {index} failed: {e}")
             print(f"   URL: {url}")
+            
+            # CRITICAL: Cleanup resources even if this URL failed
+            # This prevents resource leaks when errors occur mid-request
+            print(f"   🧹 Cleaning up resources after failed URL {index}...")
+            try:
+                killed = hard_kill_all_browsers()
+                if killed > 0:
+                    print(f"     ✓ Hard-killed {killed} browser process(es) after failure")
+                await asyncio.sleep(1.0)
+            except Exception as cleanup_error:
+                print(f"     ⚠️  Cleanup error (non-critical): {cleanup_error}")
+            
             # Continue to next URL even if this one fails
             continue
     

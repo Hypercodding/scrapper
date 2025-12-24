@@ -24,6 +24,7 @@ from selenium.webdriver import ActionChains
 from app.models.job_model import Job
 from app.core.config import settings
 from app.core.proxy_manager import get_proxy_manager, reset_proxy_manager
+from app.core.browser_executor import cleanup_browser, hard_kill_all_browsers
 import urllib3
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -1893,91 +1894,23 @@ def _scrape_sync_enhanced(
         
         print("🧹 [SCRAPE] MANDATORY cleanup: Closing browser and clearing ALL resources after scrape operation")
         
-        # Step 1: Clean up the driver instance used in this scrape
+        # Use centralized browser cleanup with hard process termination
         if driver:
-            # Step 1a: Try graceful quit first
-            try:
-                driver.quit()
-                print("   ✓ Driver quit successfully")
-            except Exception as cleanup_error:
-                print(f"   ⚠️  Error during driver.quit(): {cleanup_error}")
-            
-            # Step 1b: Force kill any remaining processes (even if quit succeeded)
-            try:
-                if hasattr(driver, 'service') and driver.service:
-                    if hasattr(driver.service, 'process') and driver.service.process:
-                        if driver.service.process.poll() is None:
-                            print("   ⚠️  ChromeDriver process still alive, force terminating...")
-                            driver.service.process.terminate()
-                            try:
-                                driver.service.process.wait(timeout=5)
-                                print("   ✓ ChromeDriver process terminated")
-                            except:
-                                print("   ⚠️  Terminate failed, force killing...")
-                                driver.service.process.kill()
-                                try:
-                                    driver.service.process.wait(timeout=2)
-                                    print("   ✓ ChromeDriver process killed")
-                                except:
-                                    print("   ⚠️  Process may still be running")
-            except Exception as kill_error:
-                print(f"   ⚠️  Error terminating driver process: {kill_error}")
+            cleanup_browser(driver)
         
-        # Step 2: ALWAYS reset global driver (critical for preventing resource leaks!)
-        try:
-            if _driver is not None:
-                # If global driver is different from local driver, clean it up too
-                if _driver != driver:
-                    try:
-                        _driver.quit()
-                    except:
-                        pass
-                    try:
-                        if hasattr(_driver, 'service') and _driver.service:
-                            if hasattr(_driver.service, 'process') and _driver.service.process:
-                                if _driver.service.process.poll() is None:
-                                    _driver.service.process.kill()
-                    except:
-                        pass
-            _driver = None
-            _driver_created_at = 0
-            _driver_last_used = 0
-            print("   ✓ Global driver reset and cleared")
-        except Exception as reset_error:
-            print(f"   ⚠️  Error resetting global driver: {reset_error}")
+        # Cleanup global driver if different
+        if _driver is not None and _driver != driver:
+            cleanup_browser(_driver)
         
-        # Step 3: Run aggressive zombie cleanup to catch any orphaned processes
-        try:
-            killed = cleanup_zombie_processes(aggressive=True)
-            if killed > 0:
-                print(f"   ✓ Cleaned up {killed} orphaned Chrome process(es)")
-            else:
-                print("   ✓ No orphaned processes found")
-        except Exception as zombie_error:
-            print(f"   ⚠️  Error during zombie cleanup: {zombie_error}")
+        # Reset global driver state
+        _driver = None
+        _driver_created_at = 0
+        _driver_last_used = 0
         
-        # Step 4: Give system time to release all resources (critical for preventing resource exhaustion)
-        try:
-            time.sleep(2.0)  # Increased wait time to ensure resources are fully released
-            print("   ✓ Resource release delay complete")
-        except:
-            pass
-        
-        # Step 5: Verify cleanup by checking process count
-        try:
-            process_count = check_chrome_process_count()
-            if process_count > 0:
-                print(f"   ⚠️  WARNING: {process_count} Chrome processes still running after cleanup")
-                if process_count > 5:
-                    print(f"   Running additional aggressive cleanup...")
-                    cleanup_zombie_processes(aggressive=True)
-                    time.sleep(1.0)
-                    final_count = check_chrome_process_count()
-                    print(f"   Final process count: {final_count}")
-            else:
-                print("   ✓ All Chrome processes cleaned up successfully")
-        except Exception as verify_error:
-            print(f"   ⚠️  Error verifying cleanup: {verify_error}")
+        # Final hard-kill of all browser processes (safety net)
+        killed = hard_kill_all_browsers()
+        if killed > 0:
+            print(f"   ✓ Hard-killed {killed} additional browser process(es)")
         
         print("✓ [SCRAPE] Complete resource cleanup finished - ready for next scrape")
     
