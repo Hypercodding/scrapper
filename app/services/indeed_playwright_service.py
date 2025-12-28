@@ -667,11 +667,39 @@ def _find_job_cards_indeed(soup: BeautifulSoup) -> List:
     return unique_cards
 
 
+def _extract_job_id_indeed(card) -> Optional[str]:
+    """Extract job ID from Indeed job card with comprehensive fallbacks."""
+    # Look for data-jk attribute on the card itself
+    job_id = card.get('data-jk')
+    if job_id:
+        return job_id
+    
+    # Look for data-jk attribute on any child element
+    job_id_elem = card.find(attrs={'data-jk': True})
+    if job_id_elem:
+        return job_id_elem.get('data-jk')
+    
+    # Try to extract from URL in the job title link
+    link_elem = card.find('a', href=True)
+    if link_elem:
+        href = link_elem.get('href', '')
+        # Extract job ID from Indeed URL patterns
+        id_match = re.search(r'jk=([^&]+)', href)
+        if id_match:
+            return id_match.group(1)
+        # Also try to extract from viewjob URLs
+        id_match = re.search(r'/viewjob\?jk=([^&]+)', href)
+        if id_match:
+            return id_match.group(1)
+    
+    return None
+
+
 def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optional[Job]:
     """Extract comprehensive job data from a job card element (matches Selenium version)."""
     try:
-        # Extract job ID
-        job_id = card.get('data-jk', '')
+        # Extract job ID with comprehensive fallbacks
+        job_id = _extract_job_id_indeed(card) or ''
         
         # Extract title
         title = _extract_title_indeed(card)
@@ -1182,6 +1210,31 @@ def _extract_company_size_from_full_page(soup) -> Optional[str]:
     return None
 
 
+def _extract_job_id_from_full_page(soup, url: str) -> Optional[str]:
+    """Extract job ID from Indeed's full job page."""
+    # Try to extract from URL first (most reliable)
+    id_match = re.search(r'jk=([^&]+)', url)
+    if id_match:
+        return id_match.group(1)
+    
+    # Try to extract from viewjob URL pattern
+    id_match = re.search(r'/viewjob\?jk=([^&]+)', url)
+    if id_match:
+        return id_match.group(1)
+    
+    # Look for data-jk attribute in the page
+    job_id_elem = soup.find(attrs={'data-jk': True})
+    if job_id_elem:
+        return job_id_elem.get('data-jk')
+    
+    # Look for job ID in meta tags or script tags
+    meta_elem = soup.find('meta', attrs={'property': re.compile(r'job.*id', re.I)})
+    if meta_elem and meta_elem.get('content'):
+        return meta_elem.get('content')
+    
+    return None
+
+
 async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job) -> Optional[Job]:
     """Extract complete job details by navigating to the individual job page URL (synchronous, one at a time)."""
     if not job.url:
@@ -1206,6 +1259,13 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
         # Get full page content
         full_page_content = await page.content()
         full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
+        
+        # Extract job ID from full page if not already present
+        if not job.job_id:
+            enhanced_job_id = _extract_job_id_from_full_page(full_page_soup, page.url)
+            if enhanced_job_id:
+                job.job_id = enhanced_job_id
+                print(f"    ✓ Enhanced job ID: {enhanced_job_id}")
         
         # Extract enhanced details from the full page
         enhanced_salary = _extract_salary_from_full_page_improved(full_page_soup)
