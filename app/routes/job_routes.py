@@ -295,14 +295,19 @@ async def get_indeed_playwright_jobs(
             status_code=503,
             detail=f"Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium. Error: {str(e)}"
         )
-    except PlaywrightCloudflareBlockedError as e:
+        except PlaywrightCloudflareBlockedError as e:
         # Indeed is blocked - return clear error with solution
         raise HTTPException(
             status_code=503,
             detail=f"Indeed blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Use /api/jobs/ziprecruiter-enhanced endpoint 3) Wait and retry"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_detail = str(e)
+        # Log the full error for debugging on Railway
+        import traceback
+        print(f"❌ [PLAYWRIGHT ENDPOINT] Error: {error_detail}")
+        print(f"   Traceback:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_detail)
 
     return jobs
 

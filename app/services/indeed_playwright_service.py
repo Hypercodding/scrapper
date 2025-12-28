@@ -113,12 +113,20 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
             # Continue without proxy
     
     # Create new browser
-    playwright = await async_playwright().start()
+    try:
+        playwright = await async_playwright().start()
+    except Exception as playwright_error:
+        error_msg = f"Failed to start Playwright: {str(playwright_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     # Launch browser with optimized settings for headless mode
-    _browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
+    try:
+        _browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
@@ -136,7 +144,13 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
             "--mute-audio",
             "--disable-blink-features=AutomationControlled",
         ]
-    )
+        )
+    except Exception as launch_error:
+        error_msg = f"Failed to launch Chromium browser: {str(launch_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        raise Exception(f"{error_msg}. This usually means Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     # Get accept language with proper fallback
     accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
@@ -270,8 +284,23 @@ async def scrape_indeed_playwright(
         await asyncio.sleep(wait)
     _last_fetch = time.monotonic()
     
-    browser, context = await get_browser()
-    page: Page = await context.new_page()
+    try:
+        browser, context = await get_browser()
+    except Exception as browser_error:
+        error_msg = f"Failed to get browser: {str(browser_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
+    
+    try:
+        page: Page = await context.new_page()
+    except Exception as page_error:
+        error_msg = f"Failed to create page: {str(page_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     try:
         # Build Indeed URL
@@ -531,7 +560,13 @@ async def scrape_indeed_playwright(
         return jobs
         
     except Exception as e:
-        print(f"❌ Error during scraping: {e}")
+        error_msg = str(e)
+        print(f"❌ Error during scraping: {error_msg}")
+        import traceback
+        print(f"   Full traceback:\n{traceback.format_exc()}")
+        # Re-raise with more context if it's a browser-related error
+        if "browser" in error_msg.lower() or "playwright" in error_msg.lower():
+            raise Exception(f"Playwright browser error: {error_msg}. Ensure Playwright browsers are installed: python -m playwright install chromium")
         raise
     finally:
         try:
