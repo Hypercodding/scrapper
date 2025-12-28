@@ -295,7 +295,7 @@ async def get_indeed_playwright_jobs(
             status_code=503,
             detail=f"Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium. Error: {str(e)}"
         )
-        except PlaywrightCloudflareBlockedError as e:
+    except PlaywrightCloudflareBlockedError as e:
         # Indeed is blocked - return clear error with solution
         raise HTTPException(
             status_code=503,
