@@ -747,80 +747,58 @@ def get_driver(force_new: bool = False):
                 print("🔧 Using regular Selenium ChromeDriver for headless mode")
                 print("   (undetected_chromedriver incompatible with headless - window closes immediately)")
                 
-                # Create regular Chrome options - use minimal, tested configuration
+                # Create regular Chrome options - CRITICAL: Use exact configuration to prevent crashes
                 chrome_options = ChromeOptions()
                 
-                # Essential headless arguments (tested and working)
-                chrome_options.add_argument("--headless=new")  # Use new headless mode (more stable)
+                # Set Chrome binary location if specified
+                if chrome_path and os.path.exists(chrome_path):
+                    chrome_options.binary_location = chrome_path
+                
+                # CRITICAL: Essential headless arguments (missing --no-sandbox or --disable-dev-shm-usage causes crashes)
+                chrome_options.add_argument("--headless=new")
                 chrome_options.add_argument("--no-sandbox")
                 chrome_options.add_argument("--disable-dev-shm-usage")
                 chrome_options.add_argument("--disable-gpu")
-                chrome_options.add_argument("--window-size=1920,1080")
-                
-                # Memory optimization to prevent crashes
+                chrome_options.add_argument("--disable-extensions")
                 chrome_options.add_argument("--disable-software-rasterizer")
+                chrome_options.add_argument("--single-process")
+                chrome_options.add_argument("--no-zygote")
+                chrome_options.add_argument("--window-size=1280,720")
+                
+                # Memory optimizations
                 chrome_options.add_argument("--disable-background-networking")
                 chrome_options.add_argument("--disable-background-timer-throttling")
-                chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-                chrome_options.add_argument("--disable-renderer-backgrounding")
-                chrome_options.add_argument("--disable-breakpad")
-                chrome_options.add_argument("--disable-component-extensions-with-background-pages")
-                chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process")
-                chrome_options.add_argument("--disable-ipc-flooding-protection")
-                chrome_options.add_argument("--disable-hang-monitor")
+                chrome_options.add_argument("--disable-client-side-phishing-detection")
+                chrome_options.add_argument("--disable-default-apps")
+                chrome_options.add_argument("--disable-sync")
                 chrome_options.add_argument("--metrics-recording-only")
-                chrome_options.add_argument("--no-first-run")
                 chrome_options.add_argument("--mute-audio")
-                chrome_options.add_argument("--disable-web-security")  # Reduce security overhead
-                chrome_options.add_argument("--disable-features=VizDisplayCompositor")  # Reduce compositor overhead
-                
-                # Resource limits to prevent Chrome from consuming too much memory
-                # NOTE: Do NOT use --single-process as it causes instability and crashes
-                chrome_options.add_argument("--disable-features=site-per-process")  # Use fewer processes
-                chrome_options.add_argument("--process-per-site")  # Group sites in same process
-                chrome_options.add_argument("--disable-site-isolation-trials")
-                
-                # Memory limits
-                chrome_options.add_argument("--max-old-space-size=768")  # Limit JS heap to 768MB
-                chrome_options.add_argument("--js-flags=--max-old-space-size=768")
-                
-                # Disable unnecessary features that consume memory
-                chrome_options.add_argument("--disable-notifications")
-                chrome_options.add_argument("--disable-logging")
-                chrome_options.add_argument("--log-level=3")  # Only fatal errors
-                chrome_options.add_argument("--silent")
                 
                 # Add user agent
-                chrome_options.add_argument(f"user-agent={settings.USER_AGENT}")
+                chrome_options.add_argument(f"--user-agent={settings.USER_AGENT}")
                 
-                # Add other important arguments from undetected options (but be selective)
-                important_args = [
-                    "--disable-blink-features=AutomationControlled",
-                    "--ignore-certificate-errors",
-                    "--disable-extensions",  # Important for headless
-                ]
-                for arg in important_args:
-                    chrome_options.add_argument(arg)
+                # Additional useful arguments
+                chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+                chrome_options.add_argument("--ignore-certificate-errors")
                 
                 # Set capabilities
                 chrome_options.set_capability('acceptInsecureCerts', True)
                 chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
                 chrome_options.add_experimental_option('useAutomationExtension', False)
                 
-                # Handle proxy - simplified for headless mode
+                # Handle proxy - use --proxy-server only (extensions are disabled)
                 if proxy_url:
                     parsed = urlparse(proxy_url)
-                    if parsed.username and parsed.password:
-                        # For authenticated proxies in headless, use extension
-                        try:
-                            ext_zip = _build_proxy_auth_extension(proxy_url)
-                            chrome_options.add_argument(f"--load-extension={os.path.dirname(ext_zip)}")
-                            print(f"   Using proxy extension for authenticated proxy")
-                        except Exception as ext_error:
-                            print(f"⚠️  Warning: Could not set up proxy extension: {ext_error}")
-                            print(f"   Continuing without proxy authentication")
-                    else:
-                        chrome_options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}:{parsed.port}")
+                    if parsed.hostname and parsed.port:
+                        # Note: Authenticated proxies won't work with --disable-extensions
+                        # Use --proxy-server for non-authenticated proxies only
+                        if parsed.username and parsed.password:
+                            print(f"⚠️  Warning: Authenticated proxy detected but extensions are disabled.")
+                            print(f"   Proxy authentication will not work. Using proxy without auth.")
+                            # Use proxy without authentication
+                            chrome_options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}:{parsed.port}")
+                        else:
+                            chrome_options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}:{parsed.port}")
                 
                 # Create service and initialize with retry logic
                 # Try using webdriver_manager if available for automatic ChromeDriver management
@@ -850,6 +828,10 @@ def get_driver(force_new: bool = False):
                         cleanup_zombie_processes(aggressive=True)
                         time.sleep(2.0)
                 
+                # Verify Chrome executable exists before attempting to start
+                if chrome_path and not os.path.exists(chrome_path):
+                    raise Exception(f"Chrome executable not found at: {chrome_path}")
+                
                 for retry in range(max_retries):
                     service = None  # Track service for cleanup
                     try:
@@ -860,8 +842,24 @@ def get_driver(force_new: bool = False):
                         else:
                             service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
                         
+                        # Enable verbose logging for ChromeDriver to help diagnose issues
+                        if hasattr(service, 'log_output'):
+                            # Create a log file for this attempt
+                            log_file = f"/tmp/chromedriver_{os.getpid()}_{retry}.log"
+                            service.log_output = log_file
+                            print(f"   ChromeDriver logs: {log_file}")
+                        
                         print(f"   Attempting Chrome initialization (attempt {retry + 1}/{max_retries})...")
                         print(f"   Chrome path: {chrome_path or 'auto-detect'}")
+                        if chrome_path:
+                            if os.path.exists(chrome_path):
+                                # Try to get Chrome version
+                                try:
+                                    result = subprocess.run([chrome_path, "--version"], capture_output=True, text=True, timeout=5)
+                                    if result.returncode == 0:
+                                        print(f"   Chrome version: {result.stdout.strip()}")
+                                except:
+                                    pass
                         print(f"   ChromeDriver path: {chromedriver_path or 'auto-detect'}")
                         
                         # Create driver
@@ -958,6 +956,30 @@ def get_driver(force_new: bool = False):
                             import traceback
                             print(f"   Full traceback:\n{traceback.format_exc()}")
                             
+                            # Check for ChromeDriver log files
+                            log_info = ""
+                            if service and hasattr(service, 'log_output') and service.log_output:
+                                log_file = service.log_output
+                                if os.path.exists(log_file):
+                                    try:
+                                        with open(log_file, 'r') as f:
+                                            log_content = f.read()
+                                            if log_content:
+                                                print(f"   ChromeDriver log file: {log_file}")
+                                                # Show last 20 lines of log
+                                                log_lines = log_content.strip().split('\n')
+                                                if len(log_lines) > 20:
+                                                    print(f"   Last 20 lines of ChromeDriver log:")
+                                                    for line in log_lines[-20:]:
+                                                        print(f"      {line}")
+                                                else:
+                                                    print(f"   ChromeDriver log content:")
+                                                    for line in log_lines:
+                                                        print(f"      {line}")
+                                                log_info = f" Check ChromeDriver log: {log_file}"
+                                    except Exception as log_error:
+                                        print(f"   ⚠️  Could not read ChromeDriver log: {log_error}")
+                            
                             # Get process count for diagnostics
                             process_count = check_chrome_process_count()
                             if process_count > 0:
@@ -969,23 +991,33 @@ def get_driver(force_new: bool = False):
                                     f"System resource exhaustion (BlockingIOError errno 11). "
                                     f"Cannot spawn new processes. {process_count if process_count > 0 else 'Many'} Chrome processes may be running. "
                                     f"Solutions: 1) Install psutil: pip install psutil 2) Restart the container/application 3) Increase system limits (ulimit) 4) Reduce concurrent requests. "
-                                    f"Error: {error_msg}"
+                                    f"Error: {error_msg}{log_info}"
                                 )
                             elif "unable to discover open pages" in error_msg.lower():
-                                raise Exception(f"ChromeDriver cannot connect to Chrome. This may indicate: 1) Chrome/ChromeDriver version mismatch 2) Chrome not starting properly 3) Missing required system dependencies. Error: {error_msg}")
+                                raise Exception(f"ChromeDriver cannot connect to Chrome. This may indicate: 1) Chrome/ChromeDriver version mismatch 2) Chrome not starting properly 3) Missing required system dependencies. Error: {error_msg}{log_info}")
                             elif "connection pool" in error_msg.lower() or "max retries" in error_msg.lower():
                                 # Connection pool exhaustion
-                                raise Exception(f"Connection pool exhausted ({process_count} Chrome processes active). Too many Chrome instances are running. Try: 1) Close unused Chrome windows 2) Restart the application 3) Run cleanup_zombie_processes(). Error: {error_msg}")
+                                raise Exception(f"Connection pool exhausted ({process_count} Chrome processes active). Too many Chrome instances are running. Try: 1) Close unused Chrome windows 2) Restart the application 3) Run cleanup_zombie_processes(). Error: {error_msg}{log_info}")
                             elif "session not created" in error_msg.lower() or "chrome.*exited" in error_msg.lower() or "invalid session" in error_msg.lower():
-                                # Chrome crashed during startup - likely resource exhaustion
+                                # Chrome crashed during startup - likely resource exhaustion or invalid arguments
+                                diagnostic_info = ""
+                                if chrome_path and os.path.exists(chrome_path):
+                                    # Check if Chrome can run at all
+                                    try:
+                                        test_result = subprocess.run([chrome_path, "--version"], capture_output=True, text=True, timeout=5)
+                                        if test_result.returncode != 0:
+                                            diagnostic_info = f" Chrome executable test failed (exit code {test_result.returncode})."
+                                    except Exception as test_error:
+                                        diagnostic_info = f" Chrome executable test error: {test_error}."
+                                
                                 raise Exception(
                                     f"Chrome instance exited during startup ({process_count} processes before attempt). "
-                                    f"This typically indicates: 1) Memory exhaustion (insufficient RAM/swap) 2) Too many processes 3) System resource limits (ulimit) 4) Missing libraries (ldd /usr/bin/google-chrome). "
-                                    f"Solutions: 1) Restart application/container 2) Increase memory limits 3) Reduce concurrent requests 4) Check 'ulimit -a' and 'free -h'. "
-                                    f"Error: {error_msg}"
+                                    f"This typically indicates: 1) Memory exhaustion (insufficient RAM/swap) 2) Too many processes 3) System resource limits (ulimit) 4) Missing libraries (ldd /usr/bin/google-chrome) 5) Invalid Chrome arguments.{diagnostic_info} "
+                                    f"Solutions: 1) Restart application/container 2) Increase memory limits 3) Reduce concurrent requests 4) Check 'ulimit -a' and 'free -h' 5) Verify Chrome arguments are valid. "
+                                    f"Error: {error_msg}{log_info}"
                                 )
                             else:
-                                raise Exception(f"Failed to initialize Chrome driver: {error_msg}")
+                                raise Exception(f"Failed to initialize Chrome driver: {error_msg}{log_info}")
                 
             else:
                 # Use undetected_chromedriver for visible mode (better anti-detection)

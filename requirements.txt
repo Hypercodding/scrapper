@@ -14,6 +14,9 @@ undetected-chromedriver==3.5.5
 selenium-stealth==1.0.6
 psutil==6.1.0
 
+# Playwright (alternative to Selenium - more stable, no ChromeDriver issues)
+playwright>=1.40.0
+
 # Optional: network interception
 selenium-wire>=5,<6
 

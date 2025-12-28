@@ -14,6 +14,12 @@ from app.services.indeed_selenium_service import (
     CloudflareBlockedError,
     check_chrome_process_count
 ) # pylint: disable=import-error
+try:
+    from app.services.indeed_playwright_service import scrape_indeed_playwright, CloudflareBlockedError as PlaywrightCloudflareBlockedError
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    PlaywrightCloudflareBlockedError = None
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
 from app.services.simplyhired_selenium_service import (
@@ -179,6 +185,117 @@ async def get_jobs(
             detail=f"Scraping operation timed out. {str(e)}"
         )
     except CloudflareBlockedError as e:
+        # Indeed is blocked - return clear error with solution
+        raise HTTPException(
+            status_code=503,
+            detail=f"Indeed blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Use /api/jobs/ziprecruiter-enhanced endpoint 3) Wait and retry"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return jobs
+
+
+@router.get("/jobs/indeed-playwright", response_model=List[Job])
+async def get_indeed_playwright_jobs(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location (flexible format). Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California'"),
+    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
+    salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
+    salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
+    experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
+    employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
+    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
+    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+):
+    """
+    Get jobs from Indeed using Playwright (More stable alternative to Selenium)
+    
+    ⭐ PLAYWRIGHT VERSION: Better resource management, no ChromeDriver issues!
+    
+    Benefits over Selenium:
+    - No ChromeDriver version mismatches (Playwright bundles its own browser)
+    - Better memory management and stability
+    - More reliable in headless mode
+    - Better error handling
+    
+    Features:
+    - Extracts job title, company, location, URL, description
+    - Dynamic location filtering (flexible format)
+    - Salary range filtering
+    - Experience level filtering
+    - Employment type filtering
+    - Date filtering
+    
+    Location Filter (Dynamic):
+    - Accepts any location format that Indeed supports
+    - Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'
+    - 'San Francisco, CA', 'London, UK', 'Toronto, ON', etc.
+    
+    Job Type Filter:
+    - 'remote' - Remote jobs only
+    - 'hybrid' - Hybrid jobs only  
+    - 'onsite' or 'on-site' - On-site jobs only
+    
+    Salary Filters:
+    - salary_min: Minimum salary (e.g., 50000)
+    - salary_max: Maximum salary (e.g., 100000)
+    
+    Experience Level Filter:
+    - 'intern' / 'internship' - Internship jobs
+    - 'assistant' - Assistant-level jobs
+    - 'entry' / 'junior' - Entry-level jobs
+    - 'mid' / 'mid-senior' - Mid-level jobs
+    - 'senior' - Senior-level jobs
+    - 'director' / 'manager' - Director/Manager-level jobs
+    - 'executive' - Executive-level jobs
+    
+    Employment Type Filter:
+    - 'full-time' - Full-time jobs
+    - 'part-time' - Part-time jobs
+    - 'contract' - Contract jobs
+    - 'internship' - Internship jobs
+    
+    Date Filter:
+    - days_old: Filter jobs posted within last N days
+    - 30 - Jobs posted in last 30 days
+    - 7 - Jobs posted in last 7 days
+    - 1 - Jobs posted today
+    
+    Installation Required:
+    ```bash
+    pip install playwright
+    python -m playwright install chromium
+    ```
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium"
+        )
+    
+    try:
+        async with scrape_execution_context():
+            jobs = await scrape_indeed_playwright(
+                query, location, max_results, job_type,
+                salary_min, salary_max, experience_level, employment_type, days_old
+            )
+    except ScrapeInProgressError as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
+        )
+    except ScrapeTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping operation timed out. {str(e)}"
+        )
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium. Error: {str(e)}"
+        )
+    except PlaywrightCloudflareBlockedError as e:
         # Indeed is blocked - return clear error with solution
         raise HTTPException(
             status_code=503,

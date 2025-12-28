@@ -1977,7 +1977,7 @@ async def detect_pagination(driver) -> Dict[str, Any]:
             # Try JavaScript-based detection as fallback
             try:
                 print("  🔄 Trying JavaScript-based pagination detection...")
-                js_pagination_check = """
+                js_pagination_check = r"""
                 // Look for pagination elements
                 const paginationKeywords = ['next', 'previous', 'prev', 'page'];
                 const allLinks = document.querySelectorAll('a, button');
@@ -3944,17 +3944,25 @@ async def scrape_with_selenium(
         # This is MANDATORY to prevent Railway deployment crashes
         print("🧹 [GENERIC SCRAPER] MANDATORY cleanup: Closing browser after scrape operation")
         
-        if driver:
-            # Use centralized browser cleanup with hard process termination
-            cleanup_browser(driver)
-            print("✓ [GENERIC SCRAPER] Browser cleanup complete - all Chrome resources freed")
-        else:
-            print("⚠️  [GENERIC SCRAPER] No driver to cleanup (already None)")
+        try:
+            if driver:
+                # Use centralized browser cleanup with hard process termination
+                cleanup_browser(driver)
+                print("✓ [GENERIC SCRAPER] Browser cleanup complete - all Chrome resources freed")
+            else:
+                print("⚠️  [GENERIC SCRAPER] No driver to cleanup (already None)")
+        except Exception as cleanup_error:
+            # Even if cleanup_browser fails, we must attempt hard-kill
+            print(f"⚠️  [GENERIC SCRAPER] Cleanup error (non-fatal): {cleanup_error}")
         
-        # Final hard-kill of all browser processes (safety net)
-        killed = hard_kill_all_browsers()
-        if killed > 0:
-            print(f"   ✓ Hard-killed {killed} additional browser process(es)")
+        # Final hard-kill of all browser processes (safety net - ALWAYS runs)
+        try:
+            killed = hard_kill_all_browsers()
+            if killed > 0:
+                print(f"   ✓ Hard-killed {killed} additional browser process(es)")
+        except Exception as kill_error:
+            # Last resort - log but don't raise (finally block should not raise)
+            print(f"⚠️  [GENERIC SCRAPER] Hard-kill error (non-fatal): {kill_error}")
     
     return jobs
 
