@@ -169,9 +169,7 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
     locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
     
     # Create context with realistic settings and proxy
-    # Increase timeouts for slow proxies
-    context_timeout = getattr(settings, "CONTEXT_TIMEOUT", 60000)  # 60 seconds default
-    
+    # Note: timeout is set on individual operations (page.goto, etc.), not on context
     context_options = {
         "viewport": {"width": 1280, "height": 720},
         "user_agent": settings.USER_AGENT,
@@ -181,7 +179,6 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
         "bypass_csp": True,
         "ignore_https_errors": True,
         "accept_downloads": False,
-        "timeout": context_timeout,  # Set longer timeout for slow proxies
     }
     
     # Add proxy if configured
