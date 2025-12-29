@@ -372,16 +372,30 @@ async def scrape_indeed_playwright(
                             # All strategies failed, but check if we got any content
                             print(f"⚠️  All navigation strategies failed, checking if we got content anyway...")
                             navigation_success = False
+                            # Wait longer when navigation fails
+                            await page.wait_for_timeout(8000)
                 
                 # Wait for page to potentially load more content
-                await page.wait_for_timeout(random.uniform(3000, 5000))
+                if navigation_success:
+                    await page.wait_for_timeout(random.uniform(3000, 5000))
+                else:
+                    # If navigation failed, wait longer and try scrolling
+                    await page.wait_for_timeout(5000)
+                    try:
+                        # Try scrolling to trigger lazy loading
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        await page.wait_for_timeout(2000)
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
                 
                 # Try to wait for job listings if they exist (with timeout)
                 try:
                     # Wait for either job cards or Cloudflare challenge
                     await page.wait_for_selector(
                         'div[data-jk], div.job_seen_beacon, #challenge-form, .cf-browser-verification',
-                        timeout=5000,
+                        timeout=10000,  # Increased timeout
                         state='attached'
                     )
                 except Exception:
@@ -390,6 +404,17 @@ async def scrape_indeed_playwright(
                 
                 # Get page content to check for Cloudflare
                 page_html = await page.content()
+                
+                # Debug: Check page title and URL to see what we actually got
+                try:
+                    page_title = await page.title()
+                    current_url = page.url
+                    print(f"🔍 Debug: Page title: '{page_title[:100]}', URL: {current_url[:100]}")
+                    # Check if page has any meaningful content
+                    if len(page_html) < 1000:
+                        print(f"⚠️  Warning: Page content is very short ({len(page_html)} chars), might be an error page")
+                except Exception:
+                    pass
                 
                 # Check for Cloudflare blocking (more comprehensive detection)
                 has_cloudflare_indicators = (
@@ -714,6 +739,11 @@ def _find_job_cards_indeed(soup: BeautifulSoup) -> List:
     """Find job cards using multiple Indeed-specific selectors."""
     cards = []
     
+    # Debug: Check if soup has any content
+    if not soup or not soup.find('body'):
+        print("⚠️  Warning: No body element found in page HTML")
+        return cards
+    
     # Try multiple selectors
     selectors = [
         'div[data-jk]',  # Most reliable - Indeed's job ID attribute
@@ -728,7 +758,28 @@ def _find_job_cards_indeed(soup: BeautifulSoup) -> List:
         found = soup.select(selector)
         if found:
             cards.extend(found)
+            print(f"  ✓ Found {len(found)} cards using selector: {selector}")
             break
+    
+    # If no cards found, debug what's actually on the page
+    if not cards:
+        # Check for common error/block pages
+        page_text = soup.get_text().lower()
+        if 'no jobs found' in page_text or 'try different keywords' in page_text:
+            print("  ℹ️  Page indicates no jobs found for this search")
+        elif 'cloudflare' in page_text or 'checking your browser' in page_text:
+            print("  ⚠️  Page appears to be a Cloudflare challenge")
+        elif 'indeed' not in page_text:
+            print("  ⚠️  Page doesn't appear to be an Indeed page")
+        else:
+            # Try to find any divs that might be job cards
+            all_divs = soup.find_all('div', limit=50)
+            print(f"  🔍 Debug: Found {len(all_divs)} div elements on page")
+            # Check for any divs with job-related classes
+            job_related = [d for d in all_divs if any(keyword in str(d.get('class', [])).lower() 
+                          for keyword in ['job', 'result', 'listing', 'card', 'serp'])]
+            if job_related:
+                print(f"  🔍 Found {len(job_related)} divs with job-related classes")
     
     # Remove duplicates based on data-jk attribute
     seen = set()
