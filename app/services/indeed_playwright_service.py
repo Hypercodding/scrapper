@@ -331,6 +331,9 @@ async def scrape_indeed_playwright(
         
         print(f"🌐 Navigating to: {url}")
         
+        # Save the original search URL (without any job view parameters)
+        original_search_url = url
+        
         # Navigate with timeout and retry logic for Cloudflare
         max_retries = getattr(settings, "MAX_RETRIES", 3)
         cloudflare_retries = 0
@@ -555,9 +558,6 @@ async def scrape_indeed_playwright(
         
         print(f"📋 Found {len(job_cards)} job cards")
         
-        # Save the search results URL for navigation after proxy rotation
-        search_results_url = page.url
-        
         # Extract job data from listing page
         jobs = []
         for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
@@ -581,14 +581,16 @@ async def scrape_indeed_playwright(
                             _context = None
                             browser, context = await get_browser(force_new=True)
                             page = await context.new_page()
-                            # Navigate back to search results page
-                            await page.goto(search_results_url, wait_until="domcontentloaded", timeout=30000)
+                            # Navigate back to original search results page (not job view URL)
+                            await page.goto(original_search_url, wait_until="domcontentloaded", timeout=30000)
+                            # Wait a bit for page to fully load
+                            await page.wait_for_timeout(2000)
                             # Re-parse the page to get fresh job cards
                             await _progressive_scroll_playwright(page)
                             content = await page.content()
                             soup = BeautifulSoup(content, "html.parser")
                             job_cards = _find_job_cards_indeed(soup)
-                            print(f"✓ New browser created with rotated proxy, navigated back and refreshed job cards")
+                            print(f"✓ New browser created with rotated proxy, navigated back and refreshed job cards ({len(job_cards)} found)")
                     except Exception as proxy_err:
                         print(f"⚠️  Error checking proxy rotation: {proxy_err}")
                 
@@ -597,7 +599,7 @@ async def scrape_indeed_playwright(
                     # Enhanced extraction: Visit individual job page for complete data
                     print(f"  → Fetching complete data from job page: {job.title}")
                     try:
-                        enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job)
+                        enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job, original_search_url)
                         if enhanced_job:
                             job = enhanced_job
                         # Add delay to be respectful to Indeed's servers
@@ -1279,12 +1281,27 @@ def _extract_job_id_from_full_page(soup, url: str) -> Optional[str]:
     return None
 
 
-async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job) -> Optional[Job]:
+async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job, original_search_url: Optional[str] = None) -> Optional[Job]:
     """Extract complete job details by navigating to the individual job page URL (synchronous, one at a time)."""
     if not job.url:
         return job
     
-    original_url = page.url
+    # Use original search URL if provided, otherwise try to clean current page URL
+    # The original_search_url should be the clean search results URL without any job view parameters
+    if original_search_url:
+        # Use the original search URL directly (it should already be clean)
+        original_url = original_search_url
+    else:
+        # Fallback: try to clean current URL to remove vjk parameter
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        current_url = page.url
+        parsed = urlparse(current_url)
+        query_params = parse_qs(parsed.query)
+        # Remove vjk parameter if it exists (job view parameter)
+        if 'vjk' in query_params:
+            del query_params['vjk']
+        clean_query = urlencode(query_params, doseq=True)
+        original_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
     
     try:
         # Navigate to the individual job page
