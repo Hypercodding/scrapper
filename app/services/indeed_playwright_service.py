@@ -169,6 +169,9 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
     locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
     
     # Create context with realistic settings and proxy
+    # Increase timeouts for slow proxies
+    context_timeout = getattr(settings, "CONTEXT_TIMEOUT", 60000)  # 60 seconds default
+    
     context_options = {
         "viewport": {"width": 1280, "height": 720},
         "user_agent": settings.USER_AGENT,
@@ -178,6 +181,7 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
         "bypass_csp": True,
         "ignore_https_errors": True,
         "accept_downloads": False,
+        "timeout": context_timeout,  # Set longer timeout for slow proxies
     }
     
     # Add proxy if configured
@@ -342,7 +346,8 @@ async def scrape_indeed_playwright(
             try:
                 # Navigate with more lenient wait strategy
                 # Try multiple wait strategies in order of preference
-                navigation_timeout = 30000  # 30 seconds
+                # Increase timeout for slow proxies (60 seconds)
+                navigation_timeout = getattr(settings, "NAVIGATION_TIMEOUT", 60000)  # 60 seconds default
                 navigation_success = False
                 
                 # Strategy 1: Try domcontentloaded (fastest, most reliable)
@@ -351,29 +356,30 @@ async def scrape_indeed_playwright(
                     print("✓ Navigation completed (domcontentloaded)")
                     navigation_success = True
                 except Exception as nav_error1:
-                    print(f"⚠️  domcontentloaded timeout, trying 'load' strategy...")
+                    print(f"⚠️  domcontentloaded timeout ({navigation_timeout/1000}s), trying 'load' strategy...")
                     
-                    # Strategy 2: Try 'load' (waits for all resources)
+                    # Strategy 2: Try 'load' (waits for all resources) with longer timeout
                     try:
                         await page.goto(url, wait_until="load", timeout=navigation_timeout)
                         print("✓ Navigation completed (load)")
                         navigation_success = True
                     except Exception as nav_error2:
-                        print(f"⚠️  load timeout, trying 'commit' strategy...")
+                        print(f"⚠️  load timeout ({navigation_timeout/1000}s), trying 'commit' strategy...")
                         
-                        # Strategy 3: Try 'commit' (just waits for navigation to start)
+                        # Strategy 3: Try 'commit' (just waits for navigation to start) with longer timeout
                         try:
-                            await page.goto(url, wait_until="commit", timeout=10000)
+                            commit_timeout = max(20000, navigation_timeout // 3)  # At least 20s, or 1/3 of main timeout
+                            await page.goto(url, wait_until="commit", timeout=commit_timeout)
                             print("✓ Navigation started (commit)")
-                            # Give it a bit more time to load
-                            await page.wait_for_timeout(5000)
+                            # Give it more time to load after commit
+                            await page.wait_for_timeout(10000)  # Increased from 5s
                             navigation_success = True
                         except Exception as nav_error3:
                             # All strategies failed, but check if we got any content
                             print(f"⚠️  All navigation strategies failed, checking if we got content anyway...")
                             navigation_success = False
                             # Wait longer when navigation fails
-                            await page.wait_for_timeout(8000)
+                            await page.wait_for_timeout(10000)  # Increased from 8s
                 
                 # Wait for page to potentially load more content
                 if navigation_success:
@@ -390,16 +396,19 @@ async def scrape_indeed_playwright(
                     except Exception:
                         pass
                 
-                # Try to wait for job listings if they exist (with timeout)
+                # Try to wait for job listings if they exist (with longer timeout for slow proxies)
                 try:
                     # Wait for either job cards or Cloudflare challenge
+                    selector_timeout = getattr(settings, "SELECTOR_TIMEOUT", 20000)  # 20 seconds default
                     await page.wait_for_selector(
                         'div[data-jk], div.job_seen_beacon, #challenge-form, .cf-browser-verification',
-                        timeout=10000,  # Increased timeout
+                        timeout=selector_timeout,
                         state='attached'
                     )
                 except Exception:
                     # Selector not found - might be Cloudflare or page still loading
+                    # Wait a bit more before giving up
+                    await page.wait_for_timeout(3000)
                     pass
                 
                 # Get page content to check for Cloudflare
@@ -410,10 +419,52 @@ async def scrape_indeed_playwright(
                     page_title = await page.title()
                     current_url = page.url
                     print(f"🔍 Debug: Page title: '{page_title[:100]}', URL: {current_url[:100]}")
+                    
+                    # Check for Chrome error pages (network/proxy failures)
+                    if 'chrome-error://' in current_url or 'chromewebdata' in current_url:
+                        print(f"❌ Chrome error page detected - network/proxy failure")
+                        # This is a proxy/network issue, rotate proxy and retry
+                        proxy_urls = _get_proxy_urls()
+                        if proxy_urls and len(proxy_urls) > 1:
+                            try:
+                                proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                                print(f"🔄 Rotating proxy due to Chrome error page...")
+                                proxy_manager.rotate_proxy(force=True)
+                                print(f"✓ Rotated to next proxy: {proxy_manager._mask_proxy(proxy_manager.get_current_proxy())}")
+                                
+                                # Close and recreate browser with new proxy
+                                try:
+                                    await page.close()
+                                    await context.close()
+                                    await browser.close()
+                                    _browser = None
+                                    _context = None
+                                except:
+                                    pass
+                                
+                                browser, context = await get_browser(force_new=True)
+                                page = await context.new_page()
+                                
+                                # Retry navigation with new proxy
+                                if cloudflare_retries < max_retries:
+                                    cloudflare_retries += 1
+                                    print(f"🔄 Retrying navigation with new proxy (attempt {cloudflare_retries + 1}/{max_retries + 1})...")
+                                    continue  # Retry the navigation loop
+                                else:
+                                    raise Exception(f"Chrome error page after {max_retries} proxy rotations. Proxy may be blocked or network issue.")
+                            except Exception as proxy_rotate_err:
+                                print(f"⚠️  Error rotating proxy: {proxy_rotate_err}")
+                                raise Exception(f"Chrome error page - network/proxy failure. Error: {proxy_rotate_err}")
+                        else:
+                            raise Exception(f"Chrome error page - network/proxy failure. No proxy rotation available.")
+                    
                     # Check if page has any meaningful content
                     if len(page_html) < 1000:
                         print(f"⚠️  Warning: Page content is very short ({len(page_html)} chars), might be an error page")
-                except Exception:
+                except Exception as debug_err:
+                    # If we already raised an exception above, re-raise it
+                    if "Chrome error page" in str(debug_err) or "network/proxy failure" in str(debug_err):
+                        raise
                     pass
                 
                 # Check for Cloudflare blocking (more comprehensive detection)
@@ -1392,7 +1443,8 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
     try:
         # Navigate to the individual job page
         print(f"    → Navigating to: {job.url}")
-        await page.goto(job.url, wait_until="domcontentloaded", timeout=30000)
+        job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 60000)  # 60 seconds default
+        await page.goto(job.url, wait_until="domcontentloaded", timeout=job_page_timeout)
         
         # Wait for page to load
         await page.wait_for_timeout(random.uniform(2000, 3000))
@@ -1475,10 +1527,12 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
         # Navigate back to the original search results page
         try:
             print(f"    ← Navigating back to search results")
-            await page.goto(original_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(1000)  # Brief wait for page to load
+            back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 30000)  # 30 seconds default
+            await page.goto(original_url, wait_until="domcontentloaded", timeout=back_nav_timeout)
+            await page.wait_for_timeout(2000)  # Wait for page to load
         except Exception as nav_error:
             print(f"    ⚠️  Warning: Could not navigate back: {nav_error}")
+            # If navigation back fails, it's not critical - we can continue
     
     return job
 
