@@ -7,17 +7,19 @@ Benefits:
 - More stable in headless mode
 - Better error handling
 - Fast navigation with smart waiting strategies
+- Proxy rotation support for avoiding blocks
 """
 
 import time
 import random
 import asyncio
 import re
-from typing import Optional, List
-from urllib.parse import quote_plus
+from typing import Optional, List, Dict
+from urllib.parse import quote_plus, urlparse
 from bs4 import BeautifulSoup
 from app.models.job_model import Job
 from app.core.config import settings
+from app.core.proxy_manager import ProxyManager
 
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -29,7 +31,107 @@ except ImportError:
 
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
+_proxy_manager: Optional[ProxyManager] = None
+_current_proxy: Optional[str] = None
 _last_fetch = 0
+
+
+def _parse_proxy_for_playwright(proxy_url: str) -> Optional[Dict]:
+    """
+    Parse a proxy URL into Playwright's proxy format.
+    
+    Args:
+        proxy_url: Proxy URL in format http://user:pass@host:port
+        
+    Returns:
+        Dict with 'server', 'username', 'password' for Playwright
+    """
+    if not proxy_url:
+        return None
+    
+    try:
+        parsed = urlparse(proxy_url)
+        proxy_config = {
+            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        }
+        
+        if parsed.username:
+            proxy_config["username"] = parsed.username
+        if parsed.password:
+            proxy_config["password"] = parsed.password
+            
+        return proxy_config
+    except Exception as e:
+        print(f"⚠️  Error parsing proxy URL: {e}")
+        return None
+
+
+def _init_proxy_manager() -> Optional[ProxyManager]:
+    """Initialize the proxy manager from config settings."""
+    global _proxy_manager
+    
+    if _proxy_manager is not None:
+        return _proxy_manager
+    
+    # Get proxy URLs from config
+    proxy_urls_str = getattr(settings, "PROXY_URLS", "")
+    
+    if not proxy_urls_str:
+        print("ℹ️  No proxy URLs configured - using direct connection")
+        return None
+    
+    # Parse comma-separated proxy URLs
+    proxy_urls = [url.strip() for url in proxy_urls_str.split(",") if url.strip()]
+    
+    if not proxy_urls:
+        print("ℹ️  No valid proxy URLs found - using direct connection")
+        return None
+    
+    try:
+        rotation_interval = getattr(settings, "PROXY_ROTATION_INTERVAL", 240)
+        _proxy_manager = ProxyManager(proxy_urls, rotation_interval)
+        print(f"✓ Proxy manager initialized with {len(proxy_urls)} proxies (rotation every {rotation_interval}s)")
+        return _proxy_manager
+    except Exception as e:
+        print(f"⚠️  Error initializing proxy manager: {e}")
+        return None
+
+
+def _get_current_proxy_config() -> Optional[Dict]:
+    """Get the current proxy configuration for Playwright."""
+    global _current_proxy
+    
+    proxy_manager = _init_proxy_manager()
+    if not proxy_manager:
+        return None
+    
+    # Check if we should rotate based on time
+    if proxy_manager.should_rotate():
+        proxy_manager.rotate_proxy()
+    
+    _current_proxy = proxy_manager.get_current_proxy()
+    return _parse_proxy_for_playwright(_current_proxy)
+
+
+def _rotate_proxy_on_error() -> Optional[Dict]:
+    """Force rotate to next proxy after an error."""
+    global _current_proxy
+    
+    if not _proxy_manager:
+        return None
+    
+    # Mark current proxy as failed
+    _proxy_manager.mark_proxy_failure()
+    
+    # Force rotate to next proxy
+    _current_proxy = _proxy_manager.rotate_proxy(force=True)
+    return _parse_proxy_for_playwright(_current_proxy)
+
+
+def _mark_proxy_success():
+    """Mark the current proxy as successful."""
+    if _proxy_manager and _current_proxy:
+        _proxy_manager.mark_proxy_success(_current_proxy)
 
 
 class CloudflareBlockedError(Exception):
@@ -37,12 +139,13 @@ class CloudflareBlockedError(Exception):
     pass
 
 
-async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]:
+async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tuple[Browser, BrowserContext]:
     """
-    Get or create a Playwright browser instance with stealth support.
+    Get or create a Playwright browser instance with stealth and proxy support.
     
     Args:
         force_new: If True, create a new browser instance
+        rotate_proxy: If True, rotate to the next proxy before creating browser
         
     Returns:
         Tuple of (browser, context)
@@ -56,13 +159,27 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
         try:
             # Check if browser is still alive
             if _browser.is_connected():
-                return _browser, _context
+                # Check if we should rotate proxy based on time
+                if _proxy_manager and _proxy_manager.should_rotate():
+                    print("🔄 Proxy rotation interval reached - recreating browser with new proxy")
+                    force_new = True
+                else:
+                    return _browser, _context
         except:
             # Browser is dead, create new one
             _browser = None
             _context = None
     
-    print("🌐 Creating browser instance (no proxy - direct connection)")
+    # Get proxy configuration
+    if rotate_proxy:
+        proxy_config = _rotate_proxy_on_error()
+    else:
+        proxy_config = _get_current_proxy_config()
+    
+    if proxy_config:
+        print(f"🌐 Creating browser instance with proxy: {proxy_config['server']}")
+    else:
+        print("🌐 Creating browser instance (no proxy - direct connection)")
     
     # Create new browser
     try:
@@ -119,6 +236,11 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
         "ignore_https_errors": True,
         "accept_downloads": False,
     }
+    
+    # Add proxy configuration if available
+    if proxy_config:
+        context_options["proxy"] = proxy_config
+        print(f"✓ Proxy configured for browser context")
     
     _context = await _browser.new_context(**context_options)
     
@@ -189,6 +311,27 @@ async def close_browser():
         except:
             pass
         _browser = None
+
+
+def get_proxy_stats() -> Optional[Dict]:
+    """
+    Get current proxy statistics for monitoring/debugging.
+    
+    Returns:
+        Dict with proxy stats or None if no proxy manager
+    """
+    if not _proxy_manager:
+        return None
+    return _proxy_manager.get_proxy_stats()
+
+
+def reset_proxy_manager_state():
+    """Reset the proxy manager state (useful for testing or forced reset)."""
+    global _proxy_manager, _current_proxy
+    
+    if _proxy_manager:
+        _proxy_manager.reset_failures()
+    _current_proxy = None
 
 
 async def scrape_indeed_playwright(
@@ -413,7 +556,8 @@ async def scrape_indeed_playwright(
                     print("✓ Indeed content detected - proceeding with scraping")
                 
                 if not is_actually_blocked:
-                    # Success - no Cloudflare block
+                    # Success - no Cloudflare block, mark proxy as successful
+                    _mark_proxy_success()
                     break
                 
                 # Cloudflare detected - retry logic
@@ -435,7 +579,7 @@ async def scrape_indeed_playwright(
                 await context.clear_cookies()
                 await asyncio.sleep(backoff)
                 
-                # Recreate browser for fresh start
+                # Recreate browser for fresh start with rotated proxy
                 try:
                     await page.close()
                     await context.close()
@@ -445,7 +589,8 @@ async def scrape_indeed_playwright(
                 except:
                     pass
                 
-                browser, context = await get_browser(force_new=True)
+                # Rotate proxy on Cloudflare block
+                browser, context = await get_browser(force_new=True, rotate_proxy=True)
                 page = await context.new_page()
                 cloudflare_retries += 1
                 
@@ -472,14 +617,15 @@ async def scrape_indeed_playwright(
                 cloudflare_retries += 1
                 await asyncio.sleep(random.uniform(2.0, 4.0))
                 
-                # Recreate browser
+                # Recreate browser with rotated proxy
                 try:
                     await page.close()
                     await context.close()
                     await browser.close()
                     _browser = None
                     _context = None
-                    browser, context = await get_browser(force_new=True)
+                    # Rotate proxy on navigation error
+                    browser, context = await get_browser(force_new=True, rotate_proxy=True)
                     page = await context.new_page()
                 except:
                     pass

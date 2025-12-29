@@ -18,7 +18,8 @@ class Settings(BaseSettings):
     BACKOFF_MAX: float = 8.0  # Max backoff between Cloudflare retries
     # Proxy configuration - supports multiple proxies for rotation
     # Format: comma-separated list of proxy URLs: http://user:pass@host:port
-    PROXY_URLS: str = "http://ydgjcfkg:akhpmonf8vdj@142.111.48.253:7030,http://ydgjcfkg:akhpmonf8vdj@142.111.67.146:5611,http://ydgjcfkg:akhpmonf8vdj@142.147.128.93:6593"  # Add more proxies separated by commas
+    # http://oliqrnln:crmu361j609a@142.111.48.253:7030,http://oliqrnln:crmu361j609a@107.172.163.27:6543,http://oliqrnln:crmu361j609a@198.23.239.134:6540
+    PROXY_URLS: str = "http://oliqrnln:crmu361j609a@64.137.96.74:6641,http://oliqrnln:crmu361j609a@84.247.60.125:6095"  # Add more proxies separated by commas
     PROXY_ROTATION_INTERVAL: int = 240  # Rotate proxy every 240 seconds (4 minutes)
     
     # Legacy single proxy support (deprecated, use PROXY_URLS instead)
