@@ -369,8 +369,26 @@ async def scrape_indeed_playwright(
                             await page.goto(url, wait_until="commit", timeout=commit_timeout)
                             print("✓ Navigation started (commit)")
                             # Give it more time to load after commit
-                            await page.wait_for_timeout(10000)  # Increased from 5s
-                            navigation_success = True
+                            await page.wait_for_timeout(15000)  # Increased to 15s
+                            
+                            # Verify page actually loaded content (not just committed)
+                            try:
+                                content_check = await page.content()
+                                if len(content_check) < 100:
+                                    # Page committed but no content - likely still loading or error
+                                    print("⚠️  Page committed but content is empty, waiting more...")
+                                    await page.wait_for_timeout(10000)
+                                    # Check again
+                                    content_check = await page.content()
+                                    if len(content_check) < 100:
+                                        print("⚠️  Page still has no content after extended wait")
+                                        navigation_success = False
+                                    else:
+                                        navigation_success = True
+                                else:
+                                    navigation_success = True
+                            except Exception:
+                                navigation_success = True  # Assume success if we can't check
                         except Exception as nav_error3:
                             # All strategies failed, but check if we got any content
                             print(f"⚠️  All navigation strategies failed, checking if we got content anyway...")
@@ -411,6 +429,49 @@ async def scrape_indeed_playwright(
                 # Get page content to check for Cloudflare
                 page_html = await page.content()
                 
+                # Check if page has any content at all (before other checks)
+                if len(page_html) < 100:
+                    print(f"⚠️  Warning: Page content is very short ({len(page_html)} chars)")
+                    current_url = page.url
+                    
+                    # Check for Chrome error pages first
+                    if 'chrome-error://' in current_url or 'chromewebdata' in current_url:
+                        # This will be handled below
+                        pass
+                    elif not navigation_success:
+                        # Page loaded but has no content - might need to wait more or retry
+                        print("⚠️  Page loaded but has no content, waiting more...")
+                        await page.wait_for_timeout(10000)
+                        page_html = await page.content()  # Refresh content
+                        if len(page_html) < 100:
+                            # Still no content - likely a proxy issue, rotate and retry
+                            proxy_urls = _get_proxy_urls()
+                            if proxy_urls and len(proxy_urls) > 1 and cloudflare_retries < max_retries:
+                                print("🔄 No content detected, rotating proxy and retrying...")
+                                try:
+                                    proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                                    proxy_manager.rotate_proxy(force=True)
+                                    print(f"✓ Rotated to next proxy: {proxy_manager._mask_proxy(proxy_manager.get_current_proxy())}")
+                                    
+                                    # Close and recreate browser
+                                    try:
+                                        await page.close()
+                                        await context.close()
+                                        await browser.close()
+                                        _browser = None
+                                        _context = None
+                                    except:
+                                        pass
+                                    
+                                    await asyncio.sleep(2)
+                                    browser, context = await get_browser(force_new=True)
+                                    page = await context.new_page()
+                                    cloudflare_retries += 1
+                                    await asyncio.sleep(3)
+                                    continue  # Retry navigation
+                                except Exception as proxy_err:
+                                    print(f"⚠️  Error rotating proxy: {proxy_err}")
+                
                 # Debug: Check page title and URL to see what we actually got
                 try:
                     page_title = await page.title()
@@ -439,6 +500,9 @@ async def scrape_indeed_playwright(
                                 except:
                                     pass
                                 
+                                # Wait a bit before creating new browser
+                                await asyncio.sleep(2)
+                                
                                 browser, context = await get_browser(force_new=True)
                                 page = await context.new_page()
                                 
@@ -446,9 +510,11 @@ async def scrape_indeed_playwright(
                                 if cloudflare_retries < max_retries:
                                     cloudflare_retries += 1
                                     print(f"🔄 Retrying navigation with new proxy (attempt {cloudflare_retries + 1}/{max_retries + 1})...")
+                                    # Wait a bit before retrying
+                                    await asyncio.sleep(3)
                                     continue  # Retry the navigation loop
                                 else:
-                                    raise Exception(f"Chrome error page after {max_retries} proxy rotations. Proxy may be blocked or network issue.")
+                                    raise Exception(f"Chrome error page after {max_retries} proxy rotations. All proxies may be blocked or network issue.")
                             except Exception as proxy_rotate_err:
                                 print(f"⚠️  Error rotating proxy: {proxy_rotate_err}")
                                 raise Exception(f"Chrome error page - network/proxy failure. Error: {proxy_rotate_err}")
