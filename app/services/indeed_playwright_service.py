@@ -457,6 +457,17 @@ async def scrape_indeed_playwright(
                 
                 print(f"⚠️  [PLAYWRIGHT] Cloudflare detected, retry {cloudflare_retries + 1}/{max_retries}, waiting {backoff:.1f}s...")
                 
+                # Rotate proxy when Cloudflare is detected (proxy is likely blocked)
+                proxy_urls = _get_proxy_urls()
+                if proxy_urls and len(proxy_urls) > 1:
+                    try:
+                        proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                        print(f"🔄 Rotating proxy due to Cloudflare block...")
+                        proxy_manager.rotate_proxy(force=True)  # Force rotation regardless of interval
+                        print(f"✓ Rotated to next proxy: {proxy_manager._mask_proxy(proxy_manager.get_current_proxy())}")
+                    except Exception as proxy_rotate_err:
+                        print(f"⚠️  Error rotating proxy: {proxy_rotate_err}")
+                
                 # Perform human-like interactions
                 if getattr(settings, "HUMANIZE", True):
                     await _perform_human_interactions_playwright(page)
@@ -476,7 +487,7 @@ async def scrape_indeed_playwright(
                 except Exception as cleanup_err:
                     print(f"⚠️  [PLAYWRIGHT] Error during cleanup: {cleanup_err}")
                 
-                # Create new browser for retry
+                # Create new browser for retry (will use rotated proxy)
                 browser, context = await get_browser(force_new=True)
                 page = await context.new_page()
                 
@@ -504,10 +515,22 @@ async def scrape_indeed_playwright(
                             is_actually_blocked = False
                             break
                         else:
-                            # Unknown timeout - retry
+                            # Unknown timeout - retry (could be proxy issue)
                             if cloudflare_retries >= max_retries:
                                 raise Exception(f"Navigation timeout after {max_retries} retries. This may indicate: 1) Slow network 2) Cloudflare blocking 3) Proxy issues. Error: {nav_error}")
                             print(f"⚠️  [PLAYWRIGHT] Navigation timeout, retry {cloudflare_retries + 1}/{max_retries}...")
+                            
+                            # Rotate proxy on timeout (could be proxy issue)
+                            proxy_urls = _get_proxy_urls()
+                            if proxy_urls and len(proxy_urls) > 1:
+                                try:
+                                    proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                                    print(f"🔄 Rotating proxy due to timeout...")
+                                    proxy_manager.rotate_proxy(force=True)
+                                    print(f"✓ Rotated to next proxy: {proxy_manager._mask_proxy(proxy_manager.get_current_proxy())}")
+                                except Exception as proxy_rotate_err:
+                                    print(f"⚠️  Error rotating proxy: {proxy_rotate_err}")
+                            
                             cloudflare_retries += 1
                             await asyncio.sleep(random.uniform(3.0, 6.0))
                             # Recreate browser for retry
@@ -529,6 +552,18 @@ async def scrape_indeed_playwright(
                 if cloudflare_retries >= max_retries:
                     raise Exception(f"Navigation failed after {max_retries} retries: {nav_error}")
                 print(f"⚠️  [PLAYWRIGHT] Navigation error: {nav_error}, retrying...")
+                
+                # Rotate proxy on navigation errors (could be proxy issue)
+                proxy_urls = _get_proxy_urls()
+                if proxy_urls and len(proxy_urls) > 1:
+                    try:
+                        proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                        print(f"🔄 Rotating proxy due to navigation error...")
+                        proxy_manager.rotate_proxy(force=True)
+                        print(f"✓ Rotated to next proxy: {proxy_manager._mask_proxy(proxy_manager.get_current_proxy())}")
+                    except Exception as proxy_rotate_err:
+                        print(f"⚠️  Error rotating proxy: {proxy_rotate_err}")
+                
                 cloudflare_retries += 1
                 await asyncio.sleep(random.uniform(2.0, 5.0))
                 
