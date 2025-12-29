@@ -77,6 +77,18 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
     
+    # Check if we need to rotate proxy
+    proxy_urls = _get_proxy_urls()
+    if proxy_urls and len(proxy_urls) > 1:
+        try:
+            proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+            if proxy_manager.should_rotate():
+                print("⏰ Proxy rotation interval reached, creating new browser with next proxy...")
+                force_new = True
+                proxy_manager.rotate_proxy()
+        except Exception as e:
+            print(f"⚠️  Error checking proxy rotation: {e}")
+    
     if _browser and not force_new:
         try:
             # Check if browser is still alive
@@ -89,13 +101,12 @@ async def get_browser(force_new: bool = False) -> tuple[Browser, BrowserContext]
     
     # Get proxy configuration
     proxy_config = None
-    proxy_urls = _get_proxy_urls()
     if proxy_urls:
         try:
             # Initialize proxy manager with all available proxies
             proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
             
-            # Get the current proxy to use
+            # Get the current proxy to use (after potential rotation)
             proxy_raw = proxy_manager.get_current_proxy()
             print(f"🔄 Using proxy: {proxy_manager._mask_proxy(proxy_raw)}")
             
@@ -544,10 +555,43 @@ async def scrape_indeed_playwright(
         
         print(f"📋 Found {len(job_cards)} job cards")
         
+        # Save the search results URL for navigation after proxy rotation
+        search_results_url = page.url
+        
         # Extract job data from listing page
         jobs = []
         for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
             try:
+                # Check if we need to rotate proxy before processing each job
+                proxy_urls = _get_proxy_urls()
+                if proxy_urls and len(proxy_urls) > 1:
+                    try:
+                        proxy_manager = get_proxy_manager(proxy_urls, getattr(settings, "PROXY_ROTATION_INTERVAL", 240))
+                        if proxy_manager.should_rotate():
+                            print("⏰ Rotating proxy before processing next job...")
+                            proxy_manager.rotate_proxy()
+                            # Close current browser and create new one with rotated proxy
+                            try:
+                                await page.close()
+                                await context.close()
+                                await browser.close()
+                            except:
+                                pass
+                            _browser = None
+                            _context = None
+                            browser, context = await get_browser(force_new=True)
+                            page = await context.new_page()
+                            # Navigate back to search results page
+                            await page.goto(search_results_url, wait_until="domcontentloaded", timeout=30000)
+                            # Re-parse the page to get fresh job cards
+                            await _progressive_scroll_playwright(page)
+                            content = await page.content()
+                            soup = BeautifulSoup(content, "html.parser")
+                            job_cards = _find_job_cards_indeed(soup)
+                            print(f"✓ New browser created with rotated proxy, navigated back and refreshed job cards")
+                    except Exception as proxy_err:
+                        print(f"⚠️  Error checking proxy rotation: {proxy_err}")
+                
                 job = _extract_job_from_card(card, query, location)
                 if job and job.title and job.url:
                     # Enhanced extraction: Visit individual job page for complete data
