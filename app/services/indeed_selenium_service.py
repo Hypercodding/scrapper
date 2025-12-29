@@ -835,19 +835,38 @@ def get_driver(force_new: bool = False):
                 for retry in range(max_retries):
                     service = None  # Track service for cleanup
                     try:
+                        # Enable verbose logging for ChromeDriver to help diagnose issues
+                        # Note: In newer Selenium versions, log_output must be a file object or None
+                        log_file = None
+                        log_file_path = f"/tmp/chromedriver_{os.getpid()}_{retry}.log"
+                        try:
+                            # Try to open log file for writing (Selenium expects file object)
+                            log_file = open(log_file_path, 'w', encoding='utf-8')
+                            print(f"   ChromeDriver logs: {log_file_path}")
+                        except Exception as log_err:
+                            # If we can't create log file, disable logging
+                            print(f"   ⚠️  Could not create log file: {log_err}")
+                            log_file = None
+                        
+                        # Create Service with log_output in constructor (more reliable)
                         if use_webdriver_manager and not chromedriver_path:
                             # Use webdriver_manager to get the right ChromeDriver version
-                            service = Service(ChromeDriverManager().install())
+                            if log_file:
+                                service = Service(ChromeDriverManager().install(), log_output=log_file)
+                            else:
+                                service = Service(ChromeDriverManager().install())
                             print(f"   ChromeDriver installed via webdriver_manager")
                         else:
-                            service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
-                        
-                        # Enable verbose logging for ChromeDriver to help diagnose issues
-                        if hasattr(service, 'log_output'):
-                            # Create a log file for this attempt
-                            log_file = f"/tmp/chromedriver_{os.getpid()}_{retry}.log"
-                            service.log_output = log_file
-                            print(f"   ChromeDriver logs: {log_file}")
+                            if chromedriver_path:
+                                if log_file:
+                                    service = Service(executable_path=chromedriver_path, log_output=log_file)
+                                else:
+                                    service = Service(executable_path=chromedriver_path)
+                            else:
+                                if log_file:
+                                    service = Service(log_output=log_file)
+                                else:
+                                    service = Service()
                         
                         print(f"   Attempting Chrome initialization (attempt {retry + 1}/{max_retries})...")
                         print(f"   Chrome path: {chrome_path or 'auto-detect'}")
@@ -863,7 +882,24 @@ def get_driver(force_new: bool = False):
                         print(f"   ChromeDriver path: {chromedriver_path or 'auto-detect'}")
                         
                         # Create driver
-                        temp_driver = webdriver.Chrome(service=service, options=chrome_options)
+                        try:
+                            temp_driver = webdriver.Chrome(service=service, options=chrome_options)
+                        except Exception as driver_err:
+                            # Close log file if it was opened before re-raising
+                            if log_file and hasattr(log_file, 'close') and not log_file.closed:
+                                try:
+                                    log_file.close()
+                                except:
+                                    pass
+                            raise driver_err
+                        
+                        # After successful driver creation, close the log file handle
+                        # The Service object will continue writing to the file, but we release our handle
+                        if log_file and hasattr(log_file, 'close') and not log_file.closed:
+                            try:
+                                log_file.close()
+                            except:
+                                pass
                         
                         # ===== CRITICAL: Configure connection pool to prevent exhaustion =====
                         configure_driver_connection_pool(temp_driver)
@@ -960,12 +996,28 @@ def get_driver(force_new: bool = False):
                             log_info = ""
                             if service and hasattr(service, 'log_output') and service.log_output:
                                 log_file = service.log_output
-                                if os.path.exists(log_file):
+                                # log_output can be either a file object or a string path
+                                log_file_path = None
+                                
+                                if isinstance(log_file, str):
+                                    # It's a string path
+                                    log_file_path = log_file
+                                elif hasattr(log_file, 'name'):
+                                    # It's a file object, get its path
+                                    log_file_path = log_file.name
+                                    # Close the file if it's still open
                                     try:
-                                        with open(log_file, 'r') as f:
+                                        if not log_file.closed:
+                                            log_file.close()
+                                    except:
+                                        pass
+                                
+                                if log_file_path and os.path.exists(log_file_path):
+                                    try:
+                                        with open(log_file_path, 'r') as f:
                                             log_content = f.read()
                                             if log_content:
-                                                print(f"   ChromeDriver log file: {log_file}")
+                                                print(f"   ChromeDriver log file: {log_file_path}")
                                                 # Show last 20 lines of log
                                                 log_lines = log_content.strip().split('\n')
                                                 if len(log_lines) > 20:
@@ -976,7 +1028,7 @@ def get_driver(force_new: bool = False):
                                                     print(f"   ChromeDriver log content:")
                                                     for line in log_lines:
                                                         print(f"      {line}")
-                                                log_info = f" Check ChromeDriver log: {log_file}"
+                                                log_info = f" Check ChromeDriver log: {log_file_path}"
                                     except Exception as log_error:
                                         print(f"   ⚠️  Could not read ChromeDriver log: {log_error}")
                             
