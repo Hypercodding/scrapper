@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     # Proxy configuration - supports multiple proxies for rotation
     # Format: comma-separated list of proxy URLs: http://user:pass@host:port
     # http://oliqrnln:crmu361j609a@142.111.48.253:7030,http://oliqrnln:crmu361j609a@107.172.163.27:6543,http://oliqrnln:crmu361j609a@198.23.239.134:6540
-    PROXY_URLS: str = "http://oliqrnln:crmu361j609a@64.137.96.74:6641,http://oliqrnln:crmu361j609a@84.247.60.125:6095"  # Add more proxies separated by commas
+    # Note: Webshare proxies - ensure bandwidth is available on your account
+    # Error 402 = bandwidth limit exceeded, need to add credits or wait for reset
+    # Leave empty to use direct connection (your home IP - often works better than datacenter proxies)
+    PROXY_URLS: str = ""  # Add proxies separated by commas, or leave empty for direct connection
     PROXY_ROTATION_INTERVAL: int = 240  # Rotate proxy every 240 seconds (4 minutes)
     
     # Legacy single proxy support (deprecated, use PROXY_URLS instead)

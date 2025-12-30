@@ -28,6 +28,13 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     print("⚠️  Playwright not installed. Install with: pip install playwright && python -m playwright install chromium")
 
+try:
+    from playwright_stealth import stealth_async
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
+    print("ℹ️  playwright-stealth not installed. Install with: pip install playwright-stealth")
+
 
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
@@ -244,52 +251,63 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
     
     _context = await _browser.new_context(**context_options)
     
-    # Enhanced stealth script to hide automation (similar to selenium-stealth)
-    await _context.add_init_script("""
-        // Hide webdriver property
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        
-        // Add plugins
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-        
-        // Set languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-        
-        // Add chrome runtime
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-        
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-        
-        // Mock platform
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-        
-        // Mock hardware concurrency
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
-        });
-        
-        // Mock device memory
-        Object.defineProperty(navigator, 'deviceMemory', {
-            get: () => 8
-        });
-    """)
+    # Apply comprehensive stealth using playwright-stealth library
+    # This handles: webdriver, plugins, languages, chrome runtime, permissions,
+    # WebGL vendor/renderer, canvas fingerprint, and many more detection vectors
+    if STEALTH_AVAILABLE:
+        # Create a temporary page to apply stealth to context
+        temp_page = await _context.new_page()
+        await stealth_async(temp_page)
+        await temp_page.close()
+        print("✓ Playwright-stealth applied (comprehensive anti-detection)")
+    else:
+        # Fallback to basic stealth script if playwright-stealth not available
+        print("ℹ️  Using basic stealth (install playwright-stealth for better detection avoidance)")
+        await _context.add_init_script("""
+            // Hide webdriver property
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            
+            // Add plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // Set languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            
+            // Add chrome runtime
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+            
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Mock platform
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'Win32'
+            });
+            
+            // Mock hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8
+            });
+            
+            // Mock device memory
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8
+            });
+        """)
     
     return _browser, _context
 
@@ -386,6 +404,9 @@ async def scrape_indeed_playwright(
     
     try:
         page: Page = await context.new_page()
+        # Apply stealth to the scraping page
+        if STEALTH_AVAILABLE:
+            await stealth_async(page)
     except Exception as page_error:
         error_msg = f"Failed to create page: {str(page_error)}"
         print(f"❌ {error_msg}")
@@ -592,6 +613,8 @@ async def scrape_indeed_playwright(
                 # Rotate proxy on Cloudflare block
                 browser, context = await get_browser(force_new=True, rotate_proxy=True)
                 page = await context.new_page()
+                if STEALTH_AVAILABLE:
+                    await stealth_async(page)
                 cloudflare_retries += 1
                 
             except CloudflareBlockedError:
@@ -627,6 +650,8 @@ async def scrape_indeed_playwright(
                     # Rotate proxy on navigation error
                     browser, context = await get_browser(force_new=True, rotate_proxy=True)
                     page = await context.new_page()
+                    if STEALTH_AVAILABLE:
+                        await stealth_async(page)
                 except:
                     pass
         
