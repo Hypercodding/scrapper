@@ -26,12 +26,16 @@ logger = logging.getLogger(__name__)
 # Railway-appropriate timeouts (in seconds)
 SCRAPE_TIMEOUT = 600  # 10 minutes - reasonable for complex scraping
 CLEANUP_TIMEOUT = 30  # 30 seconds for cleanup operations
-LOCK_ACQUIRE_TIMEOUT = 60  # 1 minute to wait for lock (prevents indefinite blocking)
+# Increased timeout - allows many requests to queue and wait for their turn
+# For 40 requests @ ~2min each = ~80 min max queue time, but most complete faster
+LOCK_ACQUIRE_TIMEOUT = 1800  # 30 minutes - allows deep request queuing
 
 # Global execution lock - ensures only one scrape runs at a time
 _execution_lock = asyncio.Lock()
 _current_task: Optional[asyncio.Task] = None
 _task_start_time: Optional[float] = None
+_queue_count: int = 0  # Track how many requests are waiting
+_completed_count: int = 0  # Track completed requests for stats
 
 T = TypeVar('T')
 
@@ -53,13 +57,22 @@ async def scrape_execution_context():
     
     Enforces single-concurrency: only one scrape can run at a time.
     Automatically handles cleanup and timeout.
+    Requests queue up and wait for their turn (up to LOCK_ACQUIRE_TIMEOUT).
     
     Usage:
         async with scrape_execution_context():
             # Perform scraping here
             result = await scrape_function()
     """
-    global _current_task, _task_start_time
+    global _current_task, _task_start_time, _queue_count, _completed_count
+    
+    # Track queue position
+    _queue_count += 1
+    queue_position = _queue_count
+    wait_start = time.time()
+    
+    if _execution_lock.locked():
+        logger.info(f"📋 Request queued (position: {queue_position}, waiting for lock...)")
     
     # Try to acquire lock with timeout
     try:
@@ -68,17 +81,24 @@ async def scrape_execution_context():
             timeout=LOCK_ACQUIRE_TIMEOUT
         )
         if not acquired:
+            _queue_count -= 1
             raise ScrapeInProgressError(
                 f"Could not acquire execution lock within {LOCK_ACQUIRE_TIMEOUT}s. "
                 "Another scrape may be in progress."
             )
     except asyncio.TimeoutError:
+        _queue_count -= 1
         raise ScrapeInProgressError(
-            f"Timeout waiting for execution lock. Another scrape is likely still running."
+            f"Timeout waiting for execution lock after {LOCK_ACQUIRE_TIMEOUT}s. Queue may be very long."
         )
     
+    wait_time = time.time() - wait_start
     _task_start_time = time.time()
-    logger.info("🔒 Scrape execution lock acquired - starting scrape")
+    
+    if wait_time > 1:
+        logger.info(f"🔒 Scrape execution lock acquired after {wait_time:.1f}s wait - starting scrape")
+    else:
+        logger.info("🔒 Scrape execution lock acquired - starting scrape")
     
     try:
         # Verify no browser processes before starting (safety check)
@@ -116,11 +136,18 @@ async def scrape_execution_context():
             except Exception:
                 pass
         
-        # Release lock
+        # Release lock and update counters
         _execution_lock.release()
+        _queue_count -= 1
+        _completed_count += 1
         elapsed = time.time() - (_task_start_time or time.time())
         _task_start_time = None
-        logger.info(f"🔓 Scrape execution lock released (elapsed: {elapsed:.1f}s)")
+        
+        remaining = _queue_count
+        if remaining > 0:
+            logger.info(f"🔓 Scrape completed (elapsed: {elapsed:.1f}s) - {remaining} request(s) still waiting")
+        else:
+            logger.info(f"🔓 Scrape completed (elapsed: {elapsed:.1f}s) - queue empty")
         
         # Small delay to ensure system resources are fully released
         await asyncio.sleep(1.0)
@@ -209,8 +236,10 @@ def get_execution_status() -> dict:
         Dictionary with status information:
         - is_locked: Whether a scrape is currently running
         - elapsed_time: How long the current scrape has been running (if any)
+        - queue_count: Number of requests waiting in queue
+        - completed_count: Total completed requests
     """
-    global _task_start_time
+    global _task_start_time, _queue_count, _completed_count
     
     is_locked = _execution_lock.locked()
     elapsed = None
@@ -222,7 +251,11 @@ def get_execution_status() -> dict:
         "is_locked": is_locked,
         "scrape_in_progress": is_locked,
         "elapsed_seconds": elapsed,
-        "timeout_seconds": SCRAPE_TIMEOUT
+        "timeout_seconds": SCRAPE_TIMEOUT,
+        "queue_count": _queue_count,
+        "waiting_requests": max(0, _queue_count - (1 if is_locked else 0)),
+        "completed_total": _completed_count,
+        "lock_acquire_timeout": LOCK_ACQUIRE_TIMEOUT
     }
 
 

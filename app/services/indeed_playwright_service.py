@@ -29,10 +29,30 @@ except ImportError:
     print("⚠️  Playwright not installed. Install with: pip install playwright && python -m playwright install chromium")
 
 try:
-    from playwright_stealth import stealth_async
+    from playwright_stealth import Stealth
     STEALTH_AVAILABLE = True
+    # Create a global stealth instance with comprehensive settings
+    _stealth = Stealth(
+        chrome_app=True,
+        chrome_csi=True,
+        chrome_load_times=True,
+        chrome_runtime=True,  # Enable chrome.runtime
+        navigator_webdriver=True,
+        navigator_plugins=True,
+        navigator_languages=True,
+        navigator_platform=True,
+        navigator_vendor=True,
+        navigator_user_agent=True,
+        navigator_hardware_concurrency=True,
+        navigator_permissions=True,
+        webgl_vendor=True,
+        media_codecs=True,
+        hairline=True,
+        iframe_content_window=True,
+    )
 except ImportError:
     STEALTH_AVAILABLE = False
+    _stealth = None
     print("ℹ️  playwright-stealth not installed. Install with: pip install playwright-stealth")
 
 
@@ -254,11 +274,9 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
     # Apply comprehensive stealth using playwright-stealth library
     # This handles: webdriver, plugins, languages, chrome runtime, permissions,
     # WebGL vendor/renderer, canvas fingerprint, and many more detection vectors
-    if STEALTH_AVAILABLE:
-        # Create a temporary page to apply stealth to context
-        temp_page = await _context.new_page()
-        await stealth_async(temp_page)
-        await temp_page.close()
+    if STEALTH_AVAILABLE and _stealth:
+        # Apply stealth to the context - all pages will inherit stealth settings
+        await _stealth.apply_stealth_async(_context)
         print("✓ Playwright-stealth applied (comprehensive anti-detection)")
     else:
         # Fallback to basic stealth script if playwright-stealth not available
@@ -404,9 +422,7 @@ async def scrape_indeed_playwright(
     
     try:
         page: Page = await context.new_page()
-        # Apply stealth to the scraping page
-        if STEALTH_AVAILABLE:
-            await stealth_async(page)
+        # Stealth is already applied to context, no need to apply to individual pages
     except Exception as page_error:
         error_msg = f"Failed to create page: {str(page_error)}"
         print(f"❌ {error_msg}")
@@ -613,8 +629,7 @@ async def scrape_indeed_playwright(
                 # Rotate proxy on Cloudflare block
                 browser, context = await get_browser(force_new=True, rotate_proxy=True)
                 page = await context.new_page()
-                if STEALTH_AVAILABLE:
-                    await stealth_async(page)
+                # Stealth is already applied to context
                 cloudflare_retries += 1
                 
             except CloudflareBlockedError:
@@ -650,8 +665,7 @@ async def scrape_indeed_playwright(
                     # Rotate proxy on navigation error
                     browser, context = await get_browser(force_new=True, rotate_proxy=True)
                     page = await context.new_page()
-                    if STEALTH_AVAILABLE:
-                        await stealth_async(page)
+                    # Stealth is already applied to context
                 except:
                     pass
         
