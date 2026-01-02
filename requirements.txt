@@ -16,6 +16,7 @@ psutil==6.1.0
 
 # Playwright (alternative to Selenium - more stable, no ChromeDriver issues)
 playwright>=1.40.0
+playwright-stealth>=2.0.0  # Anti-detection for Playwright
 
 # Optional: network interception
 selenium-wire>=5,<6

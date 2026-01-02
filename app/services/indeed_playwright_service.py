@@ -50,10 +50,15 @@ try:
         hairline=True,
         iframe_content_window=True,
     )
-except ImportError:
+    print("✓ playwright-stealth loaded successfully")
+except ImportError as ie:
     STEALTH_AVAILABLE = False
     _stealth = None
-    print("ℹ️  playwright-stealth not installed. Install with: pip install playwright-stealth")
+    print(f"ℹ️  playwright-stealth not installed: {ie}. Install with: pip install playwright-stealth")
+except Exception as stealth_error:
+    STEALTH_AVAILABLE = False
+    _stealth = None
+    print(f"⚠️  Error initializing playwright-stealth: {stealth_error}")
 
 
 _browser: Optional[Browser] = None
@@ -379,7 +384,8 @@ async def scrape_indeed_playwright(
     salary_max: Optional[int] = None,
     experience_level: Optional[str] = None,
     employment_type: Optional[str] = None,
-    days_old: Optional[int] = None
+    days_old: Optional[int] = None,
+    fetch_full_details: bool = True  # Set to False for faster scraping (skip job detail pages)
 ) -> List[Job]:
     """
     Scrape Indeed jobs using Playwright.
@@ -685,21 +691,39 @@ async def scrape_indeed_playwright(
         
         # Extract job data from listing page
         jobs = []
+        browser_alive = True  # Track if browser is still usable
+        
+        if not fetch_full_details:
+            print("ℹ️  Fast mode: skipping job detail pages (using search results data only)")
+        
         for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
             try:
                 job = _extract_job_from_card(card, query, location)
                 if job and job.title and job.url:
                     # Enhanced extraction: Visit individual job page for complete data
-                    print(f"  → Fetching complete data from job page: {job.title}")
-                    try:
-                        enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job, original_search_url)
-                        if enhanced_job:
-                            job = enhanced_job
-                        # Add delay to be respectful to Indeed's servers
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
-                    except Exception as enhance_error:
-                        print(f"⚠️  Error enhancing job details: {enhance_error}")
-                        # Continue with basic job data if enhancement fails
+                    # Only attempt if browser is still alive AND fetch_full_details is True
+                    if fetch_full_details and browser_alive:
+                        print(f"  → Fetching complete data from job page: {job.title}")
+                        try:
+                            # Check if page is still connected before navigating
+                            if page.is_closed():
+                                print("  ⚠️  Page was closed - skipping job detail extraction for remaining jobs")
+                                browser_alive = False
+                            else:
+                                enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job, original_search_url)
+                                if enhanced_job:
+                                    job = enhanced_job
+                                # Add delay to be respectful to Indeed's servers
+                                await asyncio.sleep(random.uniform(1.5, 3.0))
+                        except Exception as enhance_error:
+                            error_msg = str(enhance_error).lower()
+                            if "closed" in error_msg or "target" in error_msg:
+                                # Browser/page was closed - stop trying to navigate
+                                print(f"  ⚠️  Browser closed during job detail extraction - using basic data for remaining jobs")
+                                browser_alive = False
+                            else:
+                                print(f"  ⚠️  Error enhancing job details: {enhance_error}")
+                            # Continue with basic job data if enhancement fails
                     
                     # Apply filters
                     if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):

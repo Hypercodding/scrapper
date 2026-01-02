@@ -207,6 +207,7 @@ async def get_indeed_playwright_jobs(
     employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
     days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
     max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+    fetch_full_details: bool = Query(True, description="Fetch full job details by visiting each job page (slower but more data). Set to false for faster scraping (~5s vs ~50s)"),
 ):
     """
     Get jobs from Indeed using Playwright (More stable alternative to Selenium)
@@ -278,7 +279,8 @@ async def get_indeed_playwright_jobs(
         async with scrape_execution_context():
             jobs = await scrape_indeed_playwright(
                 query, location, max_results, job_type,
-                salary_min, salary_max, experience_level, employment_type, days_old
+                salary_min, salary_max, experience_level, employment_type, days_old,
+                fetch_full_details=fetch_full_details
             )
     except ScrapeInProgressError as e:
         raise HTTPException(
