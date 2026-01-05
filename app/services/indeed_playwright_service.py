@@ -14,7 +14,8 @@ import time
 import random
 import asyncio
 import re
-from typing import Optional, List, Dict
+import atexit
+from typing import Optional, List, Dict, Set
 from urllib.parse import quote_plus, urlparse
 from bs4 import BeautifulSoup
 from app.models.job_model import Job
@@ -22,7 +23,7 @@ from app.core.config import settings
 from app.core.proxy_manager import ProxyManager
 
 try:
-    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -61,11 +62,21 @@ except Exception as stealth_error:
     print(f"⚠️  Error initializing playwright-stealth: {stealth_error}")
 
 
+# Global browser resources - properly managed to prevent resource leaks
+_playwright: Optional["Playwright"] = None
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
 _proxy_manager: Optional[ProxyManager] = None
 _current_proxy: Optional[str] = None
 _last_fetch = 0
+_active_pages: Set[int] = set()  # Track active page IDs
+_resource_lock = asyncio.Lock() if PLAYWRIGHT_AVAILABLE else None  # Lock for resource management
+_max_pages_per_context = 5  # Maximum concurrent pages
+_browser_creation_count = 0  # Track how many times browser was created
+_last_cleanup_time = 0  # Last time resources were cleaned up
+_cleanup_interval = 300  # Cleanup every 5 minutes
+_scrape_count = 0  # Count of scrapes since last full cleanup
+_max_scrapes_before_cleanup = 20  # Force cleanup after this many scrapes
 
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Optional[Dict]:
@@ -171,6 +182,89 @@ class CloudflareBlockedError(Exception):
     pass
 
 
+async def _force_cleanup_all_resources():
+    """Force cleanup of all Playwright resources to prevent resource leaks."""
+    global _playwright, _browser, _context, _active_pages, _browser_creation_count, _scrape_count
+    
+    print("🧹 Force cleaning up all Playwright resources...")
+    
+    # Close all tracked pages
+    _active_pages.clear()
+    
+    # Close context
+    if _context:
+        try:
+            await _context.close()
+            print("  ✓ Context closed")
+        except Exception as e:
+            print(f"  ⚠️  Error closing context: {e}")
+        _context = None
+    
+    # Close browser
+    if _browser:
+        try:
+            await _browser.close()
+            print("  ✓ Browser closed")
+        except Exception as e:
+            print(f"  ⚠️  Error closing browser: {e}")
+        _browser = None
+    
+    # Stop playwright
+    if _playwright:
+        try:
+            await _playwright.stop()
+            print("  ✓ Playwright stopped")
+        except Exception as e:
+            print(f"  ⚠️  Error stopping playwright: {e}")
+        _playwright = None
+    
+    _browser_creation_count = 0
+    _scrape_count = 0
+    print("✓ All Playwright resources cleaned up")
+
+
+async def _check_and_cleanup_resources():
+    """Check if resources need cleanup and perform if necessary."""
+    global _last_cleanup_time, _browser_creation_count, _scrape_count
+    
+    now = time.monotonic()
+    
+    # Cleanup if:
+    # 1. Cleanup interval has passed
+    # 2. Too many browser creations (possible leak)
+    # 3. Browser is dead but playwright is alive
+    # 4. Too many scrapes since last cleanup
+    # 5. Too many active pages
+    should_cleanup = False
+    reason = ""
+    
+    if now - _last_cleanup_time > _cleanup_interval:
+        should_cleanup = True
+        reason = f"interval exceeded ({_cleanup_interval}s)"
+    
+    if _browser_creation_count > 10:
+        should_cleanup = True
+        reason = f"too many browser creations ({_browser_creation_count})"
+    
+    if _playwright and not _browser:
+        should_cleanup = True
+        reason = "orphaned playwright instance"
+    
+    if _scrape_count >= _max_scrapes_before_cleanup:
+        should_cleanup = True
+        reason = f"max scrapes reached ({_scrape_count}/{_max_scrapes_before_cleanup})"
+    
+    if len(_active_pages) > _max_pages_per_context:
+        should_cleanup = True
+        reason = f"too many active pages ({len(_active_pages)})"
+    
+    if should_cleanup:
+        print(f"🔄 Cleanup triggered: {reason}")
+        await _force_cleanup_all_resources()
+        _last_cleanup_time = now
+        _scrape_count = 0
+
+
 async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tuple[Browser, BrowserContext]:
     """
     Get or create a Playwright browser instance with stealth and proxy support.
@@ -182,10 +276,13 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
     Returns:
         Tuple of (browser, context)
     """
-    global _browser, _context
+    global _playwright, _browser, _context, _browser_creation_count, _active_pages
     
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
+    
+    # Check if we need to cleanup resources
+    await _check_and_cleanup_resources()
     
     if _browser and not force_new:
         try:
@@ -198,9 +295,16 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
                 else:
                     return _browser, _context
         except:
-            # Browser is dead, create new one
-            _browser = None
-            _context = None
+            # Browser is dead, cleanup and create new one
+            print("⚠️  Browser connection lost, cleaning up...")
+            await _force_cleanup_all_resources()
+    
+    # If force_new, cleanup existing resources first
+    if force_new:
+        await _force_cleanup_all_resources()
+    
+    # Clear active pages tracking for new browser
+    _active_pages.clear()
     
     # Get proxy configuration
     if rotate_proxy:
@@ -213,19 +317,22 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
     else:
         print("🌐 Creating browser instance (no proxy - direct connection)")
     
-    # Create new browser
-    try:
-        playwright = await async_playwright().start()
-    except Exception as playwright_error:
-        error_msg = f"Failed to start Playwright: {str(playwright_error)}"
-        print(f"❌ {error_msg}")
-        import traceback
-        print(f"   Traceback: {traceback.format_exc()}")
-        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
+    # Create new playwright instance if needed
+    if not _playwright:
+        try:
+            _playwright = await async_playwright().start()
+            _browser_creation_count += 1
+            print(f"✓ Playwright started (creation #{_browser_creation_count})")
+        except Exception as playwright_error:
+            error_msg = f"Failed to start Playwright: {str(playwright_error)}"
+            print(f"❌ {error_msg}")
+            import traceback
+            print(f"   Traceback: {traceback.format_exc()}")
+            raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     # Launch browser with optimized settings for headless mode
     try:
-        _browser = await playwright.chromium.launch(
+        _browser = await _playwright.chromium.launch(
             headless=True,
             args=[
             "--no-sandbox",
@@ -251,6 +358,8 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
         print(f"❌ {error_msg}")
         import traceback
         print(f"   Traceback: {traceback.format_exc()}")
+        # Cleanup on failure
+        await _force_cleanup_all_resources()
         raise Exception(f"{error_msg}. This usually means Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     # Get accept language with proper fallback
@@ -336,22 +445,46 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
 
 
 async def close_browser():
-    """Close the browser and clean up resources."""
-    global _browser, _context
+    """Close the browser and clean up ALL resources including Playwright instance."""
+    await _force_cleanup_all_resources()
+
+
+async def create_page_with_tracking(context: BrowserContext) -> Page:
+    """
+    Create a new page with resource tracking.
+    Ensures we don't exceed max pages per context.
+    """
+    global _active_pages
     
-    if _context:
-        try:
-            await _context.close()
-        except:
-            pass
-        _context = None
+    # Check if we have too many active pages
+    if len(_active_pages) >= _max_pages_per_context:
+        print(f"⚠️  Maximum pages ({_max_pages_per_context}) reached, cleaning up old pages...")
+        # Force cleanup and reset
+        await _force_cleanup_all_resources()
+        # Get new browser/context
+        _, context = await get_browser(force_new=True)
     
-    if _browser:
+    page = await context.new_page()
+    page_id = id(page)
+    _active_pages.add(page_id)
+    print(f"📄 Created page (active: {len(_active_pages)})")
+    return page
+
+
+async def close_page_with_tracking(page: Page):
+    """Close a page and remove from tracking."""
+    global _active_pages
+    
+    if page:
+        page_id = id(page)
         try:
-            await _browser.close()
-        except:
-            pass
-        _browser = None
+            if not page.is_closed():
+                await page.close()
+        except Exception as e:
+            print(f"⚠️  Error closing page: {e}")
+        
+        _active_pages.discard(page_id)
+        print(f"📄 Closed page (active: {len(_active_pages)})")
 
 
 def get_proxy_stats() -> Optional[Dict]:
@@ -373,6 +506,56 @@ def reset_proxy_manager_state():
     if _proxy_manager:
         _proxy_manager.reset_failures()
     _current_proxy = None
+
+
+def get_browser_resource_stats() -> Dict:
+    """
+    Get current browser resource statistics for monitoring.
+    Useful for debugging resource leaks.
+    """
+    return {
+        "playwright_active": _playwright is not None,
+        "browser_connected": _browser.is_connected() if _browser else False,
+        "context_active": _context is not None,
+        "active_pages": len(_active_pages),
+        "max_pages_per_context": _max_pages_per_context,
+        "browser_creation_count": _browser_creation_count,
+        "scrape_count": _scrape_count,
+        "max_scrapes_before_cleanup": _max_scrapes_before_cleanup,
+        "last_cleanup_time": _last_cleanup_time,
+        "cleanup_interval": _cleanup_interval,
+    }
+
+
+def _sync_cleanup_atexit():
+    """Synchronous cleanup for atexit handler."""
+    global _playwright, _browser, _context
+    
+    print("🧹 Performing atexit cleanup of Playwright resources...")
+    
+    # We can't use async in atexit, so we need to do sync cleanup
+    # This is a best-effort cleanup
+    if _context:
+        try:
+            # Try to get event loop if it exists
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is running, schedule cleanup
+                loop.create_task(_force_cleanup_all_resources())
+            else:
+                # If loop is not running, run cleanup
+                loop.run_until_complete(_force_cleanup_all_resources())
+        except Exception as e:
+            print(f"⚠️  Atexit cleanup error (expected if loop is closed): {e}")
+    
+    _context = None
+    _browser = None
+    _playwright = None
+    print("✓ Atexit cleanup completed")
+
+
+# Register cleanup on exit
+atexit.register(_sync_cleanup_atexit)
 
 
 async def scrape_indeed_playwright(
@@ -407,7 +590,11 @@ async def scrape_indeed_playwright(
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
     
-    global _last_fetch
+    global _last_fetch, _scrape_count
+    
+    # Increment scrape counter for resource management
+    _scrape_count += 1
+    print(f"🔍 Starting scrape #{_scrape_count} (cleanup threshold: {_max_scrapes_before_cleanup})")
     
     # Rate limiting
     now = time.monotonic()
@@ -417,6 +604,8 @@ async def scrape_indeed_playwright(
         await asyncio.sleep(wait)
     _last_fetch = time.monotonic()
     
+    page = None  # Initialize page variable for cleanup in finally block
+    
     try:
         browser, context = await get_browser()
     except Exception as browser_error:
@@ -424,16 +613,20 @@ async def scrape_indeed_playwright(
         print(f"❌ {error_msg}")
         import traceback
         print(f"   Traceback: {traceback.format_exc()}")
+        # Force cleanup on browser creation failure
+        await _force_cleanup_all_resources()
         raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     try:
-        page: Page = await context.new_page()
+        page = await create_page_with_tracking(context)
         # Stealth is already applied to context, no need to apply to individual pages
     except Exception as page_error:
         error_msg = f"Failed to create page: {str(page_error)}"
         print(f"❌ {error_msg}")
         import traceback
         print(f"   Traceback: {traceback.format_exc()}")
+        # Force cleanup on page creation failure
+        await _force_cleanup_all_resources()
         raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
     
     try:
@@ -623,19 +816,13 @@ async def scrape_indeed_playwright(
                 await asyncio.sleep(backoff)
                 
                 # Recreate browser for fresh start with rotated proxy
-                try:
-                    await page.close()
-                    await context.close()
-                    await browser.close()
-                    _browser = None
-                    _context = None
-                except:
-                    pass
+                # Properly close existing page and cleanup resources
+                if page:
+                    await close_page_with_tracking(page)
                 
-                # Rotate proxy on Cloudflare block
+                # Rotate proxy on Cloudflare block - force_new will cleanup old resources
                 browser, context = await get_browser(force_new=True, rotate_proxy=True)
-                page = await context.new_page()
-                # Stealth is already applied to context
+                page = await create_page_with_tracking(context)
                 cloudflare_retries += 1
                 
             except CloudflareBlockedError:
@@ -662,18 +849,13 @@ async def scrape_indeed_playwright(
                 await asyncio.sleep(random.uniform(2.0, 4.0))
                 
                 # Recreate browser with rotated proxy
-                try:
-                    await page.close()
-                    await context.close()
-                    await browser.close()
-                    _browser = None
-                    _context = None
-                    # Rotate proxy on navigation error
-                    browser, context = await get_browser(force_new=True, rotate_proxy=True)
-                    page = await context.new_page()
-                    # Stealth is already applied to context
-                except:
-                    pass
+                # Properly close existing page and cleanup resources
+                if page:
+                    await close_page_with_tracking(page)
+                
+                # Rotate proxy on navigation error - force_new will cleanup old resources
+                browser, context = await get_browser(force_new=True, rotate_proxy=True)
+                page = await create_page_with_tracking(context)
         
         # Progressive scroll to load more jobs
         await _progressive_scroll_playwright(page)
@@ -744,15 +926,22 @@ async def scrape_indeed_playwright(
         print(f"❌ Error during scraping: {error_msg}")
         import traceback
         print(f"   Full traceback:\n{traceback.format_exc()}")
+        
+        # Check for resource exhaustion errors
+        if "pthread_create" in error_msg or "Resource temporarily unavailable" in error_msg:
+            print("🚨 Resource exhaustion detected - forcing full cleanup")
+            await _force_cleanup_all_resources()
+            raise Exception(f"System resource exhaustion - browser resources have been cleaned up. Please retry the request.")
+        
         # Re-raise with more context if it's a browser-related error
         if "browser" in error_msg.lower() or "playwright" in error_msg.lower():
+            await _force_cleanup_all_resources()
             raise Exception(f"Playwright browser error: {error_msg}. Ensure Playwright browsers are installed: python -m playwright install chromium")
         raise
     finally:
-        try:
-            await page.close()
-        except:
-            pass
+        # Always close the page properly
+        if page:
+            await close_page_with_tracking(page)
 
 
 async def _progressive_scroll_playwright(page: Page):
