@@ -22,8 +22,8 @@ except ImportError:
     PlaywrightCloudflareBlockedError = None
 from app.services.ziprecruiter_service import scrape_ziprecruiter # pylint: disable=import-error
 from app.services.ziprecruiter_enhanced_service import scrape_ziprecruiter_enhanced # pylint: disable=import-error
-from app.services.simplyhired_selenium_service import (
-    scrape_simplyhired_selenium,
+from app.services.simplyhired_playwright_service import (
+    scrape_simplyhired_playwright,
     CloudflareBlockedError as SimplyHiredCloudflareBlockedError
 ) # pylint: disable=import-error
 from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
@@ -101,6 +101,24 @@ async def _execute_sync_scrape(
     async with scrape_execution_context():
         # Execute sync function in thread pool
         return await asyncio.to_thread(scrape_func, *args, **kwargs)
+
+
+async def _execute_async_scrape(
+    scrape_func: Callable,
+    *args,
+    **kwargs
+):
+    """
+    Execute an asynchronous scraping function with single-concurrency enforcement.
+    
+    This wrapper ensures:
+    1. Only one scrape runs at a time (global lock)
+    2. Cleanup happens even for async functions
+    3. Proper error handling
+    """
+    async with scrape_execution_context():
+        # Execute async function directly
+        return await scrape_func(*args, **kwargs)
 
 
 @router.get("/jobs", response_model=List[Job])
@@ -446,7 +464,7 @@ async def get_simplyhired_jobs(
     max_results: int = Query(20, description="Maximum number of results (default: 20)"),
 ):
     """
-    Get jobs from SimplyHired using enhanced browser automation (Selenium)
+    Get jobs from SimplyHired using Playwright with stealth (better Cloudflare bypass)
     
     ⭐ ENHANCED VERSION: Comprehensive data extraction and advanced filtering!
     
@@ -497,8 +515,8 @@ async def get_simplyhired_jobs(
     - 1 - Jobs posted today
     """
     try:
-        jobs = await _execute_sync_scrape(
-            scrape_simplyhired_selenium,
+        jobs = await _execute_async_scrape(
+            scrape_simplyhired_playwright,
             query, location, max_results, job_type,
             salary_min, salary_max, experience_level, employment_type, days_old
         )
