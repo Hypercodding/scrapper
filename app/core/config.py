@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # Note: Webshare proxies - ensure bandwidth is available on your account
     # Error 402 = bandwidth limit exceeded, need to add credits or wait for reset
     # Leave empty to use direct connection (your home IP - often works better than datacenter proxies)
-    PROXY_URLS: str = ""  # Add proxies separated by commas, or leave empty for direct connection
+    PROXY_URLS: str = "http://cyyjmhrh:06q82f2l9jwz@46.203.82.177:6177,http://cyyjmhrh:06q82f2l9jwz@138.226.88.238:7926,http://cyyjmhrh:06q82f2l9jwz@9.142.47.2:6171"  # Add proxies separated by commas, or leave empty for direct connection
     PROXY_ROTATION_INTERVAL: int = 240  # Rotate proxy every 240 seconds (4 minutes)
     
     # Legacy single proxy support (deprecated, use PROXY_URLS instead)
