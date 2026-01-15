@@ -1,5 +1,5 @@
 """
-Playwright-based Indeed scraper - Optimized for best performance with proxy rotation.
+Playwright-based Indeed scraper - Optimized for best performance.
 
 Benefits:
 - No ChromeDriver version issues (bundles its own browser)
@@ -8,7 +8,6 @@ Benefits:
 - Better error handling
 - Fast navigation with smart waiting strategies
 - Proxy rotation support for avoiding blocks
-- Smart proxy rotation per job fetch to avoid detection
 """
 
 import time
@@ -266,14 +265,13 @@ async def _check_and_cleanup_resources():
         _scrape_count = 0
 
 
-async def get_browser(force_new: bool = False, rotate_proxy: bool = False, new_context_only: bool = False) -> tuple[Browser, BrowserContext]:
+async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tuple[Browser, BrowserContext]:
     """
     Get or create a Playwright browser instance with stealth and proxy support.
     
     Args:
         force_new: If True, create a new browser instance
         rotate_proxy: If True, rotate to the next proxy before creating browser
-        new_context_only: If True, only create new context (for auto-rotating proxies)
         
     Returns:
         Tuple of (browser, context)
@@ -285,61 +283,6 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False, new_c
     
     # Check if we need to cleanup resources
     await _check_and_cleanup_resources()
-    
-    # If new_context_only is True and browser exists, just create new context
-    if new_context_only and _browser and _browser.is_connected():
-        # Close existing context
-        if _context:
-            try:
-                await _context.close()
-                print("  ✓ Old context closed for rotation")
-            except Exception as e:
-                print(f"  ⚠️  Error closing old context: {e}")
-        
-        # Create new context with same proxy (proxy rotates per request)
-        proxy_config = _get_current_proxy_config()
-        
-        accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
-        locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
-        
-        context_options = {
-            "viewport": {"width": 1280, "height": 720},
-            "user_agent": settings.USER_AGENT,
-            "locale": locale,
-            "timezone_id": "America/New_York",
-            "java_script_enabled": True,
-            "bypass_csp": True,
-            "ignore_https_errors": True,
-            "accept_downloads": False,
-        }
-        
-        if proxy_config:
-            context_options["proxy"] = proxy_config
-        
-        _context = await _browser.new_context(**context_options)
-        
-        # Apply stealth to new context
-        if STEALTH_AVAILABLE and _stealth:
-            await _stealth.apply_stealth_async(_context)
-        else:
-            await _context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                window.chrome = {runtime: {}, loadTimes: function() {}, csi: function() {}, app: {}};
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
-                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-            """)
-        
-        print("  ✓ New context created with proxy rotation")
-        return _browser, _context
     
     if _browser and not force_new:
         try:
@@ -935,95 +878,25 @@ async def scrape_indeed_playwright(
         if not fetch_full_details:
             print("ℹ️  Fast mode: skipping job detail pages (using search results data only)")
         
-        # NEW: Track job fetches and implement proxy rotation strategy
-        job_fetch_count = 0  # Track number of jobs fetched for proxy rotation
-        cloudflare_block_count = 0  # Track Cloudflare blocks on job pages
-        max_cloudflare_blocks = getattr(settings, "MAX_JOB_PAGE_CLOUDFLARE_BLOCKS", 3)  # Stop fetching details after N blocks
-        
-        # For rotating residential proxies (like Webshare), recreate browser per job
-        # This forces a fresh TCP connection and new IP from the proxy pool
-        use_auto_rotating_proxy = getattr(settings, "USE_AUTO_ROTATING_PROXY", True)
-        
-        # Delays configuration
-        min_delay_between_fetches = getattr(settings, "JOB_DETAIL_MIN_DELAY", 4.0)  # Longer delays for residential
-        max_delay_between_fetches = getattr(settings, "JOB_DETAIL_MAX_DELAY", 8.0)  # More variation
-        
         for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
             try:
                 job = _extract_job_from_card(card, query, location)
                 if job and job.title and job.url:
-                    # Check if we should stop fetching details due to too many Cloudflare blocks
-                    if cloudflare_block_count >= max_cloudflare_blocks:
-                        print(f"  ⚠️  Too many Cloudflare blocks ({cloudflare_block_count}) - switching to fast mode (no job detail pages)")
-                        fetch_full_details = False  # Disable detailed fetching
-                    
                     # Enhanced extraction: Visit individual job page for complete data
                     # Only attempt if browser is still alive AND fetch_full_details is True
                     if fetch_full_details and browser_alive:
                         print(f"  → Fetching complete data from job page: {job.title}")
-                        
-                        # NEW: Add delay before fetching (randomized for more human-like behavior)
-                        delay = random.uniform(min_delay_between_fetches, max_delay_between_fetches)
-                        print(f"    ⏳ Waiting {delay:.1f}s before fetch...")
-                        await asyncio.sleep(delay)
-                        
-                        # NEW: Perform human-like interactions BEFORE navigating to job page
-                        if getattr(settings, "HUMANIZE", True):
-                            try:
-                                # Scroll a bit on search results page
-                                await page.evaluate("window.scrollBy(0, Math.random() * 300)")
-                                await page.wait_for_timeout(random.uniform(500, 1000))
-                                # Move mouse randomly
-                                await page.mouse.move(
-                                    random.randint(100, 800),
-                                    random.randint(100, 500)
-                                )
-                                await page.wait_for_timeout(random.uniform(200, 500))
-                            except Exception:
-                                pass
-                        
-                        # SIMPLE APPROACH: Recreate browser to get fresh proxy connection
-                        # This forces Webshare to assign a new IP from the pool
-                        rotate_browser_per_job = getattr(settings, "ROTATE_BROWSER_PER_JOB", True)
-                        
-                        if use_auto_rotating_proxy and rotate_browser_per_job:
-                            try:
-                                print(f"    🔄 Recreating browser to force fresh proxy connection...")
-                                # Close current page
-                                await close_page_with_tracking(page)
-                                # Force new browser instance (closes all connections, gets new IP)
-                                browser, context = await get_browser(force_new=True, rotate_proxy=False)
-                                page = await create_page_with_tracking(context)
-                                print(f"    ✓ Browser recreated with fresh proxy connection")
-                                # Small delay after recreation
-                                await page.wait_for_timeout(random.uniform(1000, 2000))
-                            except Exception as browser_error:
-                                print(f"    ⚠️  Error recreating browser: {browser_error}")
-                                browser_alive = False
-                                continue
-                        
                         try:
                             # Check if page is still connected before navigating
                             if page.is_closed():
                                 print("  ⚠️  Page was closed - skipping job detail extraction for remaining jobs")
                                 browser_alive = False
                             else:
-                                enhanced_job = await _extract_complete_job_details_from_url_playwright(
-                                    page, job, original_search_url, 
-                                    skip_nav_back=use_auto_rotating_proxy and rotate_browser_per_job
-                                )
+                                enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job, original_search_url)
                                 if enhanced_job:
-                                    # Check if we got blocked (job would have Ray ID in requirements)
-                                    if enhanced_job.requirements and any('Ray ID' in str(req) for req in enhanced_job.requirements):
-                                        cloudflare_block_count += 1
-                                        print(f"    ⚠️  Cloudflare block detected (total: {cloudflare_block_count}/{max_cloudflare_blocks})")
-                                    else:
-                                        job = enhanced_job
-                                        job_fetch_count += 1
-                                
-                                # NEW: Add delay after fetching (slightly shorter than pre-fetch delay)
-                                post_fetch_delay = random.uniform(1.5, 3.0)
-                                await asyncio.sleep(post_fetch_delay)
+                                    job = enhanced_job
+                                # Add delay to be respectful to Indeed's servers
+                                await asyncio.sleep(random.uniform(1.5, 3.0))
                         except Exception as enhance_error:
                             error_msg = str(enhance_error).lower()
                             if "closed" in error_msg or "target" in error_msg:
@@ -1045,7 +918,7 @@ async def scrape_indeed_playwright(
                 print(f"⚠️  Error extracting job from card: {e}")
                 continue
         
-        print(f"✓ Extracted {len(jobs)} jobs (fetched details from {job_fetch_count} job pages)")
+        print(f"✓ Extracted {len(jobs)} jobs")
         return jobs
         
     except Exception as e:
@@ -1230,7 +1103,7 @@ def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optiona
         posted_date = _extract_posted_date_indeed(card)
         
         # Extract job description
-        description = _extract_description_indeed(card)
+        description = _extract_description_from_full_page_improved(card)
        
         # Extract job URL
         job_url = _extract_job_url_indeed(card, job_id)
@@ -2058,331 +1931,120 @@ def _extract_job_id_from_full_page(soup, url: str) -> Optional[str]:
     return None
 
 
-def _extract_company_url_from_full_page(soup, page: Page = None) -> Optional[str]:
-    """
-    Extract company URL from Indeed's full job page.
-    Indeed displays company info with links to company pages.
-    """
-    # Strategy 1: Look for company name link with data-testid
-    company_selectors = [
-        'a[data-testid="companyName"]',
-        'a[data-testid="employer-link"]',
-        'a[data-testid="inlineHeader-companyName"]',
-        'div[data-testid="inlineHeader-companyName"] a',
-    ]
-    
-    for selector in company_selectors:
-        company_elem = soup.select_one(selector)
-        if company_elem and company_elem.get('href'):
-            href = company_elem.get('href')
-            # Convert relative to absolute URL
-            if href.startswith('/'):
-                return f"https://www.indeed.com{href}"
-            elif href.startswith('http'):
-                return href
-    
-    # Strategy 2: Look for company header section
-    company_header = soup.find('div', attrs={'data-testid': re.compile(r'.*company.*', re.I)})
-    if company_header:
-        company_link = company_header.find('a', href=True)
-        if company_link:
-            href = company_link.get('href')
-            if href and ('/cmp/' in href or '/company/' in href):
-                if href.startswith('/'):
-                    return f"https://www.indeed.com{href}"
-                return href
-    
-    # Strategy 3: Look for links containing /cmp/ (Indeed's company page pattern)
-    all_links = soup.find_all('a', href=True, limit=50)  # Limit to first 50 links
-    for link in all_links:
-        href = link.get('href', '')
-        # Indeed company pages use /cmp/ pattern
-        if '/cmp/' in href or '/company/' in href:
-            # Make sure it's not a review or jobs link
-            if '/reviews' not in href and '/jobs' not in href:
-                # Check if link text looks like a company name (not too long)
-                link_text = link.get_text(strip=True)
-                if link_text and 3 < len(link_text) < 100:
-                    if href.startswith('/'):
-                        return f"https://www.indeed.com{href}"
-                    return href
-    
-    # Strategy 4: Look for company name in header and find associated link
-    company_name_elem = soup.find(['span', 'div', 'h2'], attrs={'data-testid': re.compile(r'.*company.*', re.I)})
-    if company_name_elem:
-        company_name = company_name_elem.get_text(strip=True)
-        if company_name:
-            # Find link with this company name nearby
-            parent = company_name_elem.find_parent()
-            if parent:
-                nearby_link = parent.find('a', href=True)
-                if nearby_link:
-                    href = nearby_link.get('href')
-                    if href and ('/cmp/' in href or '/company/' in href):
-                        if href.startswith('/'):
-                            return f"https://www.indeed.com{href}"
-                        return href
-    
-    # Strategy 5: Look for employer/company section by class
-    employer_selectors = [
-        'div[class*="employer"]',
-        'div[class*="company"]',
-        'div[class*="CompanyInfo"]',
-        'div[id*="company"]',
-    ]
-    
-    for selector in employer_selectors:
-        employer_div = soup.select_one(selector)
-        if employer_div:
-            employer_link = employer_div.find('a', href=True)
-            if employer_link:
-                href = employer_link.get('href')
-                if href and ('/cmp/' in href or '/company/' in href):
-                    if href.startswith('/'):
-                        return f"https://www.indeed.com{href}"
-                    return href
-    
-    return None
-
-
-async def _extract_complete_job_details_from_url_playwright(
-    page: Page, 
-    job: Job, 
-    original_search_url: Optional[str] = None,
-    skip_nav_back: bool = False
-) -> Optional[Job]:
-    """Extract complete job details by navigating to the individual job page URL with Cloudflare bypass."""
+async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job, original_search_url: Optional[str] = None) -> Optional[Job]:
+    """Extract complete job details by navigating to the individual job page URL (synchronous, one at a time)."""
     if not job.url:
         return job
     
-    # Use original search URL if provided
+    # Use original search URL if provided, otherwise try to clean current page URL
+    # The original_search_url should be the clean search results URL without any job view parameters
     if original_search_url:
+        # Use the original search URL directly (it should already be clean)
         original_url = original_search_url
     else:
+        # Fallback: try to clean current URL to remove vjk parameter
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         current_url = page.url
         parsed = urlparse(current_url)
         query_params = parse_qs(parsed.query)
+        # Remove vjk parameter if it exists (job view parameter)
         if 'vjk' in query_params:
             del query_params['vjk']
         clean_query = urlencode(query_params, doseq=True)
         original_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
     
-    max_job_retries = getattr(settings, "MAX_JOB_PAGE_RETRIES", 2)
-    job_retry_count = 0
-    
-    while job_retry_count <= max_job_retries:
+    try:
+        # Navigate to the individual job page
+        print(f"    → Navigating to: {job.url}")
+        job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 60000)  # 60 seconds default
+        await page.goto(job.url, wait_until="domcontentloaded", timeout=job_page_timeout)
+        
+        # Wait for page to load
+        await page.wait_for_timeout(random.uniform(2000, 3000))
+        
+        # Wait for job content to load
         try:
-            print(f"    → Navigating to: {job.url}")
-            
-            # CRITICAL: Set proper headers before navigation
-            # Include Referer to make it look like we came from search results
-            referer = original_search_url if original_search_url else "https://www.indeed.com/"
-            await page.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-                'Referer': referer,  # Critical: Makes it look like we came from search
-            })
-            
-            # Navigate with shorter timeout, we'll handle waiting manually
-            job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 15000)  # Reduced to 15s
-            
-            try:
-                response = await page.goto(job.url, wait_until="commit", timeout=job_page_timeout)
-                status_code = response.status if response else 0
-                print(f"    ✓ Navigation response: {status_code}")
-            except Exception as nav_err:
-                print(f"    ⚠️  Navigation timeout, continuing anyway...")
-            
-            # CRITICAL: Wait for Cloudflare challenge to complete
-            print(f"    ⏳ Waiting for page to load (checking for Cloudflare)...")
-            
-            # Strategy 1: Wait for body to appear
-            try:
-                await page.wait_for_selector('body', timeout=10000, state='attached')
-            except:
-                pass
-            
-            # Strategy 2: Check for Cloudflare challenge and wait for it to complete
-            cloudflare_detected = False
-            for attempt in range(10):  # Check for up to 10 seconds
-                page_content = await page.content()
-                page_title = await page.title()
-                
-                # Check for Cloudflare indicators
-                is_challenge = (
-                    'Checking your browser' in page_content or
-                    'Just a moment' in page_title or
-                    'challenge-platform' in page_content or
-                    'cf-challenge' in page_content.lower() or
-                    'Ray ID' in page_content
-                )
-                
-                if is_challenge:
-                    if attempt == 0:
-                        cloudflare_detected = True
-                        print(f"    🔐 Cloudflare challenge detected - waiting for completion...")
-                    
-                    # Wait and check again
-                    await asyncio.sleep(1)
-                    continue
-                else:
-                    # No challenge or challenge completed
-                    if cloudflare_detected:
-                        print(f"    ✓ Cloudflare challenge completed after {attempt}s")
-                    break
-            
-            # Wait a bit more for page to stabilize
-            await page.wait_for_timeout(random.uniform(2000, 3000))
-            
-            # Try to wait for job description content
-            try:
-                await page.wait_for_selector(
-                    'div[class*="jobsearch"], div[class*="jobDescription"], body', 
-                    timeout=8000,
-                    state='attached'
-                )
-            except:
-                print(f"    ℹ️  Timeout waiting for job content selector")
-            
-            # Get final page content
-            full_page_content = await page.content()
-            current_title = await page.title()
-            
-            # Final check for Cloudflare blocking
-            has_cloudflare_indicators = (
-                "Checking your browser" in full_page_content
-                or "Enable JavaScript and cookies to continue" in full_page_content
-                or "challenge-platform" in full_page_content
-                or "cf-browser-verification" in full_page_content
-                or "Just a moment" in current_title
-                or ("Ray ID" in full_page_content and len(full_page_content) < 5000)
-            )
-            
-            # Check for actual job content
-            has_job_content = (
-                'jobsearch-JobComponent' in full_page_content
-                or 'jobDescriptionText' in full_page_content
-                or 'job-description' in full_page_content.lower()
-                or (len(full_page_content) > 10000 and 'indeed.com' in full_page_content)
-            )
-            
-            # Determine if actually blocked
-            is_actually_blocked = has_cloudflare_indicators and not has_job_content
-            
-            if is_actually_blocked:
-                if job_retry_count >= max_job_retries:
-                    print(f"    ❌ Job page blocked by Cloudflare after {job_retry_count + 1} attempts - skipping enhanced details")
-                    return job
-                
-                # Retry with longer wait
-                backoff = random.uniform(5.0, 8.0) * (1 + job_retry_count)
-                print(f"    ⚠️  Still blocked, retry {job_retry_count + 1}/{max_job_retries}, waiting {backoff:.1f}s...")
-                
-                # Perform human interactions before retry
-                if getattr(settings, "HUMANIZE", True):
-                    await _perform_human_interactions_playwright(page)
-                
-                await asyncio.sleep(backoff)
-                job_retry_count += 1
-                continue
-            
-            # Successfully got job page content
-            print(f"    ✓ Job page loaded ({len(full_page_content)} chars)")
-            full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
-            
-            # Extract job ID from full page if not already present
-            if not job.job_id:
-                enhanced_job_id = _extract_job_id_from_full_page(full_page_soup, page.url)
-                if enhanced_job_id:
-                    job.job_id = enhanced_job_id
-                    print(f"    ✓ Enhanced job ID: {enhanced_job_id}")
-            
-            # Extract company URL from full page if not already present
-            if not job.company_url:
-                enhanced_company_url = _extract_company_url_from_full_page(full_page_soup, page)
-                if enhanced_company_url:
-                    job.company_url = enhanced_company_url
-                    print(f"    ✓ Enhanced company URL: {enhanced_company_url}")
-            
-            # Extract enhanced details from the full page
-            enhanced_salary = _extract_salary_from_full_page_improved(full_page_soup)
-            enhanced_employment = _extract_employment_from_full_page_improved(full_page_soup)
-            enhanced_date = _extract_date_from_full_page_improved(full_page_soup)
-            enhanced_description = _extract_description_from_full_page_improved(full_page_soup)
-            enhanced_experience = _extract_experience_from_full_page_improved(full_page_soup)
-            enhanced_benefits = _extract_benefits_from_full_page(full_page_soup)
-            enhanced_requirements = _extract_requirements_from_full_page(full_page_soup)
-            enhanced_skills = _extract_skills_from_full_page(full_page_soup)
-            enhanced_industry = _extract_industry_from_full_page(full_page_soup)
-            enhanced_company_size = _extract_company_size_from_full_page(full_page_soup)
-            
-            # Update job with enhanced details (only if not already present or significantly better)
-            if enhanced_salary and (not job.salary_range or len(enhanced_salary) > len(job.salary_range or "")):
-                job.salary_range = enhanced_salary
-                print(f"    ✓ Enhanced salary: {enhanced_salary}")
-            
-            if enhanced_employment and not job.employment_type:
-                job.employment_type = enhanced_employment
-                print(f"    ✓ Enhanced employment: {enhanced_employment}")
-            
-            if enhanced_date and not job.posted_date:
-                job.posted_date = enhanced_date
-                print(f"    ✓ Enhanced date: {enhanced_date}")
-            
-            # Always update description with full job description from detail page
-            if enhanced_description and len(enhanced_description) > 100:
-                job.description = enhanced_description
-                print(f"    ✓ Enhanced description: {len(enhanced_description)} characters")
-            
-            if enhanced_experience and not job.experience_level:
-                job.experience_level = enhanced_experience
-                print(f"    ✓ Enhanced experience: {enhanced_experience}")
-            
-            if enhanced_benefits and (not job.benefits or len(job.benefits or []) < len(enhanced_benefits)):
-                job.benefits = enhanced_benefits
-                print(f"    ✓ Enhanced benefits: {len(enhanced_benefits)} items")
-            
-            if enhanced_requirements and (not job.requirements or len(job.requirements or []) < len(enhanced_requirements)):
-                job.requirements = enhanced_requirements
-                print(f"    ✓ Enhanced requirements: {len(enhanced_requirements)} items")
-            
-            if enhanced_skills and (not job.skills or len(job.skills or []) < 3):
-                job.skills = enhanced_skills
-                print(f"    ✓ Enhanced skills: {len(enhanced_skills)} items")
-            
-            if enhanced_industry and not job.industry:
-                job.industry = enhanced_industry
-                print(f"    ✓ Enhanced industry: {enhanced_industry}")
-            
-            if enhanced_company_size and not job.company_size:
-                job.company_size = enhanced_company_size
-                print(f"    ✓ Enhanced company size: {enhanced_company_size}")
-            
-            # Break out of retry loop on success
-            break
-            
-        except Exception as e:
-            if job_retry_count >= max_job_retries:
-                print(f"    ⚠️  Error extracting enhanced details after {job_retry_count + 1} attempts: {e}")
-                return job  # Continue with basic job data if enhancement fails
-            
-            print(f"    ⚠️  Error on attempt {job_retry_count + 1}, retrying: {e}")
-            job_retry_count += 1
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-            continue
-    
-    # Navigate back to search results (outside retry loop)
-    if not skip_nav_back:
+            await page.wait_for_selector('div[class*="jobsearch-JobComponent"], body', timeout=10000)
+        except:
+            pass  # Continue even if selector not found
+        
+        # Get full page content
+        full_page_content = await page.content()
+        full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
+        
+        # Extract job ID from full page if not already present
+        if not job.job_id:
+            enhanced_job_id = _extract_job_id_from_full_page(full_page_soup, page.url)
+            if enhanced_job_id:
+                job.job_id = enhanced_job_id
+                print(f"    ✓ Enhanced job ID: {enhanced_job_id}")
+        
+        # Extract enhanced details from the full page
+        enhanced_salary = _extract_salary_from_full_page_improved(full_page_soup)
+        enhanced_employment = _extract_employment_from_full_page_improved(full_page_soup)
+        enhanced_date = _extract_date_from_full_page_improved(full_page_soup)
+        enhanced_description = _extract_description_from_full_page_improved(full_page_soup)
+        print(f"    ✓ Enhanced description: {enhanced_description}")
+        enhanced_experience = _extract_experience_from_full_page_improved(full_page_soup)
+        print(f"    ✓ Enhanced experience: {enhanced_experience}")
+        enhanced_benefits = _extract_benefits_from_full_page(full_page_soup)
+        print(f"    ✓ Enhanced benefits: {enhanced_benefits}")
+        enhanced_requirements = _extract_requirements_from_full_page(full_page_soup)
+        print(f"    ✓ Enhanced requirements: {enhanced_requirements}")
+        enhanced_skills = _extract_skills_from_full_page(full_page_soup)
+        print(f"    ✓ Enhanced skills: {enhanced_skills}")
+        enhanced_industry = _extract_industry_from_full_page(full_page_soup)
+        print(f"    ✓ Enhanced industry: {enhanced_industry}")
+        enhanced_company_size = _extract_company_size_from_full_page(full_page_soup)
+        print(f"    ✓ Enhanced company size: {enhanced_company_size}")
+        
+        # Update job with enhanced details (only if not already present or significantly better)
+        if enhanced_salary and (not job.salary_range or len(enhanced_salary) > len(job.salary_range or "")):
+            job.salary_range = enhanced_salary
+            print(f"    ✓ Enhanced salary: {enhanced_salary}")
+        
+        if enhanced_employment and not job.employment_type:
+            job.employment_type = enhanced_employment
+            print(f"    ✓ Enhanced employment: {enhanced_employment}")
+        
+        if enhanced_date and not job.posted_date:
+            job.posted_date = enhanced_date
+            print(f"    ✓ Enhanced date: {enhanced_date}")
+        
+        # Always update description with full job description from detail page
+        if enhanced_description and len(enhanced_description) > 100:
+            job.description = enhanced_description
+            print(f"    ✓ Enhanced description: {len(enhanced_description)} characters")
+        
+        if enhanced_experience and not job.experience_level:
+            job.experience_level = enhanced_experience
+            print(f"    ✓ Enhanced experience: {enhanced_experience}")
+        
+        if enhanced_benefits and (not job.benefits or len(job.benefits or []) < len(enhanced_benefits)):
+            job.benefits = enhanced_benefits
+            print(f"    ✓ Enhanced benefits: {len(enhanced_benefits)} items")
+        
+        if enhanced_requirements and (not job.requirements or len(job.requirements or []) < len(enhanced_requirements)):
+            job.requirements = enhanced_requirements
+            print(f"    ✓ Enhanced requirements: {len(enhanced_requirements)} items")
+        
+        if enhanced_skills and (not job.skills or len(job.skills or []) < 3):
+            job.skills = enhanced_skills
+            print(f"    ✓ Enhanced skills: {len(enhanced_skills)} items")
+        
+        if enhanced_industry and not job.industry:
+            job.industry = enhanced_industry
+            print(f"    ✓ Enhanced industry: {enhanced_industry}")
+        
+        if enhanced_company_size and not job.company_size:
+            job.company_size = enhanced_company_size
+            print(f"    ✓ Enhanced company size: {enhanced_company_size}")
+        
+    except Exception as e:
+        print(f"    ⚠️  Error extracting enhanced details: {e}")
+        # Continue with basic job data if enhancement fails
+    finally:
+        # Navigate back to the original search results page
         try:
             print(f"    ← Navigating back to search results")
             back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 30000)  # 30 seconds default
@@ -2391,8 +2053,6 @@ async def _extract_complete_job_details_from_url_playwright(
         except Exception as nav_error:
             print(f"    ⚠️  Warning: Could not navigate back: {nav_error}")
             # If navigation back fails, it's not critical - we can continue
-    else:
-        print(f"    ↻ Skipping navigation back (using context rotation)")
     
     return job
 
@@ -2437,3 +2097,4 @@ def _should_include_job(
     # Note: Full date parsing would require parsing the posted_date string
     
     return True
+
