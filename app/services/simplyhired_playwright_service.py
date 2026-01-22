@@ -67,6 +67,7 @@ from app.services.simplyhired_selenium_service import (
     _format_location_for_simplyhired,
     _get_simplyhired_employment_filter,
     _get_simplyhired_date_filter,
+    _get_simplyhired_job_type_filter,
     _find_job_cards_simplyhired,
     _is_valid_job_card_simplyhired,
     _extract_title_simplyhired,
@@ -100,6 +101,8 @@ from app.services.simplyhired_selenium_service import (
     _extract_job_id_from_full_page_simplyhired,
     _extract_company_from_full_page_simplyhired,
     _extract_location_from_full_page_simplyhired,
+    _validate_description,
+    _clean_description_text,
 )
 
 # Global browser resources - properly managed to prevent resource leaks
@@ -589,7 +592,84 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
         except:
             pass  # Continue even if selector not found
         
-        # Get full page content
+        # Try to extract description using Playwright's page evaluation first (more reliable)
+        enhanced_description = None
+        try:
+            # Look for description using JavaScript - more reliable than parsing HTML
+            description_text = await page.evaluate("""
+                () => {
+                    // Try multiple selectors
+                    const selectors = [
+                        'div[data-testid="viewjob-jobDescription"]',
+                        'div[data-testid="jobDescription"]',
+                        'div[class*="JobDescription"]',
+                        'div[class*="jobDescription"]',
+                        'div[class*="job-description"]',
+                        'div[class*="fullDescription"]',
+                    ];
+                    
+                    for (const selector of selectors) {
+                        const elem = document.querySelector(selector);
+                        if (elem) {
+                            // Remove similar jobs sections
+                            const similar = elem.querySelector('[class*="similar"], [class*="related"]');
+                            if (similar) similar.remove();
+                            
+                            let text = elem.innerText || elem.textContent || '';
+                            text = text.trim();
+                            
+                            // Check if it's substantial and doesn't start with nav text
+                            if (text.length > 200 && 
+                                !text.toLowerCase().startsWith('skip to content') &&
+                                !text.toLowerCase().startsWith('job title')) {
+                                return text;
+                            }
+                        }
+                    }
+                    
+                    // Fallback: Look for heading "Full Job Description" and get content after it
+                    const headings = document.querySelectorAll('h2, h3, h4');
+                    for (const heading of headings) {
+                        const headingText = (heading.innerText || heading.textContent || '').toLowerCase();
+                        if (headingText.includes('full job description') || headingText.includes('job description')) {
+                            // Get parent container
+                            let parent = heading.parentElement;
+                            if (parent) {
+                                // Get all text from parent, but skip the heading
+                                let text = parent.innerText || parent.textContent || '';
+                                // Remove the heading text from the start
+                                const headingTextFull = heading.innerText || heading.textContent || '';
+                                if (text.startsWith(headingTextFull)) {
+                                    text = text.substring(headingTextFull.length).trim();
+                                }
+                                
+                                // Remove similar jobs if present
+                                const similar = parent.querySelector('[class*="similar"], [class*="related"]');
+                                if (similar) {
+                                    const similarText = similar.innerText || similar.textContent || '';
+                                    text = text.replace(similarText, '').trim();
+                                }
+                                
+                                if (text.length > 200) {
+                                    return text;
+                                }
+                            }
+                        }
+                    }
+                    
+                    return null;
+                }
+            """)
+            
+            if description_text and isinstance(description_text, str) and len(description_text) > 200:
+                # Clean the description
+                enhanced_description = _clean_description_text(description_text)
+                if enhanced_description and len(enhanced_description) > 200:
+                    print(f"    ✓ Extracted description via Playwright: {len(enhanced_description)} characters")
+        except Exception as e:
+            print(f"    ⚠️  Error extracting description via Playwright: {e}")
+        
+        # Get full page content for other extractions
         full_page_content = await page.content()
         full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
         
@@ -600,13 +680,16 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
                 job.job_id = enhanced_job_id
                 print(f"    ✓ Enhanced job ID: {enhanced_job_id}")
         
-        # Extract enhanced details from the full page
+        # Extract enhanced details from the full page (if description not found via Playwright)
         enhanced_company, enhanced_company_url = _extract_company_from_full_page_simplyhired(full_page_soup)
         enhanced_location = _extract_location_from_full_page_simplyhired(full_page_soup)
         enhanced_salary = _extract_salary_from_full_page_simplyhired(full_page_soup)
         enhanced_employment = _extract_employment_from_full_page_simplyhired(full_page_soup)
         enhanced_date = _extract_date_from_full_page_simplyhired(full_page_soup)
-        enhanced_description = _extract_description_from_full_page_simplyhired(full_page_soup)
+        
+        # Only extract description from soup if we didn't get it via Playwright
+        if not enhanced_description:
+            enhanced_description = _extract_description_from_full_page_simplyhired(full_page_soup)
         enhanced_experience = _extract_experience_from_full_page_simplyhired(full_page_soup)
         enhanced_benefits = _extract_benefits_from_full_page_simplyhired(full_page_soup)
         enhanced_requirements = _extract_requirements_from_full_page_simplyhired(full_page_soup)
@@ -623,9 +706,38 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
             job.company_url = enhanced_company_url
             print(f"    ✓ Enhanced company URL: {enhanced_company_url}")
         
-        if enhanced_location and not job.location:
-            job.location = enhanced_location
-            print(f"    ✓ Enhanced location: {enhanced_location}")
+        # Update location with validation - especially for remote jobs
+        if enhanced_location:
+            # Validate location - reject invalid patterns
+            invalid_patterns = ['job title', 'skills', 'company', 'city, state', 'zip', 'search']
+            location_lower = enhanced_location.lower()
+            is_invalid = any(pattern in location_lower for pattern in invalid_patterns)
+            
+            # For remote jobs, ensure location is set to "Remote" if invalid or missing
+            if job.remote_type == 'Remote':
+                if is_invalid or not enhanced_location:
+                    job.location = 'Remote'
+                    print(f"    ✓ Set location to 'Remote' (invalid location detected)")
+                elif not job.location:
+                    job.location = enhanced_location
+                    print(f"    ✓ Enhanced location: {enhanced_location}")
+            elif not is_invalid and not job.location:
+                job.location = enhanced_location
+                print(f"    ✓ Enhanced location: {enhanced_location}")
+            elif is_invalid and not job.location:
+                # Invalid location and no existing location - try to infer from remote_type
+                if job.remote_type == 'Hybrid':
+                    job.location = 'Hybrid'
+                elif job.remote_type == 'Remote':
+                    job.location = 'Remote'
+        elif not job.location:
+            # No enhanced location found - set based on remote_type
+            if job.remote_type == 'Remote':
+                job.location = 'Remote'
+                print(f"    ✓ Set location to 'Remote' (no location found)")
+            elif job.remote_type == 'Hybrid':
+                job.location = 'Hybrid'
+                print(f"    ✓ Set location to 'Hybrid' (no location found)")
         
         if enhanced_salary and (not job.salary_range or len(enhanced_salary) > len(job.salary_range or "")):
             job.salary_range = enhanced_salary
@@ -641,14 +753,35 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
         
         # Always update description with full job description from detail page
         # Prioritize full page description as it's more complete
+        # But validate it first to ensure it's not navigation/header text
         if enhanced_description:
-            if len(enhanced_description) > 100:
-                job.description = enhanced_description
-                print(f"    ✓ Enhanced description: {len(enhanced_description)} characters")
-            elif not job.description or len(job.description) < 100:
-                # Use it even if shorter if we don't have a good description yet
-                job.description = enhanced_description
-                print(f"    ✓ Updated description: {len(enhanced_description)} characters")
+            # Clean the description
+            cleaned_description = _clean_description_text(enhanced_description)
+            
+            # Be more lenient - if it's substantial and doesn't start with nav text, use it
+            if cleaned_description and len(cleaned_description) > 50:
+                # Check if it starts with navigation text
+                first_200 = cleaned_description.lower()[:200]
+                starts_with_nav = any(nav in first_200 for nav in ['skip to content', 'job title, skills', 'search jobs', 'sign in'])
+                
+                if _validate_description(cleaned_description):
+                    # Valid description
+                    if len(cleaned_description) > 100:
+                        job.description = cleaned_description
+                        print(f"    ✓ Enhanced description: {len(cleaned_description)} characters")
+                    elif not job.description or len(job.description) < 100:
+                        job.description = cleaned_description
+                        print(f"    ✓ Updated description: {len(cleaned_description)} characters")
+                elif not starts_with_nav and len(cleaned_description) > 300:
+                    # Not validated but substantial and doesn't start with nav - likely valid
+                    job.description = cleaned_description
+                    print(f"    ✓ Enhanced description (lenient): {len(cleaned_description)} characters")
+                else:
+                    # Invalid description (likely navigation text) - keep existing or skip
+                    if not job.description or len(job.description) < 100:
+                        print(f"    ⚠️  Enhanced description appears to be navigation text - skipping (length: {len(cleaned_description)})")
+                    else:
+                        print(f"    ⚠️  Enhanced description invalid - keeping existing description")
         elif not job.description:
             print(f"    ⚠️  No description found on full page")
         
@@ -781,10 +914,26 @@ async def scrape_simplyhired_playwright(
         base_url = "https://www.simplyhired.com/search"
         params = f"?q={quote_plus(query)}"
         
-        if location:
+        # Handle job_type filter - if remote, bypass location and search all over United States
+        # Similar to how Indeed handles remote jobs
+        if job_type and job_type.lower() in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+            # For remote jobs, use location=remote to search all over United States
+            # This bypasses any specific location filter
+            job_type_filter = _get_simplyhired_job_type_filter(job_type)
+            if job_type_filter:
+                params += f"&{job_type_filter}"
+                print(f"DEBUG - Job type '{job_type}' mapped to filter '{job_type_filter}' (bypassing location, searching all US)")
+        elif location:
+            # Only add location if job_type is not remote
             location_param = _format_location_for_simplyhired(location)
             params += f"&l={location_param}"
             print(f"DEBUG - Location '{location}' formatted as '{location_param}'")
+        
+        # Add job type filter for hybrid/onsite (if not already handled above)
+        if job_type and job_type.lower() not in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+            # For hybrid/onsite, SimplyHired doesn't have URL-level filters
+            # We'll rely on post-scraping filtering
+            print(f"DEBUG - Job type '{job_type}' will be filtered post-scraping (no URL parameter available)")
         
         # Add employment type filter
         if employment_type:

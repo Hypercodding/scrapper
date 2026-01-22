@@ -103,6 +103,26 @@ def _get_simplyhired_date_filter(days_old: int) -> Optional[str]:
         return None  # SimplyHired doesn't support > 30 days filter
 
 
+def _get_simplyhired_job_type_filter(job_type: str) -> Optional[str]:
+    """Get SimplyHired job type filter parameter (remote/hybrid/onsite).
+    
+    SimplyHired uses location parameter 'l=remote' for remote jobs.
+    For hybrid and onsite, we rely on post-scraping filtering as SimplyHired
+    doesn't have explicit URL parameters for these.
+    """
+    job_type = job_type.lower().strip()
+    
+    # SimplyHired uses 'l=remote' for remote job searches
+    # This bypasses location filtering and searches all over United States
+    if job_type in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+        return 'l=remote'
+    
+    # For hybrid and onsite, SimplyHired doesn't have URL-level filters
+    # We'll rely on post-scraping filtering based on job.remote_type
+    # Return None to indicate no URL parameter needed
+    return None
+
+
 def _find_job_cards_simplyhired(soup: BeautifulSoup) -> List:
     """Find job cards using SimplyHired-specific selectors."""
     job_cards = []
@@ -339,6 +359,42 @@ def _extract_location_info_simplyhired(card) -> tuple[Optional[str], Optional[st
     location = None
     remote_type = None
     
+    # Determine remote type first based on card text (needed for validation)
+    card_text_lower = card.get_text().lower()
+    if 'remote' in card_text_lower:
+        if 'hybrid' in card_text_lower:
+            remote_type = 'Hybrid'
+        elif 'on-site' in card_text_lower or 'onsite' in card_text_lower or 'in-person' in card_text_lower:
+            remote_type = 'Hybrid'  # Has both remote and on-site mentioned
+        else:
+            remote_type = 'Remote'
+    elif 'hybrid' in card_text_lower:
+        remote_type = 'Hybrid'
+    elif 'on-site' in card_text_lower or 'onsite' in card_text_lower or 'in-person' in card_text_lower:
+        remote_type = 'On-site'
+    else:
+        # Default to On-site if not specified
+        remote_type = 'On-site'
+    
+    # Invalid location patterns to reject (common navigation/header text)
+    invalid_location_patterns = [
+        'job title',
+        'skills',
+        'company',
+        'city, state',
+        'zip',
+        'search',
+        'sign in',
+        'create account',
+        'post jobs',
+        'browse',
+        'resources',
+        'tools',
+        'country',
+        'simplyhired',
+        'indeed',
+    ]
+    
     # Priority 1: Direct location selectors
     location_selectors = [
         '[class*="location"]',
@@ -353,7 +409,14 @@ def _extract_location_info_simplyhired(card) -> tuple[Optional[str], Optional[st
         if location_elem:
             location = location_elem.get_text(strip=True)
             if location:
-                break
+                # Validate location - reject if it matches invalid patterns
+                location_lower = location.lower()
+                if any(pattern in location_lower for pattern in invalid_location_patterns):
+                    location = None
+                elif len(location) < 3:  # Too short to be valid
+                    location = None
+                else:
+                    break
     
     # Priority 2: Parse from company text (format: "Company — City, State Rating")
     if not location:
@@ -375,8 +438,11 @@ def _extract_location_info_simplyhired(card) -> tuple[Optional[str], Optional[st
                         # Remove rating numbers (like "3.5", "4.2")
                         loc_part = re.sub(r'\s+\d+\.?\d*\s*$', '', loc_part).strip()
                         if loc_part:
-                            location = loc_part
-                            break
+                            # Validate location
+                            loc_lower = loc_part.lower()
+                            if not any(pattern in loc_lower for pattern in invalid_location_patterns) and len(loc_part) >= 3:
+                                location = loc_part
+                                break
     
     # Priority 3: Look for city/state pattern in card text
     if not location:
@@ -385,24 +451,18 @@ def _extract_location_info_simplyhired(card) -> tuple[Optional[str], Optional[st
         loc_pattern = r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*([A-Z]{2})\b'
         match = re.search(loc_pattern, card_text)
         if match:
-            location = f"{match.group(1)}, {match.group(2)}"
+            potential_location = f"{match.group(1)}, {match.group(2)}"
+            # Validate it's not in invalid patterns
+            if not any(pattern in potential_location.lower() for pattern in invalid_location_patterns):
+                location = potential_location
     
-    # Determine remote type based on card text (not just location)
-    card_text_lower = card.get_text().lower()
-    if 'remote' in card_text_lower:
-        if 'hybrid' in card_text_lower:
-            remote_type = 'Hybrid'
-        elif 'on-site' in card_text_lower or 'onsite' in card_text_lower or 'in-person' in card_text_lower:
-            remote_type = 'Hybrid'  # Has both remote and on-site mentioned
-        else:
-            remote_type = 'Remote'
-    elif 'hybrid' in card_text_lower:
-        remote_type = 'Hybrid'
-    elif 'on-site' in card_text_lower or 'onsite' in card_text_lower or 'in-person' in card_text_lower:
-        remote_type = 'On-site'
-    else:
-        # Default to On-site if not specified
-        remote_type = 'On-site'
+    # For remote jobs, set location to "Remote" if no valid location found
+    if remote_type == 'Remote' and (not location or any(pattern in location.lower() for pattern in invalid_location_patterns)):
+        location = 'Remote'
+    elif remote_type == 'Hybrid' and (not location or any(pattern in location.lower() for pattern in invalid_location_patterns)):
+        # For hybrid, try to keep location if valid, otherwise set to "Hybrid"
+        if not location or any(pattern in location.lower() for pattern in invalid_location_patterns):
+            location = 'Hybrid'
     
     return location, remote_type
 
@@ -888,24 +948,215 @@ def _extract_date_from_full_page_simplyhired(soup: BeautifulSoup) -> Optional[st
     return None
 
 
+def _validate_description(description: str) -> bool:
+    """Validate that a description is actually a job description and not navigation/header text."""
+    if not description or len(description) < 50:  # Reduced minimum length
+        return False
+    
+    description_lower = description.lower()
+    
+    # Navigation/header text patterns that indicate invalid description
+    invalid_patterns = [
+        'skip to content',
+        'job title, skills',
+        'city, state, zip',
+        'search jobs',
+        'post jobs',
+        'sign in',
+        'create account',
+        'simplyhired is part of',
+        'indeed terms of service',
+        'privacy policy',
+        'cookie and privacy policy',
+        'resources and tools',
+        'job seeker tools',
+        'salary estimator',
+        'glassdoor community',
+        'employer tools',
+        'browse',
+        'all jobs',
+        'all salaries',
+        'all cities',
+        'all companies',
+        'stay connected',
+        'contact us',
+        'take your job search',
+        '© 202',
+        'sh inc',
+        'privacy center',
+        'accessibility',
+        'your privacy choices',
+        'countryunited states',
+        'i want to receive the latest job alert',
+        'by signing in to your account',
+    ]
+    
+    # Check if description contains too many invalid patterns
+    invalid_count = sum(1 for pattern in invalid_patterns if pattern in description_lower)
+    
+    # If more than 3 invalid patterns found, it's likely navigation text
+    if invalid_count > 3:
+        return False
+    
+    # Check if description starts with navigation text
+    first_200 = description_lower[:200]
+    if any(pattern in first_200 for pattern in ['skip to content', 'job title, skills', 'search jobs', 'sign in']):
+        return False
+    
+    # Check if it has job-related content (good indicator) - expanded list
+    job_keywords = [
+        'responsibilities', 'requirements', 'qualifications', 'experience', 
+        'skills', 'duties', 'role', 'position', 'job description', 'about',
+        'we are', 'looking for', 'candidate', 'must have', 'should have',
+        'you will', 'you\'ll', 'you will be', 'we\'re looking', 'we are looking',
+        'client', 'partners', 'team', 'work', 'develop', 'build', 'create',
+        'design', 'implement', 'manage', 'lead', 'collaborate', 'support',
+        'full-time', 'part-time', 'contract', 'remote', 'hybrid'
+    ]
+    
+    has_job_content = any(keyword in description_lower for keyword in job_keywords)
+    
+    # Also check for common sentence patterns that indicate real content
+    has_sentence_structure = (
+        '.' in description and  # Has sentences
+        len(description.split()) > 20  # Has substantial word count
+    )
+    
+    # If it has job content OR good sentence structure, and not too many invalid patterns, it's valid
+    # Be more lenient - if it's long enough and doesn't have many invalid patterns, accept it
+    if invalid_count <= 2:
+        return has_job_content or (has_sentence_structure and len(description) > 200)
+    
+    return False
+
+
+def _clean_description_text(text: str) -> str:
+    """Clean description text by removing navigation, header, and footer content."""
+    if not text:
+        return ""
+    
+    # Remove SimplyHired-specific navigation text patterns
+    patterns_to_remove = [
+        r'Skip to content.*?(?=Job Title|Search|Sign)',
+        r'Job Title, Skills or Company.*?(?=Search Jobs|Sign In)',
+        r'City, State, ZIP or "Remote".*?(?=Search Jobs)',
+        r'Search Jobs.*?(?=Sign In|Post Jobs)',
+        r'Post Jobs.*?(?=Sign In)',
+        r'Sign In / Create Account.*?(?=I want to receive|By signing)',
+        r'I want to receive the latest job alert.*?Privacy Policy\.?',
+        r'By signing in to your account.*?Privacy Policy\.?',
+        r'Resources and Tools.*?Country',
+        r'Job Seeker Tools.*?Country',
+        r'Salary Estimator.*?Country',
+        r'Glassdoor Community.*?Country',
+        r'Country.*?Employer Tools',
+        r'Employer Tools.*?Stay Connected',
+        r'Post Jobs.*?Stay Connected',
+        r'Browse.*?Stay Connected',
+        r'All Jobs.*?Stay Connected',
+        r'All Salaries.*?Stay Connected',
+        r'All Cities.*?Stay Connected',
+        r'All Companies.*?Stay Connected',
+        r'Stay Connected.*?Contact Us',
+        r'Contact Us.*?Take your job search',
+        r'Take your job search wherever you go\.',
+        r'© \d{4} SH Inc\.',
+        r'SimplyHired is part of the Indeed Site.*?Privacy Choices',
+        r'Terms of Service.*?Privacy Choices',
+        r'Privacy.*?Privacy Choices',
+        r'Terms.*?Privacy Choices',
+        r'Cookies.*?Privacy Choices',
+        r'Privacy Center.*?Privacy Choices',
+        r'Accessibility.*?Privacy Choices',
+        r'Your Privacy Choices.*?$',
+    ]
+    
+    for pattern in patterns_to_remove:
+        text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove "Similar Jobs" sections
+    text = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'Similar Jobs.*?View more', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
 def _extract_description_from_full_page_simplyhired(soup: BeautifulSoup) -> Optional[str]:
     """Extract full job description from SimplyHired's full job page."""
     # SimplyHired description selectors - try more specific ones first
+    # Based on actual SimplyHired page structure
     desc_selectors = [
         'div[data-testid="viewjob-jobDescription"]',
         'div[data-testid="jobDescription"]',
+        'div[data-testid="viewjob-fullDescription"]',
+        'div[data-testid="fullDescription"]',
+        # Look for sections with "Full Job Description" or similar headings
+        'div:has(h2:contains("Full Job Description")), div:has(h3:contains("Full Job Description")), div:has(h2:contains("Job Description")), div:has(h3:contains("Job Description"))',
         'div[class*="JobDescription"]',
         'div[class*="jobDescription"]',
         'div[class*="job-description"]',
         'div[class*="jobDescriptionText"]',
         'div[class*="JobDescriptionText"]',
+        'div[class*="fullDescription"]',
+        'div[class*="FullDescription"]',
         'div[id*="jobDescription"]',
         'div[id*="JobDescription"]',
         'section[class*="description"]',
         'article[class*="description"]',
-        'div[class*="description"]',
-        'div[class*="Description"]',
+        # Look for main content area that contains description
+        'main div[class*="description"]',
+        'article div[class*="description"]',
     ]
+    
+    # First, try to find heading "Full Job Description" and get content after it
+    heading_patterns = [
+        ('h2', 'Full Job Description'),
+        ('h3', 'Full Job Description'),
+        ('h2', 'Job Description'),
+        ('h3', 'Job Description'),
+        ('h4', 'Full Job Description'),
+        ('h4', 'Job Description'),
+    ]
+    
+    for tag, text in heading_patterns:
+        heading = soup.find(tag, string=re.compile(text, re.I))
+        if heading:
+            # Get the parent container
+            parent = heading.find_parent(['div', 'section', 'article'])
+            if parent:
+                # Find the description content after the heading
+                # Look for the next sibling or content within parent
+                desc_content = None
+                # Try to find a div after the heading
+                for sibling in heading.find_next_siblings(['div', 'section', 'p']):
+                    sibling_text = sibling.get_text(strip=True)
+                    if sibling_text and len(sibling_text) > 100:
+                        desc_content = sibling
+                        break
+                
+                # If no sibling, get all text from parent after heading
+                if not desc_content:
+                    # Get all text from parent, but skip the heading itself
+                    parent_copy = BeautifulSoup(str(parent), 'html.parser')
+                    # Remove the heading
+                    heading_in_copy = parent_copy.find(tag, string=re.compile(text, re.I))
+                    if heading_in_copy:
+                        heading_in_copy.decompose()
+                    # Remove similar jobs sections
+                    for unwanted in parent_copy.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended', re.I)):
+                        unwanted.decompose()
+                    # Remove navigation elements
+                    for tag_elem in parent_copy.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
+                        tag_elem.decompose()
+                    
+                    description = parent_copy.get_text(separator=' ', strip=True)
+                    if description and len(description) > 100:
+                        description = _clean_description_text(description)
+                        if _validate_description(description) and len(description) > 100:
+                            return description
     
     for selector in desc_selectors:
         desc_elem = soup.select_one(selector)
@@ -915,25 +1166,35 @@ def _extract_description_from_full_page_simplyhired(soup: BeautifulSoup) -> Opti
             
             # Remove "similar jobs" and other unwanted sections more carefully
             # Only remove if they're clearly separate sections, not part of the description
-            for unwanted in desc_copy.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert', re.I)):
+            for unwanted in desc_copy.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert|navigation|header|footer', re.I)):
                 # Check if this is a separate section (has specific classes)
-                if unwanted.get('class') and any('similar' in str(c).lower() or 'related' in str(c).lower() for c in unwanted.get('class')):
+                if unwanted.get('class') and any('similar' in str(c).lower() or 'related' in str(c).lower() or 'navigation' in str(c).lower() for c in unwanted.get('class')):
                     unwanted.decompose()
             
             # Remove navigation, header, footer elements
-            for tag in desc_copy.find_all(['header', 'footer', 'nav', 'aside', 'button']):
+            for tag in desc_copy.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
                 tag.decompose()
             
-            description = desc_copy.get_text(strip=True)
-            if description and len(description) > 100:
-                # Remove "similar jobs" text patterns more carefully
-                # Only remove if it's clearly a separate section
-                description = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'Similar Jobs.*?View more', '', description, flags=re.DOTALL | re.IGNORECASE)
-                # Clean up whitespace
-                description = re.sub(r'\s+', ' ', description).strip()
-                if len(description) > 100:
-                    return description
+            # Remove links that are clearly navigation
+            for link in desc_copy.find_all('a', href=True):
+                href = link.get('href', '').lower()
+                if any(nav in href for nav in ['/search', '/sign', '/post', '/browse', '/account', '/privacy', '/terms']):
+                    link.decompose()
+            
+            description = desc_copy.get_text(separator=' ', strip=True)
+            if description and len(description) > 50:  # Reduced minimum
+                # Clean the description
+                description = _clean_description_text(description)
+                
+                # Validate it's actually a job description (more lenient)
+                if description and len(description) > 50:
+                    # If validation passes, use it
+                    if _validate_description(description):
+                        return description
+                    # If validation fails but it's substantial and doesn't start with nav text, still try it
+                    elif len(description) > 300 and not any(nav in description.lower()[:200] for nav in ['skip to content', 'job title, skills', 'search jobs']):
+                        # It's substantial and doesn't start with nav - likely valid
+                        return description
     
     # Fallback 1: Look for content in the right panel (SimplyHired's layout)
     right_panel = soup.select_one('div[class*="right"], div[class*="detail"], div[class*="job-detail"]')
@@ -942,13 +1203,15 @@ def _extract_description_from_full_page_simplyhired(soup: BeautifulSoup) -> Opti
         desc_in_panel = right_panel.select_one('div[class*="description"], div[class*="Description"]')
         if desc_in_panel:
             # Remove unwanted sections
-            for unwanted in desc_in_panel.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert|sign', re.I)):
+            for unwanted in desc_in_panel.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert|sign|navigation|header|footer', re.I)):
                 unwanted.decompose()
-            description = desc_in_panel.get_text(strip=True)
+            # Remove navigation elements
+            for tag in desc_in_panel.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
+                tag.decompose()
+            description = desc_in_panel.get_text(separator=' ', strip=True)
             if description and len(description) > 100:
-                description = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'\s+', ' ', description).strip()
-                if len(description) > 100:
+                description = _clean_description_text(description)
+                if _validate_description(description) and len(description) > 100:
                     return description
     
     # Fallback 2: Look for the main content area
@@ -958,16 +1221,15 @@ def _extract_description_from_full_page_simplyhired(soup: BeautifulSoup) -> Opti
         desc_in_main = main_content.select_one('div[class*="description"], div[class*="Description"], section[class*="description"]')
         if desc_in_main:
             # Remove unwanted sections
-            for unwanted in desc_in_main.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert|sign', re.I)):
+            for unwanted in desc_in_main.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|alert|sign|navigation|header|footer', re.I)):
                 unwanted.decompose()
-            description = desc_in_main.get_text(strip=True)
+            # Remove navigation elements
+            for tag in desc_in_main.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
+                tag.decompose()
+            description = desc_in_main.get_text(separator=' ', strip=True)
             if description and len(description) > 200:
-                description = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'Similar Jobs.*?$', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'I want to receive.*?Privacy Policy\.?', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'Sign In or Sign Up.*?$', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'\s+', ' ', description).strip()
-                if len(description) > 200:
+                description = _clean_description_text(description)
+                if _validate_description(description) and len(description) > 200:
                     return description[:5000]  # Limit to 5000 chars
         
         # If no specific description section found, use main content but be more selective
@@ -976,40 +1238,75 @@ def _extract_description_from_full_page_simplyhired(soup: BeautifulSoup) -> Opti
             unwanted.decompose()
         
         # Remove header, footer, nav elements
-        for tag in main_content.find_all(['header', 'footer', 'nav', 'aside', 'button']):
+        for tag in main_content.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
             tag.decompose()
         
-        description = main_content.get_text(strip=True)
+        # Remove navigation links
+        for link in main_content.find_all('a', href=True):
+            href = link.get('href', '').lower()
+            if any(nav in href for nav in ['/search', '/sign', '/post', '/browse', '/account', '/privacy', '/terms']):
+                link.decompose()
+        
+        description = main_content.get_text(separator=' ', strip=True)
         if description and len(description) > 200:
-            # Remove "similar jobs" text patterns
-            description = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', description, flags=re.DOTALL | re.IGNORECASE)
-            description = re.sub(r'Similar Jobs.*?View more', '', description, flags=re.DOTALL | re.IGNORECASE)
-            description = re.sub(r'I want to receive.*?Privacy Policy\.?', '', description, flags=re.DOTALL | re.IGNORECASE)
-            description = re.sub(r'Sign In or Sign Up.*?$', '', description, flags=re.DOTALL | re.IGNORECASE)
-            # Remove common SimplyHired footer text
-            description = re.sub(r'By signing in.*?Privacy Policy\.?', '', description, flags=re.DOTALL | re.IGNORECASE)
-            description = re.sub(r'\s+', ' ', description).strip()
-            if len(description) > 200:
+            description = _clean_description_text(description)
+            if _validate_description(description) and len(description) > 200:
                 return description[:5000]  # Limit to 5000 chars
     
     # Fallback 3: Look for any div with substantial text content that might be the description
-    # This is a last resort
+    # This is a last resort - be very selective
     all_divs = soup.find_all('div')
+    best_description = None
+    best_length = 0
+    
     for div in all_divs:
-        text = div.get_text(strip=True)
+        # Skip if it's clearly navigation/header/footer
+        div_classes = ' '.join(div.get('class', [])).lower()
+        if any(nav in div_classes for nav in ['nav', 'header', 'footer', 'menu', 'sidebar', 'search', 'sign', 'similar']):
+            continue
+            
+        text = div.get_text(separator=' ', strip=True)
         # Look for divs with substantial text (likely description)
-        if text and 500 < len(text) < 10000:
-            # Check if it contains job-related keywords
+        if text and 300 < len(text) < 15000:  # Increased max length
+            # Check if it doesn't start with navigation text
             text_lower = text.lower()
-            if any(keyword in text_lower for keyword in ['responsibilities', 'requirements', 'qualifications', 'experience', 'skills', 'duties', 'role', 'position']):
+            first_200 = text_lower[:200]
+            if any(nav in first_200 for nav in ['skip to content', 'job title, skills', 'search jobs', 'sign in', 'post jobs']):
+                continue
+            
+            # Check if it contains job-related keywords OR is just substantial text
+            has_job_keywords = any(keyword in text_lower for keyword in [
+                'responsibilities', 'requirements', 'qualifications', 'experience', 
+                'skills', 'duties', 'role', 'position', 'we are', 'looking for',
+                'you will', 'client', 'partners', 'team', 'develop', 'build'
+            ])
+            
+            # If it has job keywords OR is very substantial, consider it
+            if has_job_keywords or len(text) > 800:
                 # Remove unwanted sections
-                for unwanted in div.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended', re.I)):
+                div_copy = BeautifulSoup(str(div), 'html.parser')
+                for unwanted in div_copy.find_all(['div', 'section'], class_=re.compile(r'similar|related|recommended|navigation|header|footer', re.I)):
                     unwanted.decompose()
-                description = div.get_text(strip=True)
-                description = re.sub(r'Our Most Similar Jobs.*?View more similar jobs', '', description, flags=re.DOTALL | re.IGNORECASE)
-                description = re.sub(r'\s+', ' ', description).strip()
-                if len(description) > 300:
-                    return description[:5000]
+                for tag in div_copy.find_all(['header', 'footer', 'nav', 'aside', 'button', 'form']):
+                    tag.decompose()
+                
+                description = div_copy.get_text(separator=' ', strip=True)
+                description = _clean_description_text(description)
+                
+                # If it's substantial and doesn't have too many nav patterns, use it
+                if description and len(description) > 300:
+                    # Count invalid patterns
+                    invalid_count = sum(1 for pattern in [
+                        'skip to content', 'job title, skills', 'search jobs', 
+                        'sign in', 'post jobs', 'simplyhired is part of'
+                    ] if pattern in description.lower())
+                    
+                    if invalid_count <= 1 and len(description) > best_length:
+                        best_description = description[:5000]
+                        best_length = len(description)
+    
+    if best_description:
+        return best_description
     
     return None
 
@@ -1415,6 +1712,25 @@ def _extract_location_from_full_page_simplyhired(soup: BeautifulSoup) -> Optiona
     """Extract location from SimplyHired's full job page."""
     location = None
     
+    # Invalid location patterns to reject (common navigation/header text)
+    invalid_location_patterns = [
+        'job title',
+        'skills',
+        'company',
+        'city, state',
+        'zip',
+        'search',
+        'sign in',
+        'create account',
+        'post jobs',
+        'browse',
+        'resources',
+        'tools',
+        'country',
+        'simplyhired',
+        'indeed',
+    ]
+    
     # Priority 1: Direct location selectors
     location_selectors = [
         'div[data-testid="viewjob-location"]',
@@ -1430,7 +1746,10 @@ def _extract_location_from_full_page_simplyhired(soup: BeautifulSoup) -> Optiona
         if location_elem:
             location = location_elem.get_text(strip=True)
             if location and len(location) > 2:
-                return location
+                # Validate location - reject if it matches invalid patterns
+                location_lower = location.lower()
+                if not any(pattern in location_lower for pattern in invalid_location_patterns):
+                    return location
     
     # Priority 2: Look in structured data
     json_ld_scripts = soup.find_all('script', type='application/ld+json')
@@ -1448,12 +1767,16 @@ def _extract_location_from_full_page_simplyhired(soup: BeautifulSoup) -> Optiona
                         city = address.get('addressLocality', '')
                         state = address.get('addressRegion', '')
                         if city and state:
-                            return f"{city}, {state}"
+                            potential_location = f"{city}, {state}"
+                            # Validate location
+                            if not any(pattern in potential_location.lower() for pattern in invalid_location_patterns):
+                                return potential_location
                         elif city:
-                            return city
+                            if not any(pattern in city.lower() for pattern in invalid_location_patterns):
+                                return city
                         # Or try addressCountry
                         country = address.get('addressCountry', '')
-                        if country:
+                        if country and country.upper() not in ['US', 'USA', 'UNITED STATES']:
                             return country
         except:
             pass
@@ -1475,8 +1798,10 @@ def _extract_location_from_full_page_simplyhired(soup: BeautifulSoup) -> Optiona
         if match:
             location_parts = [g for g in match.groups() if g]
             if location_parts:
-                location = ', '.join(location_parts)
-                return location
+                potential_location = ', '.join(location_parts)
+                # Validate location
+                if not any(pattern in potential_location.lower() for pattern in invalid_location_patterns):
+                    return potential_location
     
     # Priority 4: Look for remote/hybrid indicators
     text_lower = page_text.lower()
@@ -1728,6 +2053,26 @@ def _extract_detailed_job_info_simplyhired(card) -> Optional[Job]:
         industry = _extract_industry_simplyhired(card)
         company_size = _extract_company_size_simplyhired(card)
         
+        # Final validation: Ensure location is correct for remote jobs
+        invalid_location_patterns = ['job title', 'skills', 'company', 'city, state', 'zip', 'search']
+        if location:
+            location_lower = location.lower()
+            is_invalid = any(pattern in location_lower for pattern in invalid_location_patterns)
+            if is_invalid:
+                # If location is invalid, set based on remote_type
+                if remote_type == 'Remote':
+                    location = 'Remote'
+                elif remote_type == 'Hybrid':
+                    location = 'Hybrid'
+                else:
+                    location = None  # For on-site, we need a valid location
+        elif remote_type == 'Remote':
+            # No location found but job is remote
+            location = 'Remote'
+        elif remote_type == 'Hybrid':
+            # No location found but job is hybrid
+            location = 'Hybrid'
+        
         return Job(
             title=title,
             company=company,
@@ -1868,10 +2213,26 @@ def _scrape_sync_simplyhired(
             base_url = "https://www.simplyhired.com/search"
             params = f"?q={quote_plus(query)}"
             
-            if location:
+            # Handle job_type filter - if remote, bypass location and search all over United States
+            # Similar to how Indeed handles remote jobs
+            if job_type and job_type.lower() in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+                # For remote jobs, use location=remote to search all over United States
+                # This bypasses any specific location filter
+                job_type_filter = _get_simplyhired_job_type_filter(job_type)
+                if job_type_filter:
+                    params += f"&{job_type_filter}"
+                    print(f"DEBUG - Job type '{job_type}' mapped to filter '{job_type_filter}' (bypassing location, searching all US)")
+            elif location:
+                # Only add location if job_type is not remote
                 location_param = _format_location_for_simplyhired(location)
                 params += f"&l={location_param}"
                 print(f"DEBUG - Location '{location}' formatted as '{location_param}'")
+            
+            # Add job type filter for hybrid/onsite (if not already handled above)
+            if job_type and job_type.lower() not in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+                # For hybrid/onsite, SimplyHired doesn't have URL-level filters
+                # We'll rely on post-scraping filtering
+                print(f"DEBUG - Job type '{job_type}' will be filtered post-scraping (no URL parameter available)")
             
             # Add employment type filter
             if employment_type:

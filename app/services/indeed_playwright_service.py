@@ -63,6 +63,39 @@ except Exception as stealth_error:
     print(f"⚠️  Error initializing playwright-stealth: {stealth_error}")
 
 
+def _get_indeed_job_type_filter(job_type: str) -> Optional[str]:
+    """Get Indeed job type filter parameter (remote/hybrid/onsite).
+    
+    Indeed uses location parameter 'l=remote' for remote jobs to search all over United States.
+    For hybrid and onsite, we rely on post-scraping filtering as Indeed
+    doesn't have explicit URL parameters for these (uses jt parameter for employment type).
+    """
+    job_type = job_type.lower().strip()
+    
+    # Indeed uses 'l=remote' for remote job searches
+    # This bypasses location filtering and searches all over United States
+    if job_type in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+        return 'remote'
+    
+    # For hybrid and onsite, Indeed doesn't have URL-level filters via location
+    # We'll rely on post-scraping filtering based on job.remote_type
+    # Return None to indicate no location parameter needed
+    return None
+
+
+def _format_location_for_indeed(location: str) -> str:
+    """Format location for Indeed search."""
+    location = location.strip()
+    
+    # Handle remote job types
+    if location.lower() in ['remote', 'work from home', 'wfh']:
+        return 'remote'
+    
+    # Indeed accepts various location formats
+    # URL encode spaces and special characters
+    return quote_plus(location)
+
+
 # Global browser resources - properly managed to prevent resource leaks
 _playwright: Optional["Playwright"] = None
 _browser: Optional[Browser] = None
@@ -689,17 +722,34 @@ async def scrape_indeed_playwright(
     try:
         # Build Indeed URL
         base_url = "https://www.indeed.com/jobs"
-        params = {"q": query}
-        if location:
-            params["l"] = location
-        if job_type:
-            params["jt"] = job_type.lower()
-        if salary_min:
-            params["salary"] = f"{salary_min}-{salary_max or ''}"
-        
         url = f"{base_url}?q={quote_plus(query)}"
-        if location:
-            url += f"&l={quote_plus(location)}"
+        
+        # Handle job_type filter - if remote, bypass location and search all over United States
+        # Similar to how SimplyHired handles remote jobs
+        if job_type and job_type.lower() in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+            # For remote jobs, use location=remote to search all over United States
+            # This bypasses any specific location filter
+            job_type_location = _get_indeed_job_type_filter(job_type)
+            if job_type_location:
+                url += f"&l={quote_plus(job_type_location)}"
+                print(f"DEBUG - Job type '{job_type}' mapped to location '{job_type_location}' (bypassing location, searching all US)")
+        elif location:
+            # Only add location if job_type is not remote
+            location_param = _format_location_for_indeed(location)
+            url += f"&l={quote_plus(location_param)}"
+            print(f"DEBUG - Location '{location}' formatted as '{location_param}'")
+        
+        # Add job type filter for hybrid/onsite (if not already handled above)
+        if job_type and job_type.lower() not in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
+            # For hybrid/onsite, Indeed doesn't have URL-level filters via location
+            # We'll rely on post-scraping filtering
+            print(f"DEBUG - Job type '{job_type}' will be filtered post-scraping (no URL location parameter available)")
+        
+        # Add salary filter if provided
+        if salary_min:
+            salary_param = f"{salary_min}-{salary_max or ''}"
+            url += f"&salary={quote_plus(salary_param)}"
+            print(f"DEBUG - Salary filter: {salary_param}")
         
         print(f"🌐 Navigating to: {url}")
         
