@@ -1,18 +1,14 @@
 """
-Playwright-based Indeed scraper - COMPLETE FIXED VERSION
+Playwright-based Indeed scraper - Optimized for best performance with proxy rotation.
 
-This version fixes all the lock errors and resource exhaustion issues that occur
-after scraping 40-45 jobs.
-
-Key improvements:
-- Proper async lock handling
-- Better page lifecycle management  
-- Reduced resource consumption
-- Proper cleanup strategies
-- No more lock errors after 40+ jobs
-
-Author: Fixed version
-Date: 2024
+Benefits:
+- No ChromeDriver version issues (bundles its own browser)
+- Better resource management
+- More stable in headless mode
+- Better error handling
+- Fast navigation with smart waiting strategies
+- Proxy rotation support for avoiding blocks
+- Smart proxy rotation per job fetch to avoid detection
 """
 
 import time
@@ -42,7 +38,7 @@ try:
         chrome_app=True,
         chrome_csi=True,
         chrome_load_times=True,
-        chrome_runtime=True,
+        chrome_runtime=True,  # Enable chrome.runtime
         navigator_webdriver=True,
         navigator_plugins=True,
         navigator_languages=True,
@@ -67,38 +63,33 @@ except Exception as stealth_error:
     print(f"⚠️  Error initializing playwright-stealth: {stealth_error}")
 
 
-# Global browser resources - FIXED with proper locking
+# Global browser resources - properly managed to prevent resource leaks
 _playwright: Optional["Playwright"] = None
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
 _proxy_manager: Optional[ProxyManager] = None
 _current_proxy: Optional[str] = None
 _last_fetch = 0
-_active_pages: Dict[int, Page] = {}  # FIXED: Changed from Set to Dict to track actual page objects
-_resource_lock: Optional[asyncio.Lock] = None  # FIXED: Will be initialized in async context
-_max_concurrent_pages = 3  # FIXED: Reduced from 5 to prevent resource exhaustion
-_browser_creation_count = 0
-_last_cleanup_time = 0
-_cleanup_interval = 300  # 5 minutes
-_scrape_count = 0
-_max_scrapes_before_cleanup = 15  # FIXED: Reduced from 20 to cleanup more frequently
-
-
-def _get_or_create_lock():
-    """FIXED: Get or create the resource lock in async context."""
-    global _resource_lock
-    if _resource_lock is None:
-        try:
-            loop = asyncio.get_running_loop()
-            _resource_lock = asyncio.Lock()
-        except RuntimeError:
-            # No running loop yet, will be created later
-            pass
-    return _resource_lock
+_active_pages: Set[int] = set()  # Track active page IDs
+_resource_lock = asyncio.Lock() if PLAYWRIGHT_AVAILABLE else None  # Lock for resource management
+_max_pages_per_context = 5  # Maximum concurrent pages
+_browser_creation_count = 0  # Track how many times browser was created
+_last_cleanup_time = 0  # Last time resources were cleaned up
+_cleanup_interval = 300  # Cleanup every 5 minutes
+_scrape_count = 0  # Count of scrapes since last full cleanup
+_max_scrapes_before_cleanup = 20  # Force cleanup after this many scrapes
 
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Optional[Dict]:
-    """Parse a proxy URL into Playwright's proxy format."""
+    """
+    Parse a proxy URL into Playwright's proxy format.
+    
+    Args:
+        proxy_url: Proxy URL in format http://user:pass@host:port
+        
+    Returns:
+        Dict with 'server', 'username', 'password' for Playwright
+    """
     if not proxy_url:
         return None
     
@@ -193,20 +184,12 @@ class CloudflareBlockedError(Exception):
 
 
 async def _force_cleanup_all_resources():
-    """FIXED: Force cleanup of all Playwright resources with proper error handling."""
+    """Force cleanup of all Playwright resources to prevent resource leaks."""
     global _playwright, _browser, _context, _active_pages, _browser_creation_count, _scrape_count
     
     print("🧹 Force cleaning up all Playwright resources...")
     
-    # Close all active pages first
-    pages_to_close = list(_active_pages.values())
-    for page in pages_to_close:
-        try:
-            if not page.is_closed():
-                await page.close()
-        except Exception as e:
-            print(f"  ⚠️  Error closing page: {e}")
-    
+    # Close all tracked pages
     _active_pages.clear()
     
     # Close context
@@ -272,7 +255,7 @@ async def _check_and_cleanup_resources():
         should_cleanup = True
         reason = f"max scrapes reached ({_scrape_count}/{_max_scrapes_before_cleanup})"
     
-    if len(_active_pages) > _max_concurrent_pages:
+    if len(_active_pages) > _max_pages_per_context:
         should_cleanup = True
         reason = f"too many active pages ({len(_active_pages)})"
     
@@ -283,13 +266,14 @@ async def _check_and_cleanup_resources():
         _scrape_count = 0
 
 
-async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tuple[Browser, BrowserContext]:
+async def get_browser(force_new: bool = False, rotate_proxy: bool = False, new_context_only: bool = False) -> tuple[Browser, BrowserContext]:
     """
-    FIXED: Get or create a Playwright browser instance with proper locking.
+    Get or create a Playwright browser instance with stealth and proxy support.
     
     Args:
         force_new: If True, create a new browser instance
         rotate_proxy: If True, rotate to the next proxy before creating browser
+        new_context_only: If True, only create new context (for auto-rotating proxies)
         
     Returns:
         Tuple of (browser, context)
@@ -299,220 +283,253 @@ async def get_browser(force_new: bool = False, rotate_proxy: bool = False) -> tu
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
     
-    # FIXED: Get or create lock in async context
-    resource_lock = _get_or_create_lock()
-    if resource_lock is None:
-        resource_lock = asyncio.Lock()
+    # Check if we need to cleanup resources
+    await _check_and_cleanup_resources()
     
-    # FIXED: Use lock to prevent concurrent browser creation
-    async with resource_lock:
-        # Check if we need to cleanup resources
-        await _check_and_cleanup_resources()
-        
-        # Check if existing browser is still usable
-        if _browser and not force_new:
+    # If new_context_only is True and browser exists, just create new context
+    if new_context_only and _browser and _browser.is_connected():
+        # Close existing context
+        if _context:
             try:
-                # Check if browser is still alive
-                if _browser.is_connected():
-                    # Check if we should rotate proxy based on time
-                    if _proxy_manager and _proxy_manager.should_rotate():
-                        print("🔄 Proxy rotation interval reached - recreating context")
-                        # Only recreate context, not entire browser
-                        if _context:
-                            try:
-                                await _context.close()
-                            except:
-                                pass
-                            _context = None
-                    else:
-                        # Browser and context are good
-                        if _context:
-                            return _browser, _context
-            except:
-                # Browser is dead, cleanup and create new one
-                print("⚠️  Browser connection lost, cleaning up...")
-                await _force_cleanup_all_resources()
+                await _context.close()
+                print("  ✓ Old context closed for rotation")
+            except Exception as e:
+                print(f"  ⚠️  Error closing old context: {e}")
         
-        # If force_new, cleanup existing resources first
-        if force_new:
-            await _force_cleanup_all_resources()
+        # Create new context with same proxy (proxy rotates per request)
+        proxy_config = _get_current_proxy_config()
         
-        # Clear active pages tracking for new browser
-        _active_pages.clear()
+        accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
+        locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
         
-        # Get proxy configuration
-        if rotate_proxy:
-            proxy_config = _rotate_proxy_on_error()
-        else:
-            proxy_config = _get_current_proxy_config()
+        context_options = {
+            "viewport": {"width": 1280, "height": 720},
+            "user_agent": settings.USER_AGENT,
+            "locale": locale,
+            "timezone_id": "America/New_York",
+            "java_script_enabled": True,
+            "bypass_csp": True,
+            "ignore_https_errors": True,
+            "accept_downloads": False,
+        }
         
         if proxy_config:
-            print(f"🌐 Creating browser instance with proxy: {proxy_config['server']}")
+            context_options["proxy"] = proxy_config
+        
+        _context = await _browser.new_context(**context_options)
+        
+        # Apply stealth to new context
+        if STEALTH_AVAILABLE and _stealth:
+            await _stealth.apply_stealth_async(_context)
         else:
-            print("🌐 Creating browser instance (no proxy - direct connection)")
+            await _context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}, loadTimes: function() {}, csi: function() {}, app: {}};
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            """)
         
-        # Create new playwright instance if needed
-        if not _playwright:
-            try:
-                _playwright = await async_playwright().start()
-                _browser_creation_count += 1
-                print(f"✓ Playwright started (creation #{_browser_creation_count})")
-            except Exception as playwright_error:
-                error_msg = f"Failed to start Playwright: {str(playwright_error)}"
-                print(f"❌ {error_msg}")
-                await _force_cleanup_all_resources()
-                raise Exception(f"{error_msg}. Run: python -m playwright install chromium")
-        
-        # Launch browser with optimized settings for headless mode
-        if not _browser:
-            try:
-                _browser = await _playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-extensions",
-                        "--disable-software-rasterizer",
-                        "--single-process",
-                        "--no-zygote",
-                        "--window-size=1280,720",
-                        "--disable-background-networking",
-                        "--disable-background-timer-throttling",
-                        "--disable-client-side-phishing-detection",
-                        "--disable-default-apps",
-                        "--disable-sync",
-                        "--metrics-recording-only",
-                        "--mute-audio",
-                        "--disable-blink-features=AutomationControlled",
-                    ]
-                )
-            except Exception as launch_error:
-                error_msg = f"Failed to launch Chromium browser: {str(launch_error)}"
-                print(f"❌ {error_msg}")
-                await _force_cleanup_all_resources()
-                raise Exception(f"{error_msg}. Run: python -m playwright install chromium")
-        
-        # Create context if needed
-        if not _context:
-            # Get accept language with proper fallback
-            accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
-            locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
-            
-            # Create context with realistic settings
-            context_options = {
-                "viewport": {"width": 1280, "height": 720},
-                "user_agent": settings.USER_AGENT,
-                "locale": locale,
-                "timezone_id": "America/New_York",
-                "java_script_enabled": True,
-                "bypass_csp": True,
-                "ignore_https_errors": True,
-                "accept_downloads": False,
-            }
-            
-            # Add proxy configuration if available
-            if proxy_config:
-                context_options["proxy"] = proxy_config
-                print(f"✓ Proxy configured for browser context")
-            
-            _context = await _browser.new_context(**context_options)
-            
-            # Apply comprehensive stealth using playwright-stealth library
-            if STEALTH_AVAILABLE and _stealth:
-                await _stealth.apply_stealth_async(_context)
-                print("✓ Playwright-stealth applied (comprehensive anti-detection)")
-            else:
-                # Fallback to basic stealth script if playwright-stealth not available
-                print("ℹ️  Using basic stealth (install playwright-stealth for better detection avoidance)")
-                await _context.add_init_script("""
-                    // Hide webdriver property
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    
-                    // Add plugins
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
-                    
-                    // Set languages
-                    Object.defineProperty(navigator, 'languages', {
-                        get: () => ['en-US', 'en']
-                    });
-                    
-                    // Add chrome runtime
-                    window.chrome = {
-                        runtime: {},
-                        loadTimes: function() {},
-                        csi: function() {},
-                        app: {}
-                    };
-                    
-                    // Override permissions
-                    const originalQuery = window.navigator.permissions.query;
-                    window.navigator.permissions.query = (parameters) => (
-                        parameters.name === 'notifications' ?
-                            Promise.resolve({ state: Notification.permission }) :
-                            originalQuery(parameters)
-                    );
-                    
-                    // Mock platform
-                    Object.defineProperty(navigator, 'platform', {
-                        get: () => 'Win32'
-                    });
-                    
-                    // Mock hardware concurrency
-                    Object.defineProperty(navigator, 'hardwareConcurrency', {
-                        get: () => 8
-                    });
-                    
-                    // Mock device memory
-                    Object.defineProperty(navigator, 'deviceMemory', {
-                        get: () => 8
-                    });
-                """)
-        
+        print("  ✓ New context created with proxy rotation")
         return _browser, _context
+    
+    if _browser and not force_new:
+        try:
+            # Check if browser is still alive
+            if _browser.is_connected():
+                # Check if we should rotate proxy based on time
+                if _proxy_manager and _proxy_manager.should_rotate():
+                    print("🔄 Proxy rotation interval reached - recreating browser with new proxy")
+                    force_new = True
+                else:
+                    return _browser, _context
+        except:
+            # Browser is dead, cleanup and create new one
+            print("⚠️  Browser connection lost, cleaning up...")
+            await _force_cleanup_all_resources()
+    
+    # If force_new, cleanup existing resources first
+    if force_new:
+        await _force_cleanup_all_resources()
+    
+    # Clear active pages tracking for new browser
+    _active_pages.clear()
+    
+    # Get proxy configuration
+    if rotate_proxy:
+        proxy_config = _rotate_proxy_on_error()
+    else:
+        proxy_config = _get_current_proxy_config()
+    
+    if proxy_config:
+        print(f"🌐 Creating browser instance with proxy: {proxy_config['server']}")
+    else:
+        print("🌐 Creating browser instance (no proxy - direct connection)")
+    
+    # Create new playwright instance if needed
+    if not _playwright:
+        try:
+            _playwright = await async_playwright().start()
+            _browser_creation_count += 1
+            print(f"✓ Playwright started (creation #{_browser_creation_count})")
+        except Exception as playwright_error:
+            error_msg = f"Failed to start Playwright: {str(playwright_error)}"
+            print(f"❌ {error_msg}")
+            import traceback
+            print(f"   Traceback: {traceback.format_exc()}")
+            raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
+    
+    # Launch browser with optimized settings for headless mode
+    try:
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-software-rasterizer",
+            "--single-process",
+            "--no-zygote",
+            "--window-size=1280,720",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-client-side-phishing-detection",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--mute-audio",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        )
+    except Exception as launch_error:
+        error_msg = f"Failed to launch Chromium browser: {str(launch_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        # Cleanup on failure
+        await _force_cleanup_all_resources()
+        raise Exception(f"{error_msg}. This usually means Playwright browsers are not installed. Run: python -m playwright install chromium")
+    
+    # Get accept language with proper fallback
+    accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
+    locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
+    
+    # Create context with realistic settings
+    context_options = {
+        "viewport": {"width": 1280, "height": 720},
+        "user_agent": settings.USER_AGENT,
+        "locale": locale,
+        "timezone_id": "America/New_York",
+        "java_script_enabled": True,
+        "bypass_csp": True,
+        "ignore_https_errors": True,
+        "accept_downloads": False,
+    }
+    
+    # Add proxy configuration if available
+    if proxy_config:
+        context_options["proxy"] = proxy_config
+        print(f"✓ Proxy configured for browser context")
+    
+    _context = await _browser.new_context(**context_options)
+    
+    # Apply comprehensive stealth using playwright-stealth library
+    # This handles: webdriver, plugins, languages, chrome runtime, permissions,
+    # WebGL vendor/renderer, canvas fingerprint, and many more detection vectors
+    if STEALTH_AVAILABLE and _stealth:
+        # Apply stealth to the context - all pages will inherit stealth settings
+        await _stealth.apply_stealth_async(_context)
+        print("✓ Playwright-stealth applied (comprehensive anti-detection)")
+    else:
+        # Fallback to basic stealth script if playwright-stealth not available
+        print("ℹ️  Using basic stealth (install playwright-stealth for better detection avoidance)")
+        await _context.add_init_script("""
+            // Hide webdriver property
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            
+            // Add plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // Set languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            
+            // Add chrome runtime
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+            
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Mock platform
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'Win32'
+            });
+            
+            // Mock hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8
+            });
+            
+            // Mock device memory
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8
+            });
+        """)
+    
+    return _browser, _context
 
 
 async def close_browser():
     """Close the browser and clean up ALL resources including Playwright instance."""
-    resource_lock = _get_or_create_lock()
-    if resource_lock:
-        async with resource_lock:
-            await _force_cleanup_all_resources()
-    else:
-        await _force_cleanup_all_resources()
+    await _force_cleanup_all_resources()
 
 
 async def create_page_with_tracking(context: BrowserContext) -> Page:
     """
-    FIXED: Create a new page with resource tracking.
+    Create a new page with resource tracking.
     Ensures we don't exceed max pages per context.
     """
     global _active_pages
     
-    # FIXED: Check if we have too many active pages and close oldest
-    if len(_active_pages) >= _max_concurrent_pages:
-        print(f"⚠️  Maximum pages ({_max_concurrent_pages}) reached, closing oldest page...")
-        # Close the oldest page (first in dict)
-        oldest_page_id = next(iter(_active_pages))
-        oldest_page = _active_pages[oldest_page_id]
-        try:
-            if not oldest_page.is_closed():
-                await oldest_page.close()
-        except Exception as e:
-            print(f"⚠️  Error closing oldest page: {e}")
-        del _active_pages[oldest_page_id]
+    # Check if we have too many active pages
+    if len(_active_pages) >= _max_pages_per_context:
+        print(f"⚠️  Maximum pages ({_max_pages_per_context}) reached, cleaning up old pages...")
+        # Force cleanup and reset
+        await _force_cleanup_all_resources()
+        # Get new browser/context
+        _, context = await get_browser(force_new=True)
     
     page = await context.new_page()
     page_id = id(page)
-    _active_pages[page_id] = page  # FIXED: Store page object, not just ID
+    _active_pages.add(page_id)
     print(f"📄 Created page (active: {len(_active_pages)})")
     return page
 
 
 async def close_page_with_tracking(page: Page):
-    """FIXED: Close a page and remove from tracking."""
+    """Close a page and remove from tracking."""
     global _active_pages
     
     if page:
@@ -523,30 +540,17 @@ async def close_page_with_tracking(page: Page):
         except Exception as e:
             print(f"⚠️  Error closing page: {e}")
         
-        # FIXED: Remove from dict instead of set
-        if page_id in _active_pages:
-            del _active_pages[page_id]
+        _active_pages.discard(page_id)
         print(f"📄 Closed page (active: {len(_active_pages)})")
 
 
-async def close_all_pages():
-    """FIXED: Helper function to close all tracked pages."""
-    global _active_pages
-    
-    pages_to_close = list(_active_pages.values())
-    for page in pages_to_close:
-        try:
-            if not page.is_closed():
-                await page.close()
-        except Exception as e:
-            print(f"⚠️  Error closing page: {e}")
-    
-    _active_pages.clear()
-    print(f"📄 Closed all pages")
-
-
 def get_proxy_stats() -> Optional[Dict]:
-    """Get current proxy statistics for monitoring/debugging."""
+    """
+    Get current proxy statistics for monitoring/debugging.
+    
+    Returns:
+        Dict with proxy stats or None if no proxy manager
+    """
     if not _proxy_manager:
         return None
     return _proxy_manager.get_proxy_stats()
@@ -562,13 +566,16 @@ def reset_proxy_manager_state():
 
 
 def get_browser_resource_stats() -> Dict:
-    """Get current browser resource statistics for monitoring."""
+    """
+    Get current browser resource statistics for monitoring.
+    Useful for debugging resource leaks.
+    """
     return {
         "playwright_active": _playwright is not None,
         "browser_connected": _browser.is_connected() if _browser else False,
         "context_active": _context is not None,
         "active_pages": len(_active_pages),
-        "max_concurrent_pages": _max_concurrent_pages,
+        "max_pages_per_context": _max_pages_per_context,
         "browser_creation_count": _browser_creation_count,
         "scrape_count": _scrape_count,
         "max_scrapes_before_cleanup": _max_scrapes_before_cleanup,
@@ -606,6 +613,462 @@ def _sync_cleanup_atexit():
 
 # Register cleanup on exit
 atexit.register(_sync_cleanup_atexit)
+
+
+async def scrape_indeed_playwright(
+    query: str,
+    location: Optional[str] = None,
+    max_results: int = 20,
+    job_type: Optional[str] = None,
+    salary_min: Optional[int] = None,
+    salary_max: Optional[int] = None,
+    experience_level: Optional[str] = None,
+    employment_type: Optional[str] = None,
+    days_old: Optional[int] = None,
+    fetch_full_details: bool = True  # Set to False for faster scraping (skip job detail pages)
+) -> List[Job]:
+    """
+    Scrape Indeed jobs using Playwright.
+    
+    Args:
+        query: Job search query
+        location: Job location
+        max_results: Maximum number of jobs to return
+        job_type: Job type filter
+        salary_min: Minimum salary
+        salary_max: Maximum salary
+        experience_level: Experience level filter
+        employment_type: Employment type filter
+        days_old: Filter jobs posted within last N days
+        
+    Returns:
+        List of Job objects
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
+    
+    global _last_fetch, _scrape_count
+    
+    # Increment scrape counter for resource management
+    _scrape_count += 1
+    print(f"🔍 Starting scrape #{_scrape_count} (cleanup threshold: {_max_scrapes_before_cleanup})")
+    
+    # Rate limiting
+    now = time.monotonic()
+    jitter = random.uniform(0, 0.75)
+    wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_fetch = time.monotonic()
+    
+    page = None  # Initialize page variable for cleanup in finally block
+    
+    try:
+        browser, context = await get_browser()
+    except Exception as browser_error:
+        error_msg = f"Failed to get browser: {str(browser_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        # Force cleanup on browser creation failure
+        await _force_cleanup_all_resources()
+        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
+    
+    try:
+        page = await create_page_with_tracking(context)
+        # Stealth is already applied to context, no need to apply to individual pages
+    except Exception as page_error:
+        error_msg = f"Failed to create page: {str(page_error)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        # Force cleanup on page creation failure
+        await _force_cleanup_all_resources()
+        raise Exception(f"{error_msg}. This may indicate Playwright browsers are not installed. Run: python -m playwright install chromium")
+    
+    try:
+        # Build Indeed URL
+        base_url = "https://www.indeed.com/jobs"
+        params = {"q": query}
+        if location:
+            params["l"] = location
+        if job_type:
+            params["jt"] = job_type.lower()
+        if salary_min:
+            params["salary"] = f"{salary_min}-{salary_max or ''}"
+        
+        url = f"{base_url}?q={quote_plus(query)}"
+        if location:
+            url += f"&l={quote_plus(location)}"
+        
+        print(f"🌐 Navigating to: {url}")
+        
+        # Save the original search URL (without any job view parameters)
+        original_search_url = url
+        
+        # Navigate with retry logic for Cloudflare
+        max_retries = getattr(settings, "MAX_RETRIES", 3)
+        cloudflare_retries = 0
+        
+        while True:
+            try:
+                # Optimized navigation strategy for Playwright
+                navigation_timeout = 30000  # 30 seconds - optimized for direct connection
+                navigation_success = False
+                
+                # Strategy 1: domcontentloaded (fastest, best for Playwright)
+                try:
+                    print(f"   Navigating (domcontentloaded, {navigation_timeout/1000}s timeout)...")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
+                    print("✓ Navigation completed")
+                    navigation_success = True
+                except Exception as nav_error1:
+                    error_type = type(nav_error1).__name__
+                    error_msg = str(nav_error1)
+                    print(f"⚠️  domcontentloaded failed: {error_msg[:100]}...")
+                    
+                    # Strategy 2: commit + manual waiting (most reliable fallback)
+                    try:
+                        print(f"   Trying commit strategy...")
+                        await page.goto(url, wait_until="commit", timeout=15000)
+                        print("✓ Navigation started (commit)")
+                        
+                        # Wait for body element
+                        await page.wait_for_selector('body', timeout=20000, state='attached')
+                        print("✓ Body loaded")
+                        
+                        # Wait for job content
+                        try:
+                            await page.wait_for_selector(
+                                'div[data-jk], div.job_seen_beacon, div[class*="job"]',
+                                timeout=15000,
+                                state='attached'
+                            )
+                            print("✓ Job content detected")
+                        except:
+                            # Give page time to load
+                            await page.wait_for_timeout(3000)
+                            body_text = await page.evaluate("document.body ? document.body.innerText.length : 0")
+                            if body_text > 100:
+                                print(f"✓ Page has content ({body_text} chars)")
+                        
+                        navigation_success = True
+                    except Exception as commit_error:
+                        print(f"⚠️  All navigation strategies failed: {str(commit_error)[:100]}")
+                        navigation_success = False
+                
+                # Wait for page content
+                if navigation_success:
+                    await page.wait_for_timeout(2000)
+                else:
+                    # Try scrolling to trigger lazy loading
+                    await page.wait_for_timeout(3000)
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        await page.wait_for_timeout(1500)
+                    except:
+                        pass
+                
+                # Wait for job listings
+                try:
+                    await page.wait_for_selector(
+                        'div[data-jk], div.job_seen_beacon, #challenge-form',
+                        timeout=15000,
+                        state='attached'
+                    )
+                except:
+                    await page.wait_for_timeout(2000)
+                
+                # Get page content
+                page_html = await page.content()
+                
+                # Check page state
+                try:
+                    page_title = await page.title()
+                    current_url = page.url
+                    body_exists = await page.evaluate("document.body !== null")
+                    body_length = await page.evaluate("document.body ? document.body.innerText.length : 0")
+                    
+                    print(f"🔍 Page: '{page_title[:50]}', {len(page_html)} chars, body: {body_length} chars")
+                    
+                    # Wait for content if needed
+                    if len(page_html) < 500 or body_length < 100:
+                        print(f"⚠️  Waiting for content...")
+                        for attempt in range(3):
+                            await page.wait_for_timeout(3000)
+                            page_html = await page.content()
+                            body_length = await page.evaluate("document.body ? document.body.innerText.length : 0")
+                            if len(page_html) > 1000 and body_length > 100:
+                                print(f"✓ Content loaded")
+                                break
+                    
+                    # Check for Chrome error pages
+                    if 'chrome-error://' in current_url or 'chromewebdata' in current_url:
+                        raise Exception("Network error - Chrome error page detected")
+                    
+                except Exception as check_err:
+                    if "Network error" in str(check_err) or "Chrome error" in str(check_err):
+                        raise
+                    pass
+                
+                # Check for Cloudflare blocking (more comprehensive detection)
+                has_cloudflare_indicators = (
+                    "Checking your browser" in page_html
+                    or "Enable JavaScript and cookies to continue" in page_html
+                    or "challenge-platform" in page_html
+                    or "cf-browser-verification" in page_html
+                    or "Just a moment" in page_html
+                    or "Ray ID" in page_html  # Cloudflare Ray ID
+                    or "cf-challenge" in page_html.lower()
+                    or "challenge-form" in page_html.lower()
+                )
+                
+                # Check for Indeed content (more comprehensive)
+                has_indeed_content = (
+                    'id="mosaic-provider-jobcards"' in page_html
+                    or 'class="jobsearch-ResultsList"' in page_html
+                    or 'data-jk=' in page_html
+                    or 'class="job_seen_beacon"' in page_html
+                    or 'indeed.com/jobs' in page_html
+                    or 'jobTitle' in page_html
+                )
+                
+                # Also check page title
+                try:
+                    page_title = await page.title()
+                    if "Just a moment" in page_title or "Checking" in page_title:
+                        has_cloudflare_indicators = True
+                except Exception:
+                    pass
+                
+                is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
+                
+                # If we have Indeed content, we're good (even if there are some Cloudflare indicators)
+                if has_indeed_content:
+                    is_actually_blocked = False
+                    print("✓ Indeed content detected - proceeding with scraping")
+                
+                if not is_actually_blocked:
+                    # Success - no Cloudflare block, mark proxy as successful
+                    _mark_proxy_success()
+                    break
+                
+                # Cloudflare detected - retry logic
+                if cloudflare_retries >= max_retries:
+                    raise CloudflareBlockedError(
+                        f"Indeed blocked by Cloudflare. Tried {cloudflare_retries + 1} times. "
+                        f"Try again later or use a different IP address."
+                    )
+                
+                # Retry with backoff
+                backoff = random.uniform(3.0, 6.0) * (1 + 0.5 * cloudflare_retries)
+                print(f"⚠️  Cloudflare detected, retry {cloudflare_retries + 1}/{max_retries}, waiting {backoff:.1f}s...")
+                
+                # Perform human-like interactions
+                if getattr(settings, "HUMANIZE", True):
+                    await _perform_human_interactions_playwright(page)
+                
+                # Clear cookies and wait
+                await context.clear_cookies()
+                await asyncio.sleep(backoff)
+                
+                # Recreate browser for fresh start with rotated proxy
+                # Properly close existing page and cleanup resources
+                if page:
+                    await close_page_with_tracking(page)
+                
+                # Rotate proxy on Cloudflare block - force_new will cleanup old resources
+                browser, context = await get_browser(force_new=True, rotate_proxy=True)
+                page = await create_page_with_tracking(context)
+                cloudflare_retries += 1
+                
+            except CloudflareBlockedError:
+                raise
+            except Exception as nav_error:
+                error_str = str(nav_error).lower()
+                
+                # Check if we got content despite error
+                if "timeout" in error_str:
+                    try:
+                        page_html = await page.content()
+                        if 'data-jk=' in page_html or 'job_seen_beacon' in page_html:
+                            print("✓ Got content despite timeout")
+                            break
+                    except:
+                        pass
+                
+                # Retry on error
+                if cloudflare_retries >= max_retries:
+                    raise Exception(f"Navigation failed after {max_retries} retries: {nav_error}")
+                
+                print(f"⚠️  Navigation error, retry {cloudflare_retries + 1}/{max_retries}...")
+                cloudflare_retries += 1
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+                
+                # Recreate browser with rotated proxy
+                # Properly close existing page and cleanup resources
+                if page:
+                    await close_page_with_tracking(page)
+                
+                # Rotate proxy on navigation error - force_new will cleanup old resources
+                browser, context = await get_browser(force_new=True, rotate_proxy=True)
+                page = await create_page_with_tracking(context)
+        
+        # Progressive scroll to load more jobs
+        await _progressive_scroll_playwright(page)
+        
+        # Get page content
+        content = await page.content()
+        
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(content, "html.parser")
+        
+        # Extract job cards (reuse existing extraction logic)
+        job_cards = _find_job_cards_indeed(soup)
+        
+        print(f"📋 Found {len(job_cards)} job cards")
+        
+        # Extract job data from listing page
+        jobs = []
+        browser_alive = True  # Track if browser is still usable
+        
+        if not fetch_full_details:
+            print("ℹ️  Fast mode: skipping job detail pages (using search results data only)")
+        
+        # NEW: Track job fetches and implement proxy rotation strategy
+        job_fetch_count = 0  # Track number of jobs fetched for proxy rotation
+        cloudflare_block_count = 0  # Track Cloudflare blocks on job pages
+        max_cloudflare_blocks = getattr(settings, "MAX_JOB_PAGE_CLOUDFLARE_BLOCKS", 3)  # Stop fetching details after N blocks
+        
+        # For rotating residential proxies (like Webshare), recreate browser per job
+        # This forces a fresh TCP connection and new IP from the proxy pool
+        use_auto_rotating_proxy = getattr(settings, "USE_AUTO_ROTATING_PROXY", True)
+        
+        # Delays configuration
+        min_delay_between_fetches = getattr(settings, "JOB_DETAIL_MIN_DELAY", 4.0)  # Longer delays for residential
+        max_delay_between_fetches = getattr(settings, "JOB_DETAIL_MAX_DELAY", 8.0)  # More variation
+        
+        for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
+            try:
+                job = _extract_job_from_card(card, query, location)
+                if job and job.title and job.url:
+                    # Check if we should stop fetching details due to too many Cloudflare blocks
+                    if cloudflare_block_count >= max_cloudflare_blocks:
+                        print(f"  ⚠️  Too many Cloudflare blocks ({cloudflare_block_count}) - switching to fast mode (no job detail pages)")
+                        fetch_full_details = False  # Disable detailed fetching
+                    
+                    # Enhanced extraction: Visit individual job page for complete data
+                    # Only attempt if browser is still alive AND fetch_full_details is True
+                    if fetch_full_details and browser_alive:
+                        print(f"  → Fetching complete data from job page: {job.title}")
+                        
+                        # NEW: Add delay before fetching (randomized for more human-like behavior)
+                        delay = random.uniform(min_delay_between_fetches, max_delay_between_fetches)
+                        print(f"    ⏳ Waiting {delay:.1f}s before fetch...")
+                        await asyncio.sleep(delay)
+                        
+                        # NEW: Perform human-like interactions BEFORE navigating to job page
+                        if getattr(settings, "HUMANIZE", True):
+                            try:
+                                # Scroll a bit on search results page
+                                await page.evaluate("window.scrollBy(0, Math.random() * 300)")
+                                await page.wait_for_timeout(random.uniform(500, 1000))
+                                # Move mouse randomly
+                                await page.mouse.move(
+                                    random.randint(100, 800),
+                                    random.randint(100, 500)
+                                )
+                                await page.wait_for_timeout(random.uniform(200, 500))
+                            except Exception:
+                                pass
+                        
+                        # SIMPLE APPROACH: Recreate browser to get fresh proxy connection
+                        # This forces Webshare to assign a new IP from the pool
+                        rotate_browser_per_job = getattr(settings, "ROTATE_BROWSER_PER_JOB", True)
+                        
+                        if use_auto_rotating_proxy and rotate_browser_per_job:
+                            try:
+                                print(f"    🔄 Recreating browser to force fresh proxy connection...")
+                                # Close current page
+                                await close_page_with_tracking(page)
+                                # Force new browser instance (closes all connections, gets new IP)
+                                browser, context = await get_browser(force_new=True, rotate_proxy=False)
+                                page = await create_page_with_tracking(context)
+                                print(f"    ✓ Browser recreated with fresh proxy connection")
+                                # Small delay after recreation
+                                await page.wait_for_timeout(random.uniform(1000, 2000))
+                            except Exception as browser_error:
+                                print(f"    ⚠️  Error recreating browser: {browser_error}")
+                                browser_alive = False
+                                continue
+                        
+                        try:
+                            # Check if page is still connected before navigating
+                            if page.is_closed():
+                                print("  ⚠️  Page was closed - skipping job detail extraction for remaining jobs")
+                                browser_alive = False
+                            else:
+                                enhanced_job = await _extract_complete_job_details_from_url_playwright(
+                                    page, job, original_search_url, 
+                                    skip_nav_back=use_auto_rotating_proxy and rotate_browser_per_job
+                                )
+                                if enhanced_job:
+                                    # Check if we got blocked (job would have Ray ID in requirements)
+                                    if enhanced_job.requirements and any('Ray ID' in str(req) for req in enhanced_job.requirements):
+                                        cloudflare_block_count += 1
+                                        print(f"    ⚠️  Cloudflare block detected (total: {cloudflare_block_count}/{max_cloudflare_blocks})")
+                                    else:
+                                        job = enhanced_job
+                                        job_fetch_count += 1
+                                
+                                # NEW: Add delay after fetching (slightly shorter than pre-fetch delay)
+                                post_fetch_delay = random.uniform(1.5, 3.0)
+                                await asyncio.sleep(post_fetch_delay)
+                        except Exception as enhance_error:
+                            error_msg = str(enhance_error).lower()
+                            if "closed" in error_msg or "target" in error_msg:
+                                # Browser/page was closed - stop trying to navigate
+                                print(f"  ⚠️  Browser closed during job detail extraction - using basic data for remaining jobs")
+                                browser_alive = False
+                            else:
+                                print(f"  ⚠️  Error enhancing job details: {enhance_error}")
+                            # Continue with basic job data if enhancement fails
+                    
+                    # Apply filters
+                    if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
+                        jobs.append(job)
+                        
+                        # Stop if we've reached max_results
+                        if len(jobs) >= max_results:
+                            break
+            except Exception as e:
+                print(f"⚠️  Error extracting job from card: {e}")
+                continue
+        
+        print(f"✓ Extracted {len(jobs)} jobs (fetched details from {job_fetch_count} job pages)")
+        return jobs
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Error during scraping: {error_msg}")
+        import traceback
+        print(f"   Full traceback:\n{traceback.format_exc()}")
+        
+        # Check for resource exhaustion errors
+        if "pthread_create" in error_msg or "Resource temporarily unavailable" in error_msg:
+            print("🚨 Resource exhaustion detected - forcing full cleanup")
+            await _force_cleanup_all_resources()
+            raise Exception(f"System resource exhaustion - browser resources have been cleaned up. Please retry the request.")
+        
+        # Re-raise with more context if it's a browser-related error
+        if "browser" in error_msg.lower() or "playwright" in error_msg.lower():
+            await _force_cleanup_all_resources()
+            raise Exception(f"Playwright browser error: {error_msg}. Ensure Playwright browsers are installed: python -m playwright install chromium")
+        raise
+    finally:
+        # Always close the page properly
+        if page:
+            await close_page_with_tracking(page)
 
 
 async def _progressive_scroll_playwright(page: Page):
@@ -735,6 +1198,77 @@ def _extract_job_id_indeed(card) -> Optional[str]:
             return id_match.group(1)
     
     return None
+
+
+def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optional[Job]:
+    """Extract comprehensive job data from a job card element (matches Selenium version)."""
+    try:
+        # Extract job ID with comprehensive fallbacks
+        job_id = _extract_job_id_indeed(card) or ''
+        
+        # Extract title
+        title = _extract_title_indeed(card)
+        if not title or len(title) < 3:
+            return None
+        
+        # Extract company information (name and URL)
+        company, company_url = _extract_company_info_indeed(card)
+        
+        # Extract location and remote type
+        job_location, remote_type = _extract_location_info_indeed(card)
+        
+        # Extract salary range
+        salary_range = _extract_salary_indeed(card)
+        
+        # Extract job type and employment type
+        job_type, employment_type = _extract_job_types_indeed(card)
+        
+        # Extract experience level
+        experience_level = _extract_experience_level_indeed(card)
+        
+        # Extract posted date
+        posted_date = _extract_posted_date_indeed(card)
+        
+        # Extract job description
+        description = _extract_description_indeed(card)
+       
+        # Extract job URL
+        job_url = _extract_job_url_indeed(card, job_id)
+        
+        # Extract skills, requirements, and benefits
+        skills = _extract_skills_indeed(card)
+        requirements = _extract_requirements_indeed(card)
+        benefits = _extract_benefits_indeed(card)
+        
+        # Extract industry and company size
+        industry = _extract_industry_indeed(card)
+        company_size = _extract_company_size_indeed(card)
+        
+        return Job(
+            title=title,
+            company=company or "Unknown",
+            company_url=company_url,
+            location=job_location or location or "Unknown",
+            description=description or "",
+            url=job_url or "",
+            salary_range=salary_range,
+            job_type=job_type,
+            posted_date=posted_date,
+            experience_level=experience_level,
+            benefits=benefits,
+            requirements=requirements,
+            skills=skills,
+            remote_type=remote_type,
+            employment_type=employment_type,
+            industry=industry,
+            company_size=company_size,
+            job_id=job_id
+        )
+    except Exception as e:
+        print(f"⚠️  Error extracting job data: {e}")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
+        return None
 
 
 def _extract_title_indeed(card) -> Optional[str]:
@@ -917,6 +1451,76 @@ def _extract_posted_date_indeed(card) -> Optional[str]:
     return None
 
 
+def _extract_description_indeed(card) -> Optional[str]:
+    """Extract job description from Indeed job card with enhanced selectors and fallback strategies."""
+    
+    # Strategy 1: Try specific Indeed data attributes first
+    data_attribute_selectors = [
+        '[data-testid*="job-snippet"]',
+        '[data-testid*="jobCard-snippet"]',
+        '[data-testid*="description"]',
+        '[data-mobtk*="description"]',
+    ]
+    
+    for selector in data_attribute_selectors:
+        desc_elem = card.select_one(selector)
+        if desc_elem:
+            description = desc_elem.get_text(strip=True)
+            if description and len(description) > 20:
+                return _clean_description(description)
+    
+    # Strategy 2: Try common class-based selectors
+    class_selectors = [
+        'div.job-snippet',
+        'div.job-snippet-container',
+        'ul.job-snippet',
+        'div[class*="jobCardShelfContainer"]',
+        'div[class*="job-snippet"]',
+        'div[class*="snippet"]',
+        'div[class*="job_summary"]',
+        'div[class*="summary"]',
+        'td.resultContent',  # Common Indeed structure
+        'div.resultContent',
+        'div.slider_container',
+        'div.job-description',
+        'span.job-snippet',
+    ]
+    
+    for selector in class_selectors:
+        desc_elem = card.select_one(selector)
+        if desc_elem:
+            # Try to get text from ul/li structure if present
+            if desc_elem.find('ul'):
+                items = desc_elem.select('li')
+                if items:
+                    description = ' '.join([item.get_text(strip=True) for item in items])
+                    if len(description) > 20:
+                        return _clean_description(description)
+            
+            # Otherwise get all text
+            description = desc_elem.get_text(strip=True)
+            if description and len(description) > 20:
+                return _clean_description(description)
+    
+    # Strategy 3: Look for table-based structure (older Indeed layout)
+    table_cell = card.select_one('td.resultContent')
+    if table_cell:
+        # Skip title and company info, look for actual description
+        divs = table_cell.find_all('div', recursive=False)
+        for div in divs[2:]:  # Skip first 2 divs (usually title/company)
+            text = div.get_text(strip=True)
+            if len(text) > 40:
+                return _clean_description(text)
+    
+    # Strategy 4: Extract from structured text blocks
+    description = _extract_from_structured_content(card)
+    if description:
+        return description
+    
+    # Strategy 5: Intelligent text extraction (improved fallback)
+    return _intelligent_text_extraction(card)
+
+
 def _clean_description(description: str) -> str:
     """Clean and normalize job description text."""
     # Remove excessive whitespace
@@ -1035,76 +1639,6 @@ def _intelligent_text_extraction(card) -> Optional[str]:
     return None
 
 
-def _extract_description_indeed(card) -> Optional[str]:
-    """Extract job description from Indeed job card with enhanced selectors and fallback strategies."""
-    
-    # Strategy 1: Try specific Indeed data attributes first
-    data_attribute_selectors = [
-        '[data-testid*="job-snippet"]',
-        '[data-testid*="jobCard-snippet"]',
-        '[data-testid*="description"]',
-        '[data-mobtk*="description"]',
-    ]
-    
-    for selector in data_attribute_selectors:
-        desc_elem = card.select_one(selector)
-        if desc_elem:
-            description = desc_elem.get_text(strip=True)
-            if description and len(description) > 20:
-                return _clean_description(description)
-    
-    # Strategy 2: Try common class-based selectors
-    class_selectors = [
-        'div.job-snippet',
-        'div.job-snippet-container',
-        'ul.job-snippet',
-        'div[class*="jobCardShelfContainer"]',
-        'div[class*="job-snippet"]',
-        'div[class*="snippet"]',
-        'div[class*="job_summary"]',
-        'div[class*="summary"]',
-        'td.resultContent',  # Common Indeed structure
-        'div.resultContent',
-        'div.slider_container',
-        'div.job-description',
-        'span.job-snippet',
-    ]
-    
-    for selector in class_selectors:
-        desc_elem = card.select_one(selector)
-        if desc_elem:
-            # Try to get text from ul/li structure if present
-            if desc_elem.find('ul'):
-                items = desc_elem.select('li')
-                if items:
-                    description = ' '.join([item.get_text(strip=True) for item in items])
-                    if len(description) > 20:
-                        return _clean_description(description)
-            
-            # Otherwise get all text
-            description = desc_elem.get_text(strip=True)
-            if description and len(description) > 20:
-                return _clean_description(description)
-    
-    # Strategy 3: Look for table-based structure (older Indeed layout)
-    table_cell = card.select_one('td.resultContent')
-    if table_cell:
-        # Skip title and company info, look for actual description
-        divs = table_cell.find_all('div', recursive=False)
-        for div in divs[2:]:  # Skip first 2 divs (usually title/company)
-            text = div.get_text(strip=True)
-            if len(text) > 40:
-                return _clean_description(text)
-    
-    # Strategy 4: Extract from structured text blocks
-    description = _extract_from_structured_content(card)
-    if description:
-        return description
-    
-    # Strategy 5: Intelligent text extraction (improved fallback)
-    return _intelligent_text_extraction(card)
-
-
 def _extract_job_url_indeed(card, job_id: str) -> Optional[str]:
     """Extract job URL from Indeed job card."""
     title_elem = card.select_one('a[class*="jcs-JobTitle"], a[class*="jobTitle"], h2 a, h3 a')
@@ -1148,76 +1682,7 @@ def _extract_company_size_indeed(card) -> Optional[str]:
     return None
 
 
-def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optional[Job]:
-    """Extract comprehensive job data from a job card element."""
-    try:
-        # Extract job ID with comprehensive fallbacks
-        job_id = _extract_job_id_indeed(card) or ''
-        
-        # Extract title
-        title = _extract_title_indeed(card)
-        if not title or len(title) < 3:
-            return None
-        
-        # Extract company information (name and URL)
-        company, company_url = _extract_company_info_indeed(card)
-        
-        # Extract location and remote type
-        job_location, remote_type = _extract_location_info_indeed(card)
-        
-        # Extract salary range
-        salary_range = _extract_salary_indeed(card)
-        
-        # Extract job type and employment type
-        job_type, employment_type = _extract_job_types_indeed(card)
-        
-        # Extract experience level
-        experience_level = _extract_experience_level_indeed(card)
-        
-        # Extract posted date
-        posted_date = _extract_posted_date_indeed(card)
-        
-        # Extract job description
-        description = _extract_description_indeed(card)
-       
-        # Extract job URL
-        job_url = _extract_job_url_indeed(card, job_id)
-        
-        # Extract skills, requirements, and benefits
-        skills = _extract_skills_indeed(card)
-        requirements = _extract_requirements_indeed(card)
-        benefits = _extract_benefits_indeed(card)
-        
-        # Extract industry and company size
-        industry = _extract_industry_indeed(card)
-        company_size = _extract_company_size_indeed(card)
-        
-        return Job(
-            title=title,
-            company=company or "Unknown",
-            company_url=company_url,
-            location=job_location or location or "Unknown",
-            description=description or "",
-            url=job_url or "",
-            salary_range=salary_range,
-            job_type=job_type,
-            posted_date=posted_date,
-            experience_level=experience_level,
-            benefits=benefits,
-            requirements=requirements,
-            skills=skills,
-            remote_type=remote_type,
-            employment_type=employment_type,
-            industry=industry,
-            company_size=company_size,
-            job_id=job_id
-        )
-    except Exception as e:
-        print(f"⚠️  Error extracting job data: {e}")
-        return None
-
-
-# Full page extraction functions
+# Full page extraction functions (for enhanced details from individual job pages)
 def _extract_salary_from_full_page_improved(soup) -> Optional[str]:
     """Extract salary from Indeed's full job page."""
     text_content = soup.get_text()
@@ -1275,7 +1740,6 @@ def _extract_date_from_full_page_improved(soup) -> Optional[str]:
     
     return None
 
-
 def _clean_and_format_description(text: str) -> str:
     """Clean and format job description text."""
     # Remove excessive whitespace
@@ -1286,14 +1750,20 @@ def _clean_and_format_description(text: str) -> str:
     text = text.strip()
     return text
 
-
 def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optional[str]:
-    """Extract description from Indeed's full job page with comprehensive patterns."""
+    """
+    Extract description from Indeed's full job page with comprehensive patterns.
+    Indeed typically structures descriptions under headings like:
+    - "Full job description"
+    - "Company Description"
+    - Direct description containers
+    """
     
     # Strategy 1: Look for text following "Full job description" heading
     full_job_desc_heading = soup.find(string=re.compile(r'Full job description', re.IGNORECASE))
     if full_job_desc_heading:
         print(f"  ✓ Found 'Full job description' heading")
+        # Get the parent and find the next sibling or descendants with text
         parent = full_job_desc_heading.find_parent()
         if parent:
             # Try to find the next div/section after the heading
@@ -1313,6 +1783,7 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
                 if text_content and len(text_content) > 20:
                     remaining_text.append(text_content)
                 current = current.find_next_sibling()
+                # Limit to prevent getting too much
                 if len(remaining_text) > 10:
                     break
             
@@ -1329,6 +1800,7 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
         print(f"  ✓ Found 'Company Description' heading")
         parent = company_desc_heading.find_parent()
         if parent:
+            # Get text from parent and its siblings
             text_parts = [parent.get_text(separator='\n', strip=True)]
             next_elem = parent.find_next_sibling()
             count = 0
@@ -1347,17 +1819,26 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
     
     # Strategy 3: Primary Indeed selectors for job description container
     desc_selectors = [
+        # Most common Indeed job description selectors
         'div.jobsearch-jobDescriptionText',
         'div[class*="jobsearch-jobDescriptionText"]',
         'div#jobDescriptionText',
         'div[id*="jobDescriptionText"]',
+        
+        # Data attribute selectors
         'div[data-testid="job-description"]',
         'div[data-testid="jobsearch-JobComponent-description"]',
+        
+        # Class-based selectors
         'div[class*="jobDescriptionText"]',
         'div[class*="job-description"]',
         'div[class*="jobDescription"]',
+        
+        # Nested selectors
         'div[class*="jobsearch-JobComponent"] div[class*="jobDescriptionText"]',
         'article div[class*="jobDescriptionText"]',
+        
+        # Alternative structures
         'div[class*="jobsearch-JobComponent-description"]',
         'section[class*="jobDescription"]',
     ]
@@ -1372,19 +1853,21 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
                     print(f"  ✓ Found description using selector '{selector}': {len(text)} characters")
                     return text
     
-    # Strategy 4: Look for large text blocks in divs
+    # Strategy 4: Look for large text blocks in divs with specific patterns
     all_divs = soup.find_all('div')
     for div in all_divs:
+        # Skip divs with too many child divs (likely containers)
         if len(div.find_all('div', recursive=False)) > 5:
             continue
         
         text = div.get_text(separator='\n', strip=True)
         
-        if (len(text) > 300 and
-            len(text.split()) > 50 and
+        # Check if this looks like a job description
+        if (len(text) > 300 and  # Substantial length
+            len(text.split()) > 50 and  # Multiple words
             not text.startswith('Apply') and
             not text.startswith('Sign in') and
-            'job description' in text.lower()[:200]):
+            'job description' in text.lower()[:200]):  # Contains job description in first part
             
             text = _clean_and_format_description(text)
             print(f"  ✓ Found description in generic div: {len(text)} characters")
@@ -1402,6 +1885,7 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
     for selector in main_selectors:
         elem = soup.select_one(selector)
         if elem:
+            # Find the largest text block within main
             text_blocks = []
             for child in elem.find_all(['div', 'section', 'article']):
                 text = child.get_text(separator='\n', strip=True)
@@ -1409,14 +1893,16 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
                     text_blocks.append((len(text), text))
             
             if text_blocks:
+                # Get the longest block
                 text_blocks.sort(reverse=True)
                 text = _clean_and_format_description(text_blocks[0][1])
                 print(f"  ✓ Found description in main content area: {len(text)} characters")
                 return text
     
-    # Strategy 6: Last resort - paragraph clustering
+    # Strategy 6: Last resort - look for any substantial paragraph clusters
     paragraphs = soup.find_all('p')
     if len(paragraphs) > 3:
+        # Combine consecutive paragraphs
         combined_text = '\n\n'.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50])
         combined_text = _clean_and_format_description(combined_text)
         if len(combined_text) > 300:
@@ -1573,7 +2059,10 @@ def _extract_job_id_from_full_page(soup, url: str) -> Optional[str]:
 
 
 def _extract_company_url_from_full_page(soup, page: Page = None) -> Optional[str]:
-    """Extract company URL from Indeed's full job page."""
+    """
+    Extract company URL from Indeed's full job page.
+    Indeed displays company info with links to company pages.
+    """
     # Strategy 1: Look for company name link with data-testid
     company_selectors = [
         'a[data-testid="companyName"]',
@@ -1586,6 +2075,7 @@ def _extract_company_url_from_full_page(soup, page: Page = None) -> Optional[str
         company_elem = soup.select_one(selector)
         if company_elem and company_elem.get('href'):
             href = company_elem.get('href')
+            # Convert relative to absolute URL
             if href.startswith('/'):
                 return f"https://www.indeed.com{href}"
             elif href.startswith('http'):
@@ -1602,14 +2092,52 @@ def _extract_company_url_from_full_page(soup, page: Page = None) -> Optional[str
                     return f"https://www.indeed.com{href}"
                 return href
     
-    # Strategy 3: Look for links containing /cmp/
-    all_links = soup.find_all('a', href=True, limit=50)
+    # Strategy 3: Look for links containing /cmp/ (Indeed's company page pattern)
+    all_links = soup.find_all('a', href=True, limit=50)  # Limit to first 50 links
     for link in all_links:
         href = link.get('href', '')
+        # Indeed company pages use /cmp/ pattern
         if '/cmp/' in href or '/company/' in href:
+            # Make sure it's not a review or jobs link
             if '/reviews' not in href and '/jobs' not in href:
+                # Check if link text looks like a company name (not too long)
                 link_text = link.get_text(strip=True)
                 if link_text and 3 < len(link_text) < 100:
+                    if href.startswith('/'):
+                        return f"https://www.indeed.com{href}"
+                    return href
+    
+    # Strategy 4: Look for company name in header and find associated link
+    company_name_elem = soup.find(['span', 'div', 'h2'], attrs={'data-testid': re.compile(r'.*company.*', re.I)})
+    if company_name_elem:
+        company_name = company_name_elem.get_text(strip=True)
+        if company_name:
+            # Find link with this company name nearby
+            parent = company_name_elem.find_parent()
+            if parent:
+                nearby_link = parent.find('a', href=True)
+                if nearby_link:
+                    href = nearby_link.get('href')
+                    if href and ('/cmp/' in href or '/company/' in href):
+                        if href.startswith('/'):
+                            return f"https://www.indeed.com{href}"
+                        return href
+    
+    # Strategy 5: Look for employer/company section by class
+    employer_selectors = [
+        'div[class*="employer"]',
+        'div[class*="company"]',
+        'div[class*="CompanyInfo"]',
+        'div[id*="company"]',
+    ]
+    
+    for selector in employer_selectors:
+        employer_div = soup.select_one(selector)
+        if employer_div:
+            employer_link = employer_div.find('a', href=True)
+            if employer_link:
+                href = employer_link.get('href')
+                if href and ('/cmp/' in href or '/company/' in href):
                     if href.startswith('/'):
                         return f"https://www.indeed.com{href}"
                     return href
@@ -1623,7 +2151,7 @@ async def _extract_complete_job_details_from_url_playwright(
     original_search_url: Optional[str] = None,
     skip_nav_back: bool = False
 ) -> Optional[Job]:
-    """Extract complete job details by navigating to the individual job page URL."""
+    """Extract complete job details by navigating to the individual job page URL with Cloudflare bypass."""
     if not job.url:
         return job
     
@@ -1647,7 +2175,8 @@ async def _extract_complete_job_details_from_url_playwright(
         try:
             print(f"    → Navigating to: {job.url}")
             
-            # Set proper headers before navigation
+            # CRITICAL: Set proper headers before navigation
+            # Include Referer to make it look like we came from search results
             referer = original_search_url if original_search_url else "https://www.indeed.com/"
             await page.set_extra_http_headers({
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -1661,11 +2190,11 @@ async def _extract_complete_job_details_from_url_playwright(
                 'Sec-Fetch-Site': 'same-origin',
                 'Sec-Fetch-User': '?1',
                 'Cache-Control': 'max-age=0',
-                'Referer': referer,
+                'Referer': referer,  # Critical: Makes it look like we came from search
             })
             
-            # Navigate with shorter timeout
-            job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 15000)
+            # Navigate with shorter timeout, we'll handle waiting manually
+            job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 15000)  # Reduced to 15s
             
             try:
                 response = await page.goto(job.url, wait_until="commit", timeout=job_page_timeout)
@@ -1674,20 +2203,22 @@ async def _extract_complete_job_details_from_url_playwright(
             except Exception as nav_err:
                 print(f"    ⚠️  Navigation timeout, continuing anyway...")
             
-            # Wait for page to load
-            print(f"    ⏳ Waiting for page to load...")
+            # CRITICAL: Wait for Cloudflare challenge to complete
+            print(f"    ⏳ Waiting for page to load (checking for Cloudflare)...")
             
+            # Strategy 1: Wait for body to appear
             try:
                 await page.wait_for_selector('body', timeout=10000, state='attached')
             except:
                 pass
             
-            # Check for Cloudflare challenge
+            # Strategy 2: Check for Cloudflare challenge and wait for it to complete
             cloudflare_detected = False
-            for attempt in range(10):
+            for attempt in range(10):  # Check for up to 10 seconds
                 page_content = await page.content()
                 page_title = await page.title()
                 
+                # Check for Cloudflare indicators
                 is_challenge = (
                     'Checking your browser' in page_content or
                     'Just a moment' in page_title or
@@ -1699,15 +2230,18 @@ async def _extract_complete_job_details_from_url_playwright(
                 if is_challenge:
                     if attempt == 0:
                         cloudflare_detected = True
-                        print(f"    🔐 Cloudflare challenge detected - waiting...")
+                        print(f"    🔐 Cloudflare challenge detected - waiting for completion...")
+                    
+                    # Wait and check again
                     await asyncio.sleep(1)
                     continue
                 else:
+                    # No challenge or challenge completed
                     if cloudflare_detected:
                         print(f"    ✓ Cloudflare challenge completed after {attempt}s")
                     break
             
-            # Wait for page to stabilize
+            # Wait a bit more for page to stabilize
             await page.wait_for_timeout(random.uniform(2000, 3000))
             
             # Try to wait for job description content
@@ -1729,10 +2263,12 @@ async def _extract_complete_job_details_from_url_playwright(
                 "Checking your browser" in full_page_content
                 or "Enable JavaScript and cookies to continue" in full_page_content
                 or "challenge-platform" in full_page_content
+                or "cf-browser-verification" in full_page_content
                 or "Just a moment" in current_title
                 or ("Ray ID" in full_page_content and len(full_page_content) < 5000)
             )
             
+            # Check for actual job content
             has_job_content = (
                 'jobsearch-JobComponent' in full_page_content
                 or 'jobDescriptionText' in full_page_content
@@ -1740,16 +2276,19 @@ async def _extract_complete_job_details_from_url_playwright(
                 or (len(full_page_content) > 10000 and 'indeed.com' in full_page_content)
             )
             
+            # Determine if actually blocked
             is_actually_blocked = has_cloudflare_indicators and not has_job_content
             
             if is_actually_blocked:
                 if job_retry_count >= max_job_retries:
-                    print(f"    ❌ Job page blocked by Cloudflare after {job_retry_count + 1} attempts")
+                    print(f"    ❌ Job page blocked by Cloudflare after {job_retry_count + 1} attempts - skipping enhanced details")
                     return job
                 
+                # Retry with longer wait
                 backoff = random.uniform(5.0, 8.0) * (1 + job_retry_count)
                 print(f"    ⚠️  Still blocked, retry {job_retry_count + 1}/{max_job_retries}, waiting {backoff:.1f}s...")
                 
+                # Perform human interactions before retry
                 if getattr(settings, "HUMANIZE", True):
                     await _perform_human_interactions_playwright(page)
                 
@@ -1761,19 +2300,21 @@ async def _extract_complete_job_details_from_url_playwright(
             print(f"    ✓ Job page loaded ({len(full_page_content)} chars)")
             full_page_soup = BeautifulSoup(full_page_content, 'html.parser')
             
-            # Extract enhanced details from the full page
+            # Extract job ID from full page if not already present
             if not job.job_id:
                 enhanced_job_id = _extract_job_id_from_full_page(full_page_soup, page.url)
                 if enhanced_job_id:
                     job.job_id = enhanced_job_id
                     print(f"    ✓ Enhanced job ID: {enhanced_job_id}")
             
+            # Extract company URL from full page if not already present
             if not job.company_url:
                 enhanced_company_url = _extract_company_url_from_full_page(full_page_soup, page)
                 if enhanced_company_url:
                     job.company_url = enhanced_company_url
                     print(f"    ✓ Enhanced company URL: {enhanced_company_url}")
             
+            # Extract enhanced details from the full page
             enhanced_salary = _extract_salary_from_full_page_improved(full_page_soup)
             enhanced_employment = _extract_employment_from_full_page_improved(full_page_soup)
             enhanced_date = _extract_date_from_full_page_improved(full_page_soup)
@@ -1785,7 +2326,7 @@ async def _extract_complete_job_details_from_url_playwright(
             enhanced_industry = _extract_industry_from_full_page(full_page_soup)
             enhanced_company_size = _extract_company_size_from_full_page(full_page_soup)
             
-            # Update job with enhanced details
+            # Update job with enhanced details (only if not already present or significantly better)
             if enhanced_salary and (not job.salary_range or len(enhanced_salary) > len(job.salary_range or "")):
                 job.salary_range = enhanced_salary
                 print(f"    ✓ Enhanced salary: {enhanced_salary}")
@@ -1798,6 +2339,7 @@ async def _extract_complete_job_details_from_url_playwright(
                 job.posted_date = enhanced_date
                 print(f"    ✓ Enhanced date: {enhanced_date}")
             
+            # Always update description with full job description from detail page
             if enhanced_description and len(enhanced_description) > 100:
                 job.description = enhanced_description
                 print(f"    ✓ Enhanced description: {len(enhanced_description)} characters")
@@ -1826,29 +2368,31 @@ async def _extract_complete_job_details_from_url_playwright(
                 job.company_size = enhanced_company_size
                 print(f"    ✓ Enhanced company size: {enhanced_company_size}")
             
+            # Break out of retry loop on success
             break
             
         except Exception as e:
             if job_retry_count >= max_job_retries:
-                print(f"    ⚠️  Error extracting enhanced details: {e}")
-                return job
+                print(f"    ⚠️  Error extracting enhanced details after {job_retry_count + 1} attempts: {e}")
+                return job  # Continue with basic job data if enhancement fails
             
             print(f"    ⚠️  Error on attempt {job_retry_count + 1}, retrying: {e}")
             job_retry_count += 1
             await asyncio.sleep(random.uniform(2.0, 4.0))
             continue
     
-    # Navigate back to search results
+    # Navigate back to search results (outside retry loop)
     if not skip_nav_back:
         try:
             print(f"    ← Navigating back to search results")
-            back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 30000)
+            back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 30000)  # 30 seconds default
             await page.goto(original_url, wait_until="domcontentloaded", timeout=back_nav_timeout)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2000)  # Wait for page to load
         except Exception as nav_error:
             print(f"    ⚠️  Warning: Could not navigate back: {nav_error}")
+            # If navigation back fails, it's not critical - we can continue
     else:
-        print(f"    ↻ Skipping navigation back")
+        print(f"    ↻ Skipping navigation back (using context rotation)")
     
     return job
 
@@ -1881,345 +2425,15 @@ def _should_include_job(
         if employment_type.lower() not in job.employment_type.lower():
             return False
     
-    # Experience level filter
+    # Experience level filter (if provided)
     if experience_level and job.experience_level:
         if experience_level.lower() not in job.experience_level.lower():
             return False
     
+    # Salary filter (basic - would need parsing)
+    # Note: Full salary parsing would require parsing the salary_range string
+    
+    # Days old filter (basic - would need date parsing)
+    # Note: Full date parsing would require parsing the posted_date string
+    
     return True
-
-
-async def scrape_indeed_playwright(
-    query: str,
-    location: Optional[str] = None,
-    max_results: int = 20,
-    job_type: Optional[str] = None,
-    salary_min: Optional[int] = None,
-    salary_max: Optional[int] = None,
-    experience_level: Optional[str] = None,
-    employment_type: Optional[str] = None,
-    days_old: Optional[int] = None,
-    fetch_full_details: bool = True
-) -> List[Job]:
-    """
-    FIXED: Scrape Indeed jobs using Playwright with proper resource management.
-    
-    Args:
-        query: Job search query
-        location: Job location
-        max_results: Maximum number of jobs to return
-        job_type: Job type filter
-        salary_min: Minimum salary
-        salary_max: Maximum salary
-        experience_level: Experience level filter
-        employment_type: Employment type filter
-        days_old: Filter jobs posted within last N days
-        fetch_full_details: Set to False for faster scraping
-        
-    Returns:
-        List of Job objects
-    """
-    if not PLAYWRIGHT_AVAILABLE:
-        raise ImportError("Playwright is not installed")
-    
-    global _last_fetch, _scrape_count
-    
-    # Increment scrape counter
-    _scrape_count += 1
-    print(f"🔍 Starting scrape #{_scrape_count} (cleanup threshold: {_max_scrapes_before_cleanup})")
-    
-    # Rate limiting
-    now = time.monotonic()
-    jitter = random.uniform(0, 0.75)
-    wait = settings.MIN_DELAY + jitter - (now - _last_fetch)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    _last_fetch = time.monotonic()
-    
-    page = None  # FIXED: Initialize outside try block
-    
-    try:
-        browser, context = await get_browser()
-        page = await create_page_with_tracking(context)
-        
-        # Build Indeed URL
-        base_url = "https://www.indeed.com/jobs"
-        url = f"{base_url}?q={quote_plus(query)}"
-        if location:
-            url += f"&l={quote_plus(location)}"
-        
-        print(f"🌐 Navigating to: {url}")
-        original_search_url = url
-        
-        # Navigate with retry logic for Cloudflare
-        max_retries = getattr(settings, "MAX_RETRIES", 3)
-        cloudflare_retries = 0
-        
-        while True:
-            try:
-                navigation_timeout = 30000
-                navigation_success = False
-                
-                # Try domcontentloaded first
-                try:
-                    print(f"   Navigating (domcontentloaded)...")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
-                    print("✓ Navigation completed")
-                    navigation_success = True
-                except Exception as nav_error1:
-                    print(f"⚠️  domcontentloaded failed, trying commit...")
-                    
-                    try:
-                        await page.goto(url, wait_until="commit", timeout=15000)
-                        print("✓ Navigation started (commit)")
-                        await page.wait_for_selector('body', timeout=20000, state='attached')
-                        print("✓ Body loaded")
-                        
-                        try:
-                            await page.wait_for_selector(
-                                'div[data-jk], div.job_seen_beacon, div[class*="job"]',
-                                timeout=15000,
-                                state='attached'
-                            )
-                            print("✓ Job content detected")
-                        except:
-                            await page.wait_for_timeout(3000)
-                            body_text = await page.evaluate("document.body ? document.body.innerText.length : 0")
-                            if body_text > 100:
-                                print(f"✓ Page has content ({body_text} chars)")
-                        
-                        navigation_success = True
-                    except Exception as commit_error:
-                        print(f"⚠️  All navigation strategies failed")
-                        navigation_success = False
-                
-                # Wait for page content
-                if navigation_success:
-                    await page.wait_for_timeout(2000)
-                else:
-                    await page.wait_for_timeout(3000)
-                    try:
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                        await page.wait_for_timeout(1500)
-                    except:
-                        pass
-                
-                # Try to wait for job listings
-                try:
-                    await page.wait_for_selector(
-                        'div[data-jk], div.job_seen_beacon, #challenge-form',
-                        timeout=15000,
-                        state='attached'
-                    )
-                except:
-                    await page.wait_for_timeout(2000)
-                
-                # Get page content
-                page_html = await page.content()
-                
-                # Check for Cloudflare blocking
-                has_cloudflare_indicators = (
-                    "Checking your browser" in page_html
-                    or "Enable JavaScript and cookies to continue" in page_html
-                    or "challenge-platform" in page_html
-                    or "cf-browser-verification" in page_html
-                    or "Just a moment" in page_html
-                    or "Ray ID" in page_html
-                )
-                
-                has_indeed_content = (
-                    'id="mosaic-provider-jobcards"' in page_html
-                    or 'class="jobsearch-ResultsList"' in page_html
-                    or 'data-jk=' in page_html
-                    or 'class="job_seen_beacon"' in page_html
-                )
-                
-                is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
-                
-                if has_indeed_content:
-                    is_actually_blocked = False
-                    print("✓ Indeed content detected")
-                
-                if not is_actually_blocked:
-                    _mark_proxy_success()
-                    break
-                
-                # Cloudflare detected - retry
-                if cloudflare_retries >= max_retries:
-                    raise CloudflareBlockedError(
-                        f"Indeed blocked by Cloudflare after {cloudflare_retries + 1} attempts"
-                    )
-                
-                backoff = random.uniform(3.0, 6.0) * (1 + 0.5 * cloudflare_retries)
-                print(f"⚠️  Cloudflare detected, retry {cloudflare_retries + 1}/{max_retries}")
-                
-                if getattr(settings, "HUMANIZE", True):
-                    await _perform_human_interactions_playwright(page)
-                
-                await context.clear_cookies()
-                await asyncio.sleep(backoff)
-                
-                # FIXED: Properly close page before getting new browser
-                await close_page_with_tracking(page)
-                
-                browser, context = await get_browser(force_new=True, rotate_proxy=True)
-                page = await create_page_with_tracking(context)
-                cloudflare_retries += 1
-                
-            except CloudflareBlockedError:
-                raise
-            except Exception as nav_error:
-                error_str = str(nav_error).lower()
-                
-                # Check if we got content despite error
-                if "timeout" in error_str:
-                    try:
-                        page_html = await page.content()
-                        if 'data-jk=' in page_html or 'job_seen_beacon' in page_html:
-                            print("✓ Got content despite timeout")
-                            break
-                    except:
-                        pass
-                
-                if cloudflare_retries >= max_retries:
-                    raise Exception(f"Navigation failed after {max_retries} retries: {nav_error}")
-                
-                print(f"⚠️  Navigation error, retry {cloudflare_retries + 1}/{max_retries}")
-                cloudflare_retries += 1
-                await asyncio.sleep(random.uniform(2.0, 4.0))
-                
-                # FIXED: Properly close page before getting new browser
-                await close_page_with_tracking(page)
-                
-                browser, context = await get_browser(force_new=True, rotate_proxy=True)
-                page = await create_page_with_tracking(context)
-        
-        # Progressive scroll to load more jobs
-        await _progressive_scroll_playwright(page)
-        
-        # Get page content
-        content = await page.content()
-        
-        # Parse with BeautifulSoup
-        soup = BeautifulSoup(content, "html.parser")
-        
-        # Extract job cards
-        job_cards = _find_job_cards_indeed(soup)
-        
-        print(f"📋 Found {len(job_cards)} job cards")
-        
-        # Extract job data
-        jobs = []
-        browser_alive = True
-        
-        if not fetch_full_details:
-            print("ℹ️  Fast mode: skipping job detail pages")
-        
-        # Track job fetches
-        job_fetch_count = 0
-        cloudflare_block_count = 0
-        max_cloudflare_blocks = getattr(settings, "MAX_JOB_PAGE_CLOUDFLARE_BLOCKS", 3)
-        
-        # FIXED: Disabled aggressive browser rotation per job
-        # Instead, reuse browser/context and only rotate on errors
-        min_delay_between_fetches = getattr(settings, "JOB_DETAIL_MIN_DELAY", 2.0)  # Reduced delay
-        max_delay_between_fetches = getattr(settings, "JOB_DETAIL_MAX_DELAY", 4.0)
-        
-        for card in job_cards[:max_results * 2]:
-            try:
-                job = _extract_job_from_card(card, query, location)
-                if job and job.title and job.url:
-                    # Check if too many Cloudflare blocks
-                    if cloudflare_block_count >= max_cloudflare_blocks:
-                        print(f"  ⚠️  Too many Cloudflare blocks - switching to fast mode")
-                        fetch_full_details = False
-                    
-                    # Enhanced extraction
-                    if fetch_full_details and browser_alive:
-                        print(f"  → Fetching details: {job.title}")
-                        
-                        # Add delay
-                        delay = random.uniform(min_delay_between_fetches, max_delay_between_fetches)
-                        print(f"    ⏳ Waiting {delay:.1f}s...")
-                        await asyncio.sleep(delay)
-                        
-                        # Human-like interactions
-                        if getattr(settings, "HUMANIZE", True):
-                            try:
-                                await page.evaluate("window.scrollBy(0, Math.random() * 300)")
-                                await page.wait_for_timeout(random.uniform(500, 1000))
-                                await page.mouse.move(
-                                    random.randint(100, 800),
-                                    random.randint(100, 500)
-                                )
-                                await page.wait_for_timeout(random.uniform(200, 500))
-                            except Exception:
-                                pass
-                        
-                        try:
-                            # Check if page is still connected
-                            if page.is_closed():
-                                print("  ⚠️  Page closed - skipping remaining job details")
-                                browser_alive = False
-                            else:
-                                enhanced_job = await _extract_complete_job_details_from_url_playwright(
-                                    page, job, original_search_url, skip_nav_back=False
-                                )
-                                if enhanced_job:
-                                    # Check for Cloudflare block
-                                    if enhanced_job.requirements and any('Ray ID' in str(req) for req in enhanced_job.requirements):
-                                        cloudflare_block_count += 1
-                                        print(f"    ⚠️  Cloudflare block detected ({cloudflare_block_count}/{max_cloudflare_blocks})")
-                                    else:
-                                        job = enhanced_job
-                                        job_fetch_count += 1
-                                
-                                # Post-fetch delay
-                                await asyncio.sleep(random.uniform(1.5, 3.0))
-                        except Exception as enhance_error:
-                            error_msg = str(enhance_error).lower()
-                            if "closed" in error_msg or "target" in error_msg:
-                                print(f"  ⚠️  Browser closed - using basic data")
-                                browser_alive = False
-                            else:
-                                print(f"  ⚠️  Error enhancing: {enhance_error}")
-                    
-                    # Apply filters
-                    if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
-                        jobs.append(job)
-                        
-                        if len(jobs) >= max_results:
-                            break
-            except Exception as e:
-                print(f"⚠️  Error extracting job: {e}")
-                continue
-        
-        print(f"✓ Extracted {len(jobs)} jobs (fetched details from {job_fetch_count} pages)")
-        return jobs
-        
-    except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Error during scraping: {error_msg}")
-        
-        # Check for resource exhaustion
-        if "pthread_create" in error_msg or "Resource temporarily unavailable" in error_msg:
-            print("🚨 Resource exhaustion detected - forcing cleanup")
-            await _force_cleanup_all_resources()
-            raise Exception("System resource exhaustion - resources cleaned up. Please retry.")
-        
-        raise
-        
-    finally:
-        # FIXED: Always close page in finally block
-        if page:
-            await close_page_with_tracking(page)
-        
-        # FIXED: Periodic resource check
-        if _scrape_count % 5 == 0:
-            print(f"🔍 Periodic resource check (scrape #{_scrape_count})")
-            stats = get_browser_resource_stats()
-            print(f"   Stats: {stats}")
-            
-            if stats['active_pages'] > 0:
-                print(f"   ⚠️  {stats['active_pages']} pages still open, cleaning...")
-                await close_all_pages()
