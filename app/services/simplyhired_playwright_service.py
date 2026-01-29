@@ -574,20 +574,38 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
         return job
     
     try:
-        # Navigate to the individual job page
+        # Navigate to the individual job page with shorter timeout for Railway
         print(f"    → Navigating to job page: {job.url}")
         
-        job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 60000)  # 60 seconds default
-        await page.goto(job.url, wait_until="domcontentloaded", timeout=job_page_timeout)
+        # Use shorter timeout (20 seconds) to avoid Railway request timeouts
+        job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 20000)  # 20 seconds default
         
-        # Wait for page to load
-        await asyncio.sleep(random.uniform(2.0, 3.5))
+        # Try navigation with commit strategy first (faster, more reliable)
+        navigation_success = False
+        try:
+            await page.goto(job.url, wait_until="commit", timeout=job_page_timeout)
+            # Wait for body to be available
+            await page.wait_for_selector('body', timeout=5000, state='attached')
+            navigation_success = True
+        except Exception as nav_error:
+            # Fallback to domcontentloaded if commit fails
+            try:
+                await page.goto(job.url, wait_until="domcontentloaded", timeout=job_page_timeout)
+                navigation_success = True
+            except Exception:
+                # If both fail, try to get content anyway (page might have loaded)
+                print(f"    ⚠️  Navigation timeout, attempting to extract from current page...")
+                navigation_success = False
         
-        # Try to wait for job content
+        # Wait for page to load (shorter wait)
+        if navigation_success:
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        # Try to wait for job content (shorter timeout)
         try:
             await page.wait_for_selector(
-                "div[class*='description'], div[class*='Description'], article, main",
-                timeout=15000
+                "div[class*='description'], div[class*='Description'], article, main, body",
+                timeout=5000
             )
         except:
             pass  # Continue even if selector not found
@@ -822,18 +840,45 @@ async def _extract_complete_job_details_from_url_playwright(page: Page, job: Job
             print(f"    ✓ Enhanced company size: {enhanced_company_size}")
         
     except Exception as e:
-        print(f"    ⚠️  Error extracting enhanced details: {e}")
+        error_msg = str(e).lower()
+        if "timeout" in error_msg:
+            print(f"    ⚠️  Timeout extracting enhanced details (skipping navigation back)")
+        else:
+            print(f"    ⚠️  Error extracting enhanced details: {e}")
         # Continue with basic job data if enhancement fails
     finally:
-        # Navigate back to the original search results page
+        # Navigate back to the original search results page (optional, with short timeout)
+        # Skip navigation back if we had a timeout to avoid cascading timeouts
+        # Also skip if we're likely on the last job to save time
         try:
-            print(f"    ← Navigating back to search results")
-            back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 30000)  # 30 seconds default
-            await page.goto(original_search_url, wait_until="domcontentloaded", timeout=back_nav_timeout)
-            await asyncio.sleep(2.0)  # Wait for page to load
-        except Exception as nav_error:
-            print(f"    ⚠️  Warning: Could not navigate back: {nav_error}")
-            # If navigation back fails, it's not critical - we can continue
+            # Use a very short timeout to avoid blocking (8 seconds)
+            back_nav_timeout = getattr(settings, "BACK_NAV_TIMEOUT", 8000)  # 8 seconds default (reduced)
+            
+            # Try commit strategy first (faster) with timeout wrapper
+            try:
+                await asyncio.wait_for(
+                    page.goto(original_search_url, wait_until="commit", timeout=back_nav_timeout),
+                    timeout=back_nav_timeout / 1000.0  # Convert to seconds
+                )
+                await asyncio.wait_for(
+                    page.wait_for_selector('body', timeout=2000, state='attached'),
+                    timeout=2.0
+                )
+                await asyncio.sleep(0.5)  # Minimal wait
+            except (asyncio.TimeoutError, Exception):
+                # Fallback to domcontentloaded with timeout
+                try:
+                    await asyncio.wait_for(
+                        page.goto(original_search_url, wait_until="domcontentloaded", timeout=back_nav_timeout),
+                        timeout=back_nav_timeout / 1000.0
+                    )
+                    await asyncio.sleep(0.5)
+                except (asyncio.TimeoutError, Exception):
+                    # Silent fail - navigation back is optional and timeouts are expected
+                    pass
+        except Exception:
+            # Silent fail - navigation back is optional
+            pass
     
     return job
 
@@ -1188,17 +1233,31 @@ async def scrape_simplyhired_playwright(
                                 print("  ⚠️  Page was closed - skipping job detail extraction for remaining jobs")
                                 browser_alive = False
                             else:
-                                enhanced_job = await _extract_complete_job_details_from_url_playwright(page, job, original_search_url)
-                                if enhanced_job:
-                                    job = enhanced_job
-                                # Add delay to be respectful to SimplyHired's servers
-                                await asyncio.sleep(random.uniform(1.5, 3.0))
+                                # Wrap in timeout to prevent one slow job from blocking everything
+                                # Use asyncio.wait_for with a reasonable timeout (25 seconds total per job)
+                                try:
+                                    enhanced_job = await asyncio.wait_for(
+                                        _extract_complete_job_details_from_url_playwright(page, job, original_search_url),
+                                        timeout=25.0  # 25 seconds max per job
+                                    )
+                                    if enhanced_job:
+                                        job = enhanced_job
+                                except asyncio.TimeoutError:
+                                    print(f"  ⚠️  Timeout extracting job details (skipping) - using basic data")
+                                    # Don't try to navigate back if we timed out
+                                    # Just continue with next job
+                                
+                                # Add shorter delay to be respectful to SimplyHired's servers
+                                await asyncio.sleep(random.uniform(1.0, 2.0))
                         except Exception as enhance_error:
                             error_msg = str(enhance_error).lower()
                             if "closed" in error_msg or "target" in error_msg:
                                 # Browser/page was closed - stop trying to navigate
                                 print(f"  ⚠️  Browser closed during job detail extraction - using basic data for remaining jobs")
                                 browser_alive = False
+                            elif "timeout" in error_msg:
+                                # Timeout - just continue with next job
+                                print(f"  ⚠️  Timeout during job detail extraction - using basic data")
                             else:
                                 print(f"  ⚠️  Error enhancing job details: {enhance_error}")
                             # Continue with basic job data if enhancement fails

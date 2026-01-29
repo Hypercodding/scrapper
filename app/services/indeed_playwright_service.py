@@ -1802,40 +1802,51 @@ def _clean_and_format_description(text: str) -> str:
 
 def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optional[str]:
     """
-    Extract description from Indeed's full job page with comprehensive patterns.
+    Extract description from Indeed's full job page with comprehensive patterns and debugging.
     Indeed typically structures descriptions under headings like:
     - "Full job description"
     - "Company Description"
     - Direct description containers
     """
     
+    print(f"  🔍 DEBUG: Starting description extraction...")
+    
     # Strategy 1: Look for text following "Full job description" heading
     full_job_desc_heading = soup.find(string=re.compile(r'Full job description', re.IGNORECASE))
     if full_job_desc_heading:
         print(f"  ✓ Found 'Full job description' heading")
-        # Get the parent and find the next sibling or descendants with text
         parent = full_job_desc_heading.find_parent()
         if parent:
-            # Try to find the next div/section after the heading
-            next_section = parent.find_next_sibling()
-            if next_section:
-                text = next_section.get_text(separator='\n', strip=True)
-                if len(text) > 100:
-                    text = _clean_and_format_description(text)
-                    print(f"  ✓ Extracted {len(text)} chars from section after 'Full job description'")
-                    return text
+            print(f"    Parent tag: {parent.name}, classes: {parent.get('class', [])}")
             
-            # Alternative: get all text from parent onwards
+            # Strategy 1a: Get ALL text from parent's parent (go up one level)
+            grandparent = parent.find_parent()
+            if grandparent:
+                # Get all text after the heading element
+                all_text_parts = []
+                for elem in grandparent.descendants:
+                    if elem == full_job_desc_heading:
+                        # Start collecting from here
+                        continue
+                    if isinstance(elem, str) and elem.strip():
+                        all_text_parts.append(elem.strip())
+                
+                if all_text_parts:
+                    combined = ' '.join(all_text_parts)
+                    combined = _clean_and_format_description(combined)
+                    if len(combined) > 200:
+                        print(f"  ✓ Extracted {len(combined)} chars from grandparent after heading")
+                        return combined
+            
+            # Strategy 1b: Get all following siblings
             remaining_text = []
             current = parent.find_next_sibling()
-            while current:
+            while current and len(remaining_text) < 20:
                 text_content = current.get_text(separator='\n', strip=True)
-                if text_content and len(text_content) > 20:
+                if text_content and len(text_content) > 10:
                     remaining_text.append(text_content)
+                    print(f"    Found sibling with {len(text_content)} chars")
                 current = current.find_next_sibling()
-                # Limit to prevent getting too much
-                if len(remaining_text) > 10:
-                    break
             
             if remaining_text:
                 combined = '\n\n'.join(remaining_text)
@@ -1844,125 +1855,145 @@ def _extract_description_from_full_page_improved(soup: BeautifulSoup) -> Optiona
                     print(f"  ✓ Extracted {len(combined)} chars from siblings after 'Full job description'")
                     return combined
     
-    # Strategy 2: Look for "Company Description" heading
-    company_desc_heading = soup.find(string=re.compile(r'Company Description', re.IGNORECASE))
-    if company_desc_heading:
-        print(f"  ✓ Found 'Company Description' heading")
-        parent = company_desc_heading.find_parent()
-        if parent:
-            # Get text from parent and its siblings
-            text_parts = [parent.get_text(separator='\n', strip=True)]
-            next_elem = parent.find_next_sibling()
-            count = 0
-            while next_elem and count < 5:
-                text_content = next_elem.get_text(separator='\n', strip=True)
-                if text_content:
-                    text_parts.append(text_content)
-                next_elem = next_elem.find_next_sibling()
-                count += 1
-            
-            combined = '\n\n'.join(text_parts)
-            combined = _clean_and_format_description(combined)
-            if len(combined) > 100:
-                print(f"  ✓ Extracted {len(combined)} chars from 'Company Description' section")
-                return combined
-    
-    # Strategy 3: Primary Indeed selectors for job description container
+    # Strategy 2: Primary Indeed selectors for job description container (IMPROVED)
     desc_selectors = [
-        # Most common Indeed job description selectors
+        # Most common Indeed job description selectors (2024)
         'div.jobsearch-jobDescriptionText',
-        'div[class*="jobsearch-jobDescriptionText"]',
         'div#jobDescriptionText',
-        'div[id*="jobDescriptionText"]',
         
-        # Data attribute selectors
-        'div[data-testid="job-description"]',
-        'div[data-testid="jobsearch-JobComponent-description"]',
-        
-        # Class-based selectors
+        # Class-based variations
+        'div[class*="jobsearch-JobDescriptionText"]',
         'div[class*="jobDescriptionText"]',
         'div[class*="job-description"]',
         'div[class*="jobDescription"]',
         
-        # Nested selectors
-        'div[class*="jobsearch-JobComponent"] div[class*="jobDescriptionText"]',
-        'article div[class*="jobDescriptionText"]',
+        # ID-based variations  
+        'div[id*="jobDescriptionText"]',
+        'div[id*="job-description"]',
+        
+        # Data attribute selectors
+        'div[data-testid="jobsearch-JobComponent-description"]',
+        'div[data-testid="job-description"]',
+        
+        # Nested selectors (look deeper)
+        'div[class*="jobsearch-JobComponent"]',
+        'div[id*="jobsearch"]',
         
         # Alternative structures
-        'div[class*="jobsearch-JobComponent-description"]',
         'section[class*="jobDescription"]',
+        'article[class*="jobDescription"]',
     ]
     
     for selector in desc_selectors:
         elements = soup.select(selector)
+        print(f"  Trying selector '{selector}': found {len(elements)} elements")
+        
         for elem in elements:
+            # Get all text including nested elements
             text = elem.get_text(separator='\n', strip=True)
+            print(f"    Element has {len(text)} chars, classes: {elem.get('class', [])}")
+            
             if len(text) > 100:
                 text = _clean_and_format_description(text)
                 if len(text) > 100:
                     print(f"  ✓ Found description using selector '{selector}': {len(text)} characters")
                     return text
     
-    # Strategy 4: Look for large text blocks in divs with specific patterns
-    all_divs = soup.find_all('div')
+    # Strategy 3: Look for divs with ID containing "job" 
+    job_divs = soup.find_all('div', id=re.compile(r'job', re.I))
+    print(f"  Found {len(job_divs)} divs with 'job' in ID")
+    for div in job_divs:
+        text = div.get_text(separator='\n', strip=True)
+        print(f"    Div ID='{div.get('id')}': {len(text)} chars")
+        if len(text) > 300:
+            text = _clean_and_format_description(text)
+            print(f"  ✓ Found description in div with job ID: {len(text)} characters")
+            return text
+    
+    # Strategy 4: Look for largest text blocks in ANY div
+    print(f"  Analyzing all divs for large text blocks...")
+    all_divs = soup.find_all('div', limit=200)  # Limit to first 200 divs
+    text_blocks = []
+    
     for div in all_divs:
         # Skip divs with too many child divs (likely containers)
-        if len(div.find_all('div', recursive=False)) > 5:
+        child_divs = div.find_all('div', recursive=False)
+        if len(child_divs) > 8:
             continue
         
         text = div.get_text(separator='\n', strip=True)
         
-        # Check if this looks like a job description
-        if (len(text) > 300 and  # Substantial length
-            len(text.split()) > 50 and  # Multiple words
-            not text.startswith('Apply') and
-            not text.startswith('Sign in') and
-            'job description' in text.lower()[:200]):  # Contains job description in first part
+        # Score based on length and word count
+        if len(text) > 200 and len(text.split()) > 40:
+            # Avoid navigation/header elements
+            classes = ' '.join(div.get('class', [])).lower()
+            if any(skip in classes for skip in ['nav', 'header', 'footer', 'menu', 'sidebar']):
+                continue
             
-            text = _clean_and_format_description(text)
-            print(f"  ✓ Found description in generic div: {len(text)} characters")
-            return text
+            # Avoid elements that start with common UI text
+            if text.startswith(('Apply', 'Sign in', 'Save job', 'Report', 'Share')):
+                continue
+            
+            text_blocks.append((len(text), text, div.get('class', []), div.get('id', '')))
+    
+    if text_blocks:
+        # Sort by length and show top candidates
+        text_blocks.sort(reverse=True)
+        print(f"  Found {len(text_blocks)} candidate text blocks")
+        for i, (length, text, classes, div_id) in enumerate(text_blocks[:5]):
+            print(f"    #{i+1}: {length} chars, classes={classes}, id={div_id}")
+            # Also print first 100 chars to help debug
+            print(f"        Preview: {text[:100]}...")
+        
+        # Return the longest one
+        text = _clean_and_format_description(text_blocks[0][1])
+        print(f"  ✓ Using longest text block: {len(text)} characters")
+        return text
     
     # Strategy 5: Fallback - look for the main content area
     main_selectors = [
         'main',
-        'article',
+        'article', 
         'div[role="main"]',
         'div[class*="mainContent"]',
-        'div[class*="main-content"]'
+        'div[class*="main-content"]',
+        'div[class*="content"]'
     ]
     
     for selector in main_selectors:
         elem = soup.select_one(selector)
         if elem:
-            # Find the largest text block within main
-            text_blocks = []
-            for child in elem.find_all(['div', 'section', 'article']):
-                text = child.get_text(separator='\n', strip=True)
-                if len(text) > 300 and len(text.split()) > 50:
-                    text_blocks.append((len(text), text))
-            
-            if text_blocks:
-                # Get the longest block
-                text_blocks.sort(reverse=True)
-                text = _clean_and_format_description(text_blocks[0][1])
+            print(f"  Found main content area: {selector}")
+            text = elem.get_text(separator='\n', strip=True)
+            if len(text) > 500:
+                text = _clean_and_format_description(text)
                 print(f"  ✓ Found description in main content area: {len(text)} characters")
                 return text
     
-    # Strategy 6: Last resort - look for any substantial paragraph clusters
+    # Strategy 6: Last resort - combine all paragraphs
     paragraphs = soup.find_all('p')
     if len(paragraphs) > 3:
-        # Combine consecutive paragraphs
-        combined_text = '\n\n'.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50])
+        print(f"  Trying paragraph combination ({len(paragraphs)} paragraphs)")
+        combined_text = '\n\n'.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40])
         combined_text = _clean_and_format_description(combined_text)
-        if len(combined_text) > 300:
+        if len(combined_text) > 200:
             print(f"  ✓ Found description from paragraph clustering: {len(combined_text)} characters")
             return combined_text
     
-    print(f"  ⚠ No description found using any method")
+    print(f"  ❌ No description found using any method")
+    print(f"  DEBUG: Page has {len(soup.find_all('div'))} divs, {len(soup.find_all('p'))} paragraphs")
+    print(f"  DEBUG: Total page text length: {len(soup.get_text())} chars")
+    
+    # FINAL DEBUG: Save HTML to file for inspection
+    try:
+        with open('/tmp/debug_indeed_page.html', 'w', encoding='utf-8') as f:
+            f.write(str(soup.prettify()))
+        print(f"  DEBUG: Saved full HTML to /tmp/debug_indeed_page.html for inspection")
+    except:
+        pass
+    
     return None
-
-
+    
 def _extract_experience_from_full_page_improved(soup) -> Optional[str]:
     """Extract experience level from Indeed's full job page."""
     text_content = soup.get_text().lower()
