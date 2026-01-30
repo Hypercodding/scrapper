@@ -538,7 +538,7 @@ async def get_simplyhired_jobs(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+ 
     return jobs
 
 
