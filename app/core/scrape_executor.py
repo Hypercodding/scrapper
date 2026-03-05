@@ -15,13 +15,28 @@ Key Features:
 import asyncio
 import time
 import logging
+import contextvars
 from typing import Callable, TypeVar, Awaitable, Any, Optional
 from functools import wraps
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from app.core.browser_executor import hard_kill_all_browsers, verify_cleanup
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Label the current scrape for log correlation (endpoint / background task).
+_scrape_label_var: contextvars.ContextVar[str] = contextvars.ContextVar("scrape_label", default="scrape")
+
+
+@contextmanager
+def scrape_label(label: str):
+    """Temporarily set a label for scrape lock logs."""
+    token = _scrape_label_var.set(label or "scrape")
+    try:
+        yield
+    finally:
+        _scrape_label_var.reset(token)
 
 # Railway-appropriate timeouts (in seconds)
 SCRAPE_TIMEOUT = 600  # 10 minutes - reasonable for complex scraping
@@ -68,11 +83,24 @@ async def scrape_execution_context():
     
     # Track queue position
     _queue_count += 1
-    queue_position = _queue_count
     wait_start = time.time()
     
-    if _execution_lock.locked():
-        logger.info(f"📋 Request queued (position: {queue_position}, waiting for lock...)")
+    label = _scrape_label_var.get()
+    is_locked = _execution_lock.locked()
+    waiting_requests = max(0, _queue_count - (1 if is_locked else 0))
+    max_waiting = int(getattr(settings, "MAX_WAITING_SCRAPE_REQUESTS", 0) or 0)
+
+    # Optional fail-fast to prevent deep queues (especially important on low-resource boxes).
+    # If MAX_WAITING_SCRAPE_REQUESTS is 0, we do not allow any waiting at all.
+    if is_locked and waiting_requests > max_waiting:
+        _queue_count -= 1
+        raise ScrapeInProgressError(
+            f"[{label}] Another scrape is already in progress. Waiting queue is full "
+            f"({waiting_requests}/{max_waiting}). Please retry shortly."
+        )
+
+    if is_locked:
+        logger.info(f"📋 [{label}] Request queued (waiting: {waiting_requests}, waiting for lock...)")
     
     # Try to acquire lock with timeout
     try:
@@ -96,9 +124,9 @@ async def scrape_execution_context():
     _task_start_time = time.time()
     
     if wait_time > 1:
-        logger.info(f"🔒 Scrape execution lock acquired after {wait_time:.1f}s wait - starting scrape")
+        logger.info(f"🔒 [{label}] Scrape execution lock acquired after {wait_time:.1f}s wait - starting scrape")
     else:
-        logger.info("🔒 Scrape execution lock acquired - starting scrape")
+        logger.info(f"🔒 [{label}] Scrape execution lock acquired - starting scrape")
     
     try:
         # Verify no browser processes before starting (safety check)
@@ -111,7 +139,7 @@ async def scrape_execution_context():
         
     finally:
         # Always cleanup, regardless of success or failure
-        logger.info("🧹 Executing mandatory cleanup after scrape")
+        logger.info(f"🧹 [{label}] Executing mandatory cleanup after scrape")
         
         try:
             # Hard-kill all browser processes
@@ -145,9 +173,9 @@ async def scrape_execution_context():
         
         remaining = _queue_count
         if remaining > 0:
-            logger.info(f"🔓 Scrape completed (elapsed: {elapsed:.1f}s) - {remaining} request(s) still waiting")
+            logger.info(f"🔓 [{label}] Scrape completed (elapsed: {elapsed:.1f}s) - {remaining} request(s) still waiting")
         else:
-            logger.info(f"🔓 Scrape completed (elapsed: {elapsed:.1f}s) - queue empty")
+            logger.info(f"🔓 [{label}] Scrape completed (elapsed: {elapsed:.1f}s) - queue empty")
         
         # Small delay to ensure system resources are fully released
         await asyncio.sleep(1.0)

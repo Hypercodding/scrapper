@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # Chrome driver management
     CLEANUP_DRIVER_AFTER_SCRAPE: bool = True  # Kill Chrome completely after each scrape (prevents resource buildup)
     DRIVER_IDLE_TIMEOUT: int = 60  # Seconds before killing idle driver (0 = keep alive indefinitely)
+
+    # ------------------------------------------------------------
+    # Load-shedding / low-resource protection
+    # ------------------------------------------------------------
+    # Maximum number of async "company scrape jobs" kept active (pending/processing).
+    # This prevents unbounded background task buildup under low resources.
+    MAX_ASYNC_SCRAPE_JOBS: int = 25
+    # Maximum number of requests allowed to be waiting for the global scrape lock.
+    # When exceeded, endpoints should return 429 quickly instead of queueing forever.
+    # Set to 0 to fail fast (no waiting queue).
+    MAX_WAITING_SCRAPE_REQUESTS: int = 0
+    # Reject new scrape requests when Chrome processes exceed this threshold.
+    # Helps avoid "Resource temporarily unavailable" / tab crash cascades.
+    MAX_CHROME_PROCESSES_BEFORE_REJECT: int = 20
     
     # JSearch API (for Indeed jobs without scraping)
     RAPIDAPI_KEY: str = ""  # Get free key at rapidapi.com

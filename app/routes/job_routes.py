@@ -4,10 +4,11 @@ from typing import List, Optional, Dict, Any, Callable
 from datetime import datetime
 from enum import Enum
 import asyncio
+import time
 import uuid
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
-from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status # pylint: disable=import-error
+from app.core.scrape_executor import scrape_execution_context, execute_scrape_with_cleanup, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status, scrape_label # pylint: disable=import-error
 from app.core.browser_executor import hard_kill_all_browsers, verify_cleanup # pylint: disable=import-error
 from app.services.indeed_selenium_service import (
     scrape_indeed_selenium, 
@@ -35,6 +36,12 @@ router = APIRouter()
 _job_storage: Dict[str, Dict[str, Any]] = {}
 _job_lock: Optional[asyncio.Lock] = None
 
+# "Company hit list" for async scrape jobs:
+# Keeps only one active async job per company URL (prevents runaway queuing and OOM under low resources).
+# Key: normalized company key (hostname), Value: job_id
+_company_hit_list: Dict[str, str] = {}
+_company_hit_last_seen: Dict[str, float] = {}
+
 
 def _get_job_lock() -> asyncio.Lock:
     """Get or create the job lock (lazy initialization for async context)"""
@@ -42,6 +49,114 @@ def _get_job_lock() -> asyncio.Lock:
     if _job_lock is None:
         _job_lock = asyncio.Lock()
     return _job_lock
+
+
+def _normalize_company_key_from_url(url: str) -> str:
+    """
+    Normalize a "company key" from a career page URL.
+    Used for the async "company hit list" to prevent duplicate queued jobs.
+    """
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.strip())
+        host = (parsed.netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        # If user passed a bare domain without scheme, urlparse puts it in path
+        if not host and parsed.path and "." in parsed.path:
+            host = parsed.path.split("/")[0].lower().strip()
+            if host.startswith("www."):
+                host = host[4:]
+        return host or url.strip().lower()
+    except Exception:
+        return url.strip().lower()
+
+
+def _raise_if_system_overloaded():
+    """
+    Fail fast instead of queueing indefinitely when the system is under load.
+    This reduces memory pressure from many pending requests/tasks.
+    """
+    try:
+        status = get_execution_status()
+        waiting = int(status.get("waiting_requests") or 0)
+        if waiting >= getattr(settings, "MAX_WAITING_SCRAPE_REQUESTS", 10):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Server busy: too many scraping requests queued ({waiting}). "
+                    "Please retry in a few minutes."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        # If status check fails, don't block scraping.
+        pass
+
+    try:
+        process_count = check_chrome_process_count()
+        max_procs = getattr(settings, "MAX_CHROME_PROCESSES_BEFORE_REJECT", 20)
+        if process_count and process_count >= max_procs:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Server low on resources (Chrome processes: {process_count}). "
+                    "Run /api/health/cleanup or retry later."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        # If process count check fails, don't block scraping.
+        pass
+
+
+async def _cleanup_company_hit_list_locked(now: float):
+    """
+    Cleanup stale company hit list entries.
+    Must be called while holding `_get_job_lock()`.
+    """
+    # Keep per-company mappings around briefly even after completion/failure so repeat
+    # calls don't immediately trigger a new scrape under low resources.
+    # Active scrapes can legitimately take a long time; default to 4 hours.
+    # This TTL is only a safety valve for stuck jobs.
+    active_ttl = float(getattr(settings, "COMPANY_HITLIST_ACTIVE_TTL_SECONDS", 14400.0))
+    completed_ttl = float(getattr(settings, "COMPANY_HITLIST_COMPLETED_TTL_SECONDS", 900.0))
+    failed_ttl = float(getattr(settings, "COMPANY_HITLIST_FAILED_TTL_SECONDS", 180.0))
+
+    # Remove entries pointing to missing jobs or entries past their TTL
+    to_delete: List[str] = []
+    for company_key, job_id in _company_hit_list.items():
+        job = _job_storage.get(job_id)
+        if not job:
+            to_delete.append(company_key)
+            continue
+        status = job.get("status")
+        last_seen = _company_hit_last_seen.get(company_key, now)
+        age = now - last_seen
+
+        if status in (JobStatus.PENDING, JobStatus.PROCESSING):
+            if age > active_ttl:
+                to_delete.append(company_key)
+            continue
+
+        # Completed/failed jobs are kept briefly to prevent rapid re-scrapes.
+        if status == JobStatus.COMPLETED:
+            if age > completed_ttl:
+                to_delete.append(company_key)
+            continue
+        if status == JobStatus.FAILED:
+            if age > failed_ttl:
+                to_delete.append(company_key)
+            continue
+
+        # Unknown status: treat as stale.
+        to_delete.append(company_key)
+
+    for company_key in to_delete:
+        _company_hit_list.pop(company_key, None)
+        _company_hit_last_seen.pop(company_key, None)
 
 
 class JobStatus(str, Enum):
@@ -98,9 +213,11 @@ async def _execute_sync_scrape(
     2. Cleanup happens even for sync functions
     3. Proper error handling
     """
-    async with scrape_execution_context():
-        # Execute sync function in thread pool
-        return await asyncio.to_thread(scrape_func, *args, **kwargs)
+    label = getattr(scrape_func, "__name__", "sync-scrape")
+    with scrape_label(label):
+        async with scrape_execution_context():
+            # Execute sync function in thread pool
+            return await asyncio.to_thread(scrape_func, *args, **kwargs)
 
 
 async def _execute_async_scrape(
@@ -116,9 +233,11 @@ async def _execute_async_scrape(
     2. Cleanup happens even for async functions
     3. Proper error handling
     """
-    async with scrape_execution_context():
-        # Execute async function directly
-        return await scrape_func(*args, **kwargs)
+    label = getattr(scrape_func, "__name__", "async-scrape")
+    with scrape_label(label):
+        async with scrape_execution_context():
+            # Execute async function directly
+            return await scrape_func(*args, **kwargs)
 
 
 @router.get("/jobs", response_model=List[Job])
@@ -294,11 +413,12 @@ async def get_indeed_playwright_jobs(
         )
     
     try:
-        async with scrape_execution_context():
-            jobs = await scrape_indeed_playwright(
+        with scrape_label("indeed-playwright"):
+            jobs = await execute_scrape_with_cleanup(
+                scrape_indeed_playwright,
                 query, location, max_results, job_type,
                 salary_min, salary_max, experience_level, employment_type, days_old,
-                fetch_full_details=fetch_full_details
+                fetch_full_details=fetch_full_details,
             )
     except ScrapeInProgressError as e:
         raise HTTPException(
@@ -900,8 +1020,9 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
     
     try:
         # Perform scraping with single-concurrency enforcement
-        async with scrape_execution_context():
-            jobs = await scrape_generic_career_page(url, max_results, search_query)
+        with scrape_label(f"async-scrape-url:{job_id[:8]}"):
+            async with scrape_execution_context():
+                jobs = await scrape_generic_career_page(url, max_results, search_query)
         
         # Update job status
         async with _get_job_lock():
@@ -913,11 +1034,26 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
         
     except Exception as e:
         error_msg = str(e)
+        # If we hit resource exhaustion, do aggressive cleanup to prevent cascade failures
+        lowered = error_msg.lower()
+        if "resource temporarily unavailable" in lowered or "pthread_create" in lowered or "errno 11" in lowered:
+            try:
+                hard_kill_all_browsers()
+            except Exception:
+                pass
         async with _get_job_lock():
             if job_id in _job_storage:
                 _job_storage[job_id]["status"] = JobStatus.FAILED
                 _job_storage[job_id]["error"] = error_msg
                 _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
+    finally:
+        # Keep the company hit list mapping during a short cooldown window so
+        # repeated calls don't spawn new scrapes immediately after completion/failure.
+        company_key = _normalize_company_key_from_url(url)
+        async with _get_job_lock():
+            # Only touch if it still points to this job_id
+            if _company_hit_list.get(company_key) == job_id:
+                _company_hit_last_seen[company_key] = time.time()
 
 
 @router.get("/jobs/scrape-url-async-get", response_model=ScrapeJobResponse)
@@ -957,14 +1093,53 @@ async def scrape_career_page_url_async_get(
     3. When status is "completed", the result contains the jobs
     4. When status is "failed", check the error field
     """
+    _raise_if_system_overloaded()
+
     # Create request object from query parameters
     request = CareerPageRequest(url=url, max_results=max_results, search_query=search_query)
     
     # Generate unique job ID
-    job_id = str(uuid.uuid4())
+    company_key = _normalize_company_key_from_url(request.url)
+    now = time.time()
     
     # Create job record
     async with _get_job_lock():
+        # Cleanup stale entries before deciding
+        await _cleanup_company_hit_list_locked(now)
+
+        # Enforce "company hit list": if a job is already pending/processing for this company, reuse it
+        existing_job_id = _company_hit_list.get(company_key)
+        if existing_job_id:
+            existing = _job_storage.get(existing_job_id)
+            if existing:
+                existing_status = existing.get("status")
+                if existing_status in (JobStatus.PENDING, JobStatus.PROCESSING, JobStatus.COMPLETED, JobStatus.FAILED):
+                    _company_hit_last_seen[company_key] = now
+                    return ScrapeJobResponse(
+                        job_id=existing_job_id,
+                        status=existing_status,
+                        message="A scrape job for this company already exists. Poll the status_url to get results.",
+                        status_url=f"/api/jobs/scrape-status/{existing_job_id}",
+                        estimated_time="5-30 minutes (depending on page complexity)",
+                    )
+            # Stale mapping; drop it
+            _company_hit_list.pop(company_key, None)
+            _company_hit_last_seen.pop(company_key, None)
+
+        # Enforce global limit on active async jobs to avoid low-resource crashes
+        active_jobs = sum(
+            1
+            for j in _job_storage.values()
+            if j.get("status") in (JobStatus.PENDING, JobStatus.PROCESSING)
+        )
+        max_jobs = getattr(settings, "MAX_ASYNC_SCRAPE_JOBS", 25)
+        if active_jobs >= max_jobs:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many scrape jobs queued/running ({active_jobs}/{max_jobs}). Please retry later.",
+            )
+
+        job_id = str(uuid.uuid4())
         _job_storage[job_id] = {
             "job_id": job_id,
             "status": JobStatus.PENDING,
@@ -977,6 +1152,10 @@ async def scrape_career_page_url_async_get(
             "error": None,
             "progress": None
         }
+
+        # Register in company hit list
+        _company_hit_list[company_key] = job_id
+        _company_hit_last_seen[company_key] = now
     
     # Start background task
     asyncio.create_task(_process_scrape_job(job_id, request.url, request.max_results, request.search_query))
@@ -1031,11 +1210,49 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
        - If status = "failed": break loop, return error
        - Wait 15 seconds, repeat
     """
-    # Generate unique job ID
-    job_id = str(uuid.uuid4())
+    _raise_if_system_overloaded()
+
+    company_key = _normalize_company_key_from_url(request.url)
+    now = time.time()
     
     # Create job record
     async with _get_job_lock():
+        # Cleanup stale entries before deciding
+        await _cleanup_company_hit_list_locked(now)
+
+        # Enforce "company hit list": if a job is already pending/processing for this company, reuse it
+        existing_job_id = _company_hit_list.get(company_key)
+        if existing_job_id:
+            existing = _job_storage.get(existing_job_id)
+            if existing:
+                existing_status = existing.get("status")
+                if existing_status in (JobStatus.PENDING, JobStatus.PROCESSING, JobStatus.COMPLETED, JobStatus.FAILED):
+                    _company_hit_last_seen[company_key] = now
+                    return ScrapeJobResponse(
+                        job_id=existing_job_id,
+                        status=existing_status,
+                        message="A scrape job for this company already exists. Poll the status_url to get results.",
+                        status_url=f"/api/jobs/scrape-status/{existing_job_id}",
+                        estimated_time="5-30 minutes (depending on page complexity)",
+                    )
+            # Stale mapping; drop it
+            _company_hit_list.pop(company_key, None)
+            _company_hit_last_seen.pop(company_key, None)
+
+        # Enforce global limit on active async jobs to avoid low-resource crashes
+        active_jobs = sum(
+            1
+            for j in _job_storage.values()
+            if j.get("status") in (JobStatus.PENDING, JobStatus.PROCESSING)
+        )
+        max_jobs = getattr(settings, "MAX_ASYNC_SCRAPE_JOBS", 25)
+        if active_jobs >= max_jobs:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many scrape jobs queued/running ({active_jobs}/{max_jobs}). Please retry later.",
+            )
+
+        job_id = str(uuid.uuid4())
         _job_storage[job_id] = {
             "job_id": job_id,
             "status": JobStatus.PENDING,
@@ -1048,6 +1265,10 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
             "error": None,
             "progress": None
         }
+
+        # Register in company hit list
+        _company_hit_list[company_key] = job_id
+        _company_hit_last_seen[company_key] = now
     
     # Start background task
     asyncio.create_task(_process_scrape_job(job_id, request.url, request.max_results, request.search_query))
@@ -1103,6 +1324,16 @@ async def get_scrape_job_status(job_id: str):
     """
     async with _get_job_lock():
         job_data = _job_storage.get(job_id)
+        # Refresh company hit list "last seen" when clients poll status.
+        # This prevents long-running (legit) scrapes from being considered stale.
+        if job_data:
+            try:
+                url = job_data.get("url") or ""
+                company_key = _normalize_company_key_from_url(url)
+                if _company_hit_list.get(company_key) == job_id:
+                    _company_hit_last_seen[company_key] = time.time()
+            except Exception:
+                pass
     
     if not job_data:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -1136,7 +1367,17 @@ async def delete_scrape_job(job_id: str):
                 status_code=400, 
                 detail="Cannot delete a job that is currently processing"
             )
-        
+
+        # Remove from company hit list if present
+        try:
+            url = _job_storage[job_id].get("url") or ""
+            company_key = _normalize_company_key_from_url(url)
+            if _company_hit_list.get(company_key) == job_id:
+                _company_hit_list.pop(company_key, None)
+                _company_hit_last_seen.pop(company_key, None)
+        except Exception:
+            pass
+
         del _job_storage[job_id]
     
     return {"message": f"Job {job_id} deleted successfully", "status": "success"}
