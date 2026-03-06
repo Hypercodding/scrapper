@@ -4287,10 +4287,10 @@ async def scrape_multiple_career_pages(
     Returns:
         Combined list of Job objects from all URLs
     """
-    # Set max_results_per_url to unlimited if not specified
+    # Set max_results_per_url to a safe cap if not specified (prevents OOM on large hit lists)
     if max_results_per_url is None:
-        max_results_per_url = 999999  # Large number to get all jobs
-        print(f"ℹ️  No max_results_per_url specified - will scrape ALL available jobs per URL")
+        max_results_per_url = 500  # Safe default; use explicit value for "unlimited"
+        print(f"ℹ️  No max_results_per_url specified - capping at {max_results_per_url} per URL for stability")
     all_jobs = []
     successful_scrapes = 0
     failed_scrapes = 0

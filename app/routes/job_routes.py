@@ -4,10 +4,11 @@ from typing import List, Optional, Dict, Any, Callable
 from datetime import datetime
 from enum import Enum
 import asyncio
+import logging
 import uuid
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
-from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status # pylint: disable=import-error
+from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status, SCRAPE_TIMEOUT # pylint: disable=import-error
 from app.core.browser_executor import hard_kill_all_browsers, verify_cleanup # pylint: disable=import-error
 from app.services.indeed_selenium_service import (
     scrape_indeed_selenium, 
@@ -32,8 +33,16 @@ from pydantic import BaseModel
 router = APIRouter()
 
 # In-memory job storage with thread safety
+# Capped to prevent OOM when run continuously for many customers (e.g. on Railway)
+MAX_STORED_JOBS = 200  # Evict oldest completed/failed when exceeding
 _job_storage: Dict[str, Dict[str, Any]] = {}
 _job_lock: Optional[asyncio.Lock] = None
+
+# Multi-URL (company hit list) limits - prevent runaway memory and timeouts on Railway
+MAX_URLS_PER_REQUEST = 50  # Reject or truncate if more
+MULTI_URL_SCRAPE_TIMEOUT = 900  # 15 minutes total for entire multi-URL run
+MAX_RESULTS_PER_URL_DEFAULT = 500  # Cap per-URL when not specified (avoid 999999)
+MAX_TOTAL_RESULTS_DEFAULT = 2000  # Cap total when not specified
 
 
 def _get_job_lock() -> asyncio.Lock:
@@ -42,6 +51,29 @@ def _get_job_lock() -> asyncio.Lock:
     if _job_lock is None:
         _job_lock = asyncio.Lock()
     return _job_lock
+
+
+def _evict_old_jobs_if_needed() -> None:
+    """
+    Evict oldest completed/failed jobs when storage exceeds MAX_STORED_JOBS.
+    Prevents OOM when run continuously for many customers (e.g. on Railway).
+    Must be called with _job_lock held by the caller.
+    """
+    if len(_job_storage) <= MAX_STORED_JOBS:
+        return
+    evictable = [
+        (job_id, data.get("updated_at") or data.get("created_at", ""))
+        for job_id, data in _job_storage.items()
+        if data.get("status") in (JobStatus.COMPLETED, JobStatus.FAILED)
+    ]
+    evictable.sort(key=lambda x: x[1])
+    to_remove = len(_job_storage) - MAX_STORED_JOBS
+    for job_id, _ in evictable[:to_remove]:
+        if job_id in _job_storage and _job_storage[job_id].get("status") in (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+        ):
+            del _job_storage[job_id]
 
 
 class JobStatus(str, Enum):
@@ -671,18 +703,53 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
     - Failed URLs don't stop processing of other URLs
     - Optional search_query to filter jobs by keyword
     
+    Limits (to prevent OOM/timeouts on Railway):
+    - Maximum {MAX_URLS_PER_REQUEST} URLs per request
+    - Results per URL and total results are capped when not specified
+    
     Returns:
     - Combined and deduplicated list of Job objects from all URLs
     - Jobs are deduplicated based on title + company
     """
+    # Validate URL count to prevent OOM and runaway runtime on Railway
+    if len(request.urls) > MAX_URLS_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many URLs: maximum {MAX_URLS_PER_REQUEST} per request (got {len(request.urls)}). "
+            "Split into multiple requests or reduce the list."
+        )
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="At least one URL is required")
+
+    # Cap result limits to prevent unbounded memory (defaults when not specified)
+    max_per_url = request.max_results_per_url
+    if max_per_url is None:
+        max_per_url = MAX_RESULTS_PER_URL_DEFAULT
+    else:
+        max_per_url = min(max_per_url, MAX_RESULTS_PER_URL_DEFAULT)
+    total_max = request.total_max_results
+    if total_max is not None:
+        total_max = min(total_max, MAX_TOTAL_RESULTS_DEFAULT)
+    else:
+        total_max = MAX_TOTAL_RESULTS_DEFAULT
+
     try:
         async with scrape_execution_context():
-            jobs = await scrape_multiple_career_pages(
-                urls=request.urls,
-                max_results_per_url=request.max_results_per_url,
-                search_query=request.search_query,
-                total_max_results=request.total_max_results
+            jobs = await asyncio.wait_for(
+                scrape_multiple_career_pages(
+                    urls=request.urls,
+                    max_results_per_url=max_per_url,
+                    search_query=request.search_query,
+                    total_max_results=total_max,
+                ),
+                timeout=MULTI_URL_SCRAPE_TIMEOUT,
             )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Scraping exceeded {MULTI_URL_SCRAPE_TIMEOUT}s timeout. "
+            "Try fewer URLs or use the async job endpoint (/jobs/scrape-url-async) per URL."
+        )
     except ScrapeInProgressError as e:
         raise HTTPException(
             status_code=429,
@@ -892,32 +959,46 @@ async def get_throttle_status_endpoint():
 
 
 async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int], search_query: Optional[str]):
-    """Background task to process a scrape job"""
-    async with _get_job_lock():
-        if job_id in _job_storage:
-            _job_storage[job_id]["status"] = JobStatus.PROCESSING
-            _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
-    
+    """Background task to process a scrape job. Logs and stores any exception so the task never raises."""
+    logger = logging.getLogger(__name__)
     try:
-        # Perform scraping with single-concurrency enforcement
-        async with scrape_execution_context():
-            jobs = await scrape_generic_career_page(url, max_results, search_query)
-        
-        # Update job status
         async with _get_job_lock():
             if job_id in _job_storage:
-                _job_storage[job_id]["status"] = JobStatus.COMPLETED
-                _job_storage[job_id]["result"] = jobs
+                _job_storage[job_id]["status"] = JobStatus.PROCESSING
                 _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
-                _job_storage[job_id]["progress"] = {"jobs_found": len(jobs)}
         
-    except Exception as e:
-        error_msg = str(e)
-        async with _get_job_lock():
-            if job_id in _job_storage:
-                _job_storage[job_id]["status"] = JobStatus.FAILED
-                _job_storage[job_id]["error"] = error_msg
-                _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        try:
+            # Perform scraping with single-concurrency enforcement
+            async with scrape_execution_context():
+                jobs = await scrape_generic_career_page(url, max_results, search_query)
+            
+            # Update job status
+            async with _get_job_lock():
+                if job_id in _job_storage:
+                    _job_storage[job_id]["status"] = JobStatus.COMPLETED
+                    _job_storage[job_id]["result"] = jobs
+                    _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
+                    _job_storage[job_id]["progress"] = {"jobs_found": len(jobs)}
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.exception("Scrape job %s failed: %s", job_id, error_msg)
+            async with _get_job_lock():
+                if job_id in _job_storage:
+                    _job_storage[job_id]["status"] = JobStatus.FAILED
+                    _job_storage[job_id]["error"] = error_msg
+                    _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
+    except Exception as outer:
+        # Safety: catch any exception from lock/storage so the task never raises
+        logger.exception("Background scrape job %s raised: %s", job_id, outer)
+        try:
+            async with _get_job_lock():
+                if job_id in _job_storage:
+                    _job_storage[job_id]["status"] = JobStatus.FAILED
+                    _job_storage[job_id]["error"] = f"Internal error: {outer}"
+                    _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        except Exception:
+            pass
 
 
 @router.get("/jobs/scrape-url-async-get", response_model=ScrapeJobResponse)
@@ -965,6 +1046,7 @@ async def scrape_career_page_url_async_get(
     
     # Create job record
     async with _get_job_lock():
+        _evict_old_jobs_if_needed()
         _job_storage[job_id] = {
             "job_id": job_id,
             "status": JobStatus.PENDING,
@@ -1036,6 +1118,7 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
     
     # Create job record
     async with _get_job_lock():
+        _evict_old_jobs_if_needed()
         _job_storage[job_id] = {
             "job_id": job_id,
             "status": JobStatus.PENDING,
