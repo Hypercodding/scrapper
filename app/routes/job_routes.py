@@ -1,11 +1,12 @@
 
 from fastapi import APIRouter, Query, HTTPException, Body
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Tuple
 from datetime import datetime
 from enum import Enum
 import asyncio
 import logging
 import uuid
+from urllib.parse import urlparse
 from app.models.job_model import Job # pylint: disable=import-error
 from app.core.config import settings # pylint: disable=import-error
 from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status, SCRAPE_TIMEOUT # pylint: disable=import-error
@@ -31,6 +32,51 @@ from app.services.generic_career_scraper import scrape_generic_career_page, scra
 from pydantic import BaseModel
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _validate_career_url(url: str) -> None:
+    """Validate career page URL for generic scraping. Raises HTTPException if invalid."""
+    if not url or not isinstance(url, str):
+        raise HTTPException(status_code=400, detail="URL is required and must be a non-empty string.")
+    url = url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL cannot be blank.")
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid URL: {str(e)}")
+    if not parsed.scheme:
+        raise HTTPException(status_code=400, detail="URL must include scheme (e.g. https://).")
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="URL must use http or https.")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="URL must have a host (e.g. example.com).")
+    if len(url) > 2048:
+        raise HTTPException(status_code=400, detail="URL is too long.")
+
+
+def _validate_career_url_safe(url: str) -> Tuple[bool, Optional[str]]:
+    """Validate URL without raising. Returns (True, None) if valid else (False, error_message)."""
+    if not url or not isinstance(url, str):
+        return False, "URL is required and must be a non-empty string."
+    url = url.strip()
+    if not url:
+        return False, "URL cannot be blank."
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        return False, f"Invalid URL: {str(e)}"
+    if not parsed.scheme:
+        return False, "URL must include scheme (e.g. https://)."
+    if parsed.scheme not in ("http", "https"):
+        return False, "URL must use http or https."
+    if not parsed.netloc:
+        return False, "URL must have a host (e.g. example.com)."
+    if len(url) > 2048:
+        return False, "URL is too long."
+    return True, None
+
 
 # In-memory job storage with thread safety
 # Capped to prevent OOM when run continuously for many customers (e.g. on Railway)
@@ -608,6 +654,7 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
     Returns:
     - List of Job objects with actual job titles, company, location, description, etc.
     """
+    _validate_career_url(request.url)
     try:
         async with scrape_execution_context():
             jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
@@ -621,10 +668,26 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
             status_code=504,
             detail=f"Scraping operation timed out. {str(e)}"
         )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Scraping operation timed out. The site may be slow or unresponsive."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error scraping {request.url}: {str(e)}")
+        err_msg = str(e)
+        if any(x in err_msg.lower() for x in ("connection", "timeout", "refused", "reset", "unreachable")):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot reach the career page. Please check the URL and try again. ({err_msg[:200]})"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error scraping career page: {err_msg[:500]}"
+        )
 
-    return jobs
+    return jobs if jobs is not None else []
 
 
 @router.get("/jobs/scrape-url-get", response_model=List[Job])
@@ -656,6 +719,7 @@ async def scrape_career_page_url_get(
     Returns:
     - List of Job objects with actual job titles, company, location, description, etc.
     """
+    _validate_career_url(url)
     try:
         async with scrape_execution_context():
             jobs = await scrape_generic_career_page(url, max_results, search_query)
@@ -669,10 +733,26 @@ async def scrape_career_page_url_get(
             status_code=504,
             detail=f"Scraping operation timed out. {str(e)}"
         )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Scraping operation timed out. The site may be slow or unresponsive."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error scraping {url}: {str(e)}")
+        err_msg = str(e)
+        if any(x in err_msg.lower() for x in ("connection", "timeout", "refused", "reset", "unreachable")):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot reach the career page. Please check the URL and try again. ({err_msg[:200]})"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error scraping career page: {err_msg[:500]}"
+        )
 
-    return jobs
+    return jobs if jobs is not None else []
 
 
 @router.post("/jobs/scrape-multiple-urls", response_model=List[Job])
@@ -721,6 +801,18 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
     if not request.urls:
         raise HTTPException(status_code=400, detail="At least one URL is required")
 
+    # Validate all URLs before starting (fail fast for Railway)
+    invalid = []
+    for i, u in enumerate(request.urls):
+        ok, msg = _validate_career_url_safe(u)
+        if not ok:
+            invalid.append(f"URL {i + 1}: {msg}")
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL(s): " + "; ".join(invalid[:5]) + ("..." if len(invalid) > 5 else "")
+        )
+
     # Cap result limits to prevent unbounded memory (defaults when not specified)
     max_per_url = request.max_results_per_url
     if max_per_url is None:
@@ -760,10 +852,21 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
             status_code=504,
             detail=f"Scraping operation timed out. {str(e)}"
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error scraping multiple URLs: {str(e)}")
+        err_msg = str(e)
+        if any(x in err_msg.lower() for x in ("connection", "timeout", "refused", "reset", "unreachable")):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot reach one or more career pages. ({err_msg[:200]})"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error scraping URLs: {err_msg[:500]}"
+        )
 
-    return jobs
+    return jobs if jobs is not None else []
 
 
 @router.get("/health/detailed", response_model=Dict[str, Any])
@@ -976,9 +1079,9 @@ async def _process_scrape_job(job_id: str, url: str, max_results: Optional[int],
             async with _get_job_lock():
                 if job_id in _job_storage:
                     _job_storage[job_id]["status"] = JobStatus.COMPLETED
-                    _job_storage[job_id]["result"] = jobs
+                    _job_storage[job_id]["result"] = jobs if jobs is not None else []
                     _job_storage[job_id]["updated_at"] = datetime.utcnow().isoformat()
-                    _job_storage[job_id]["progress"] = {"jobs_found": len(jobs)}
+                    _job_storage[job_id]["progress"] = {"jobs_found": len(jobs) if jobs else 0}
             
         except Exception as e:
             error_msg = str(e)
@@ -1038,6 +1141,7 @@ async def scrape_career_page_url_async_get(
     3. When status is "completed", the result contains the jobs
     4. When status is "failed", check the error field
     """
+    _validate_career_url(url)
     # Create request object from query parameters
     request = CareerPageRequest(url=url, max_results=max_results, search_query=search_query)
     
@@ -1113,6 +1217,7 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
        - If status = "failed": break loop, return error
        - Wait 15 seconds, repeat
     """
+    _validate_career_url(request.url)
     # Generate unique job ID
     job_id = str(uuid.uuid4())
     

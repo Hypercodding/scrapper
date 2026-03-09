@@ -3964,7 +3964,7 @@ async def scrape_with_selenium(
             # Last resort - log but don't raise (finally block should not raise)
             print(f"⚠️  [GENERIC SCRAPER] Hard-kill error (non-fatal): {kill_error}")
     
-    return jobs
+    return jobs if jobs is not None else []
 
 
 def matches_job_title(scraped_title: str, customer_query: str) -> bool:
@@ -4119,6 +4119,23 @@ async def scrape_generic_career_page(
     Returns:
         List of Job objects
     """
+    # Validate URL before any work (fail fast, safe for Railway)
+    if not url or not isinstance(url, str):
+        raise ValueError("URL is required and must be a non-empty string.")
+    url = url.strip()
+    if not url:
+        raise ValueError("URL cannot be blank.")
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        raise ValueError(f"Invalid URL: {e}") from e
+    if not parsed.scheme or parsed.scheme not in ("http", "https"):
+        raise ValueError("URL must use http or https.")
+    if not parsed.netloc:
+        raise ValueError("URL must have a host (e.g. example.com).")
+    if len(url) > 2048:
+        raise ValueError("URL is too long.")
+
     # Set max_results to unlimited if not specified
     if max_results is None:
         max_results = 999999  # Large number to get all jobs
@@ -4257,6 +4274,8 @@ async def scrape_generic_career_page(
             jobs = filter_invalid_jobs(jobs)
             print(f"Jobs after final filtering: {len(jobs)}")
         
+        # Ensure we always return a list (defensive for Railway/API)
+        jobs = jobs if jobs is not None else []
         # Return limited results
         final_jobs = jobs[:max_results]
         
