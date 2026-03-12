@@ -3218,7 +3218,7 @@ async def scrape_with_selenium(
                             if service.process.poll() is None:
                                 service.process.terminate()
                                 service.process.wait(timeout=3)
-                        except:
+                        except Exception:
                             pass
                     service = None
                     
@@ -3265,7 +3265,7 @@ async def scrape_with_selenium(
                 # Stop page loading and continue
                 driver.execute_script("window.stop();")
                 await asyncio.sleep(2)
-            except:
+            except Exception:
                 pass
             api_urls = []
         except Exception as e:
@@ -3274,9 +3274,11 @@ async def scrape_with_selenium(
                 driver.get(url)
                 await asyncio.sleep(2)
             except TimeoutException:
-                print("Page load timeout - stopping page load and continuing")
+                print("  Page load timeout - stopping page load and continuing")
                 driver.execute_script("window.stop();")
                 await asyncio.sleep(2)
+            except Exception:
+                pass
             api_urls = []
         
         if api_urls:
@@ -3389,7 +3391,7 @@ async def scrape_with_selenium(
                             job_elements_in_iframe = driver.find_elements(By.XPATH, 
                                 "//*[contains(text(), 'Director') or contains(text(), 'Manager') or contains(text(), 'Marketing') or contains(text(), 'Operations')]")
                             has_visible_jobs = len(job_elements_in_iframe) > 0
-                        except:
+                        except Exception:
                             has_visible_jobs = False
                         
                         if has_job_keywords or has_visible_jobs:
@@ -3430,9 +3432,13 @@ async def scrape_with_selenium(
             
             print("\nExtracting job listings from page 1...")
             
-            # OPTIMIZED: Use JavaScript to find all job elements in ONE query
+            # Initialize so we never have NameError on exception (Railway-safe)
+            elements = []
+            unique_elements = []
+            job_elements_data = None
+            try:
+                job_elements_data = driver.execute_script("""
             # ENHANCED: Better handling for Workday and other job boards
-            job_elements_data = driver.execute_script("""
                 // Workday-specific: Find parent containers for jobs
                 const workdayJobTitles = document.querySelectorAll('[data-automation-id="jobTitle"]');
                 const workdayJobs = [];
@@ -3571,6 +3577,9 @@ async def scrape_with_selenium(
                 
                 return uniqueElements;
             """)
+            except Exception as elem_err:
+                logger.warning("Job elements script failed: %s", elem_err)
+                job_elements_data = None
             
             elements = job_elements_data if job_elements_data else []
             print(f"Found {len(elements)} unique job elements (after filtering)")
@@ -3587,7 +3596,7 @@ async def scrape_with_selenium(
                     """, elements)
                     if job_titles_found:
                         print(f"  Job titles found: {job_titles_found}")
-                except:
+                except Exception:
                     pass
             
             unique_elements = elements  # Already filtered by JavaScript
@@ -3704,6 +3713,7 @@ async def scrape_with_selenium(
                     hasLink: el.tagName === 'A' || el.querySelector('a') !== null
                 }));
             """, unique_elements)
+            elements_link_status = elements_link_status or []
             
             elements_with_links = [item['element'] for item in elements_link_status if item['hasLink']]
             elements_without_links = [item['element'] for item in elements_link_status if not item['hasLink']]
@@ -3729,6 +3739,7 @@ async def scrape_with_selenium(
                     };
                 });
             """, all_elements)
+            element_data_batch = element_data_batch or []
             
             print(f"  Extracting job data from elements...")
             
@@ -3938,6 +3949,11 @@ async def scrape_with_selenium(
             print("🚨 CRITICAL: CONNECTION POOL/RESOURCE EXHAUSTION ERROR DETECTED!")
             print("   This error can cause Railway deployment to crash.")
             print("   Performing emergency cleanup...")
+            try:
+                hard_kill_all_browsers()
+                await asyncio.sleep(2.0)
+            except Exception as kill_err:
+                print(f"   Emergency cleanup error: {kill_err}")
     
     finally:
         # CRITICAL: ALWAYS cleanup driver after every scrape to prevent pool exhaustion
@@ -4283,7 +4299,7 @@ async def scrape_generic_career_page(
         print(f"Scraping complete: {len(final_jobs)} jobs extracted")
         print(f"{'='*80}\n")
         
-        return final_jobs
+        return (final_jobs or [])
 
 
 async def scrape_multiple_career_pages(
@@ -4346,6 +4362,7 @@ async def scrape_multiple_career_pages(
                 search_query=search_query,
                 use_undetected=use_undetected
             )
+            jobs = jobs if jobs is not None else []
             
             if jobs:
                 all_jobs.extend(jobs)
@@ -4404,7 +4421,7 @@ async def scrape_multiple_career_pages(
     seen = set()
     
     for job in all_jobs:
-        job_key = (job.title.lower(), job.company.lower())
+        job_key = ((job.title or '').lower(), (job.company or '').lower())
         if job_key not in seen:
             seen.add(job_key)
             unique_jobs.append(job)
