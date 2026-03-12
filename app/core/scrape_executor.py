@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 # Railway-appropriate timeouts (in seconds)
 SCRAPE_TIMEOUT = 600  # 10 minutes - reasonable for complex scraping
 CLEANUP_TIMEOUT = 30  # 30 seconds for cleanup operations
-# Increased timeout - allows many requests to queue and wait for their turn
-# For 40 requests @ ~2min each = ~80 min max queue time, but most complete faster
-LOCK_ACQUIRE_TIMEOUT = 1800  # 30 minutes - allows deep request queuing
+# No timeout for queue wait - requests wait until their turn (no queue timeout)
+LOCK_ACQUIRE_TIMEOUT = None  # None = wait indefinitely for lock (no queue timeout)
 
 # Global execution lock - ensures only one scrape runs at a time
 _execution_lock = asyncio.Lock()
@@ -56,8 +55,8 @@ async def scrape_execution_context():
     Async context manager for scraping execution.
     
     Enforces single-concurrency: only one scrape can run at a time.
-    Automatically handles cleanup and timeout.
-    Requests queue up and wait for their turn (up to LOCK_ACQUIRE_TIMEOUT).
+    Automatically handles cleanup. Requests queue up and wait for their turn
+    (no queue timeout - they wait until the lock is available).
     
     Usage:
         async with scrape_execution_context():
@@ -74,23 +73,8 @@ async def scrape_execution_context():
     if _execution_lock.locked():
         logger.info(f"📋 Request queued (position: {queue_position}, waiting for lock...)")
     
-    # Try to acquire lock with timeout
-    try:
-        acquired = await asyncio.wait_for(
-            _execution_lock.acquire(),
-            timeout=LOCK_ACQUIRE_TIMEOUT
-        )
-        if not acquired:
-            _queue_count -= 1
-            raise ScrapeInProgressError(
-                f"Could not acquire execution lock within {LOCK_ACQUIRE_TIMEOUT}s. "
-                "Another scrape may be in progress."
-            )
-    except asyncio.TimeoutError:
-        _queue_count -= 1
-        raise ScrapeInProgressError(
-            f"Timeout waiting for execution lock after {LOCK_ACQUIRE_TIMEOUT}s. Queue may be very long."
-        )
+    # Acquire lock - no timeout: queued requests wait until their turn (no queue timeout)
+    await _execution_lock.acquire()
     
     wait_time = time.time() - wait_start
     _task_start_time = time.time()
