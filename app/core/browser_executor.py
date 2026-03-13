@@ -77,15 +77,12 @@ class BrowserProcessManager:
                 proc_name = proc.info['name'].lower() if proc.info['name'] else ''
                 cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
                 
-                # Match Chrome/ChromeDriver processes used by Selenium
+                # Kill ALL Chrome/ChromeDriver processes regardless of launch args.
+                # Zombie/crashed processes lose their cmdline data, so filtering by
+                # Selenium-specific flags causes stale processes to accumulate and
+                # exhaust Railway's process table (leading to EAGAIN [Errno 11]).
                 is_chrome_process = (
-                    ('chrome' in proc_name or 'chromedriver' in proc_name) and
-                    ('--test-type' in cmdline or 
-                     '--enable-automation' in cmdline or 
-                     'chromedriver' in cmdline or
-                     '--remote-debugging-port' in cmdline or
-                     '--headless' in cmdline or
-                     'selenium' in cmdline.lower())
+                    'chrome' in proc_name or 'chromedriver' in proc_name
                 )
                 
                 if is_chrome_process:
@@ -149,10 +146,10 @@ class BrowserProcessManager:
                         
                         if cmdline_result.returncode == 0:
                             cmdline = cmdline_result.stdout.lower()
-                            if any(keyword in cmdline for keyword in [
-                                '--test-type', '--enable-automation', 'chromedriver',
-                                '--remote-debugging-port', '--headless', 'selenium'
-                            ]):
+                            # Kill any chrome/chromedriver process — stale/zombie
+                            # processes lose cmdline data so we can't filter by
+                            # Selenium flags or they'll accumulate and fill the table.
+                            if 'chrome' in cmdline or not cmdline.strip():
                                 logger.info(f"Killing browser process (PID: {pid})")
                                 
                                 # Try SIGTERM first
@@ -293,9 +290,7 @@ class BrowserProcessManager:
                 proc_name = proc.info['name'].lower() if proc.info['name'] else ''
                 cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
                 
-                if (('chrome' in proc_name or 'chromedriver' in proc_name) and
-                    ('--test-type' in cmdline or '--enable-automation' in cmdline or
-                     'chromedriver' in cmdline or '--remote-debugging-port' in cmdline)):
+                if 'chrome' in proc_name or 'chromedriver' in proc_name:
                     return False
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass

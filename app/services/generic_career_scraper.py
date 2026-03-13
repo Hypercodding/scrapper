@@ -3080,6 +3080,29 @@ async def scrape_with_selenium(
     use_enhanced_features: bool = False  # NEW: Enable enhanced scraping features
 ) -> List[Job]:
     """Scrape jobs using Selenium/undetected-chromedriver"""
+    from app.core.throttle import get_browser_semaphore
+    # Acquire the global browser mutex before touching Chrome.
+    # This guarantees ONE browser process at a time across all concurrent requests.
+    async with get_browser_semaphore():
+        return await _scrape_with_selenium_impl(
+            url=url,
+            company_name=company_name,
+            max_results=max_results,
+            search_query=search_query,
+            use_undetected=use_undetected,
+            use_enhanced_features=use_enhanced_features,
+        )
+
+
+async def _scrape_with_selenium_impl(
+    url: str,
+    company_name: str,
+    max_results: int,
+    search_query: Optional[str] = None,
+    use_undetected: bool = False,
+    use_enhanced_features: bool = False
+) -> List[Job]:
+    """Internal implementation — always called while holding get_browser_semaphore()."""
     jobs = []
     driver = None
     
@@ -3130,6 +3153,15 @@ async def scrape_with_selenium(
         chrome_options.add_argument('--disable-domain-reliability')
         chrome_options.add_argument('--disable-remote-fonts')  # Reduce memory usage
         chrome_options.add_argument('--disable-notifications')
+        # CRITICAL for Railway/Docker: prevents SIGTRAP (-5) caused by seccomp blocking
+        # Chrome's zygote clone() syscall. Without this, Chrome dies immediately in
+        # Railway containers, causing "Status code was: -5" errors.
+        chrome_options.add_argument('--no-zygote')
+        # Reduce process count to avoid hitting Railway's nproc limits
+        chrome_options.add_argument('--renderer-process-limit=1')
+        chrome_options.add_argument('--disable-crash-reporter')
+        chrome_options.add_argument('--no-crash-upload')
+        chrome_options.add_argument('--disable-oopr-debug-crash-dump')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         # Add preference to avoid crashes
@@ -3138,6 +3170,18 @@ async def scrape_with_selenium(
             'profile.default_content_settings.popups': 0,
         })
         
+        # Pre-launch cleanup: kill all stale Chrome/ChromeDriver processes before starting.
+        # Stale processes from previous runs fill Railway's process table and cause
+        # EAGAIN [Errno 11] on the next posix_spawn.
+        print("🧹 Pre-launch: killing any stale Chrome/ChromeDriver processes...")
+        try:
+            pre_killed = hard_kill_all_browsers()
+            if pre_killed > 0:
+                print(f"   Killed {pre_killed} stale process(es) before launch")
+                await asyncio.sleep(1.5)  # Give OS time to release PIDs and file descriptors
+        except Exception as pre_kill_err:
+            print(f"   Pre-launch cleanup error (non-fatal): {pre_kill_err}")
+
         # Use undetected-chromedriver for anti-bot protection
         if use_undetected:
             print("Using undetected-chromedriver for anti-bot protection")

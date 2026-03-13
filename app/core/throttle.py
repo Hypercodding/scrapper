@@ -4,6 +4,12 @@ Request throttling to prevent too many parallel scraping operations.
 This module limits concurrent scraping operations to prevent resource exhaustion
 on Railway deployments. It automatically detects your Railway plan and sets
 appropriate limits.
+
+Browser semaphore (get_browser_semaphore) is separate from the scraping throttle:
+- ScrapingThrottle: limits how many full pipeline requests run concurrently
+- _browser_semaphore: guarantees only ONE browser process exists at any time,
+  regardless of plan tier or request concurrency. Every scrape_with_selenium
+  call must hold this lock for its entire duration.
 """
 import asyncio
 import os
@@ -116,6 +122,29 @@ def get_max_concurrent_from_env() -> int:
 
 # Global throttle instance
 _scraping_throttle: Optional[ScrapingThrottle] = None
+
+# ONE browser at a time — hard limit regardless of plan tier or request concurrency.
+# Acquiring this lock before launching Chrome and releasing it only after full cleanup
+# prevents two simultaneous Chrome processes from competing for Railway's limited PIDs
+# and memory. asyncio.Semaphore(1) is effectively a mutex in an async context.
+_browser_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def get_browser_semaphore() -> asyncio.Semaphore:
+    """
+    Returns the global browser mutex (Semaphore(1)).
+
+    Every call to scrape_with_selenium must hold this for its full duration:
+
+        async with get_browser_semaphore():
+            driver = webdriver.Chrome(...)
+            ...  # full scrape
+            driver.quit()
+    """
+    global _browser_semaphore
+    if _browser_semaphore is None:
+        _browser_semaphore = asyncio.Semaphore(1)
+    return _browser_semaphore
 
 
 def get_scraping_throttle() -> ScrapingThrottle:
