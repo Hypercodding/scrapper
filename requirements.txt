@@ -22,3 +22,9 @@ playwright-stealth>=2.0.0  # Anti-detection for Playwright
 selenium-wire>=5,<6
 
 blinker<1.8
+
+# Queue / job state
+celery[redis]>=5.4
+redis>=5.0
+tldextract>=5.0
+structlog>=24.0

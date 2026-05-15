@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # JSearch API (for Indeed jobs without scraping)
     RAPIDAPI_KEY: str = ""  # Get free key at rapidapi.com
 
+    # Redis / queue (see also app.core.settings_workers)
+    REDIS_URL: str = "redis://localhost:6379/0"
+
     class Config:  # pylint: disable=R0903
         env_file = ".env"
         extra = "ignore"  # Ignore extra fields from .env file

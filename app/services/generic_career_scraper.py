@@ -17,7 +17,7 @@ import random
 import time
 import logging
 import os
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -37,6 +37,9 @@ from urllib3.util.retry import Retry
 from app.models.job_model import Job
 from app.core.config import settings
 from app.core.browser_executor import cleanup_browser, hard_kill_all_browsers
+from app.services.organization_resolver import ResolvedOrganization, resolve_organization
+from app.services.normalization import normalize_and_dedupe_jobs
+from app.services.career.detector import build_ats_api_urls, detect_job_board as career_detect_job_board
 
 # Setup logging (configure only if not already configured)
 if not logging.getLogger().handlers:
@@ -226,11 +229,42 @@ def create_session_with_retries() -> requests.Session:
 
 
 def extract_company_name_from_url(url: str) -> str:
-    """Extract company name from URL"""
-    parsed = urlparse(url)
-    domain = parsed.netloc
-    name = domain.replace('www.', '').split('.')[0]
-    return name.replace('-', ' ').replace('_', ' ').title()
+    """Legacy helper — delegates to organization resolver."""
+    return resolve_organization(url, "").name
+
+
+async def fetch_initial_page_html(url: str, timeout: int = 15) -> str:
+    """Lightweight HTTP fetch for metadata extraction before Selenium."""
+    try:
+        session = create_session_with_retries()
+        response = session.get(
+            url,
+            headers={"User-Agent": get_random_user_agent()},
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            return response.text
+    except Exception as e:
+        logger.warning("Initial HTML fetch failed for %s: %s", url, e)
+    return ""
+
+
+async def try_scrape_via_ats_api(
+    url: str,
+    company_name: str,
+    company_url: Optional[str] = None,
+) -> List[Job]:
+    """Attempt ATS JSON API scrape before launching a browser."""
+    api_urls = build_ats_api_urls(url)
+    if not api_urls:
+        return []
+    session = create_session_with_retries()
+    all_jobs: List[Job] = []
+    for api_url in api_urls:
+        logger.info("Trying ATS API: %s", api_url)
+        jobs = await scrape_api_endpoint(session, api_url, company_name, company_url)
+        all_jobs.extend(jobs)
+    return all_jobs
 
 
 def detect_job_board(url: str) -> Optional[Dict[str, Any]]:
@@ -1401,112 +1435,60 @@ async def intercept_api_calls(driver, url: str, wait_time: int = 5) -> List[str]
         return []
 
 
-async def scrape_api_endpoint(session: requests.Session, api_url: str, company_name: str) -> List[Job]:
-    """Scrape jobs from an API endpoint"""
-    jobs = []
-    
+async def scrape_api_endpoint(
+    session: requests.Session,
+    api_url: str,
+    company_name: str,
+    company_url: Optional[str] = None,
+) -> List[Job]:
+    """Scrape jobs from an API endpoint (Greenhouse, Lever, Ashby, etc.)."""
+    from app.services.career.api_parser import collect_job_arrays, parse_api_job_item
+
+    jobs: List[Job] = []
+
     try:
-        print(f"Fetching API endpoint: {api_url}")
+        logger.info("Fetching API endpoint: %s", api_url)
         response = session.get(
             api_url,
-            headers={'User-Agent': get_random_user_agent()},
-            timeout=10
+            headers={"User-Agent": get_random_user_agent()},
+            timeout=30,
         )
-        
+
         if response.status_code != 200:
-            print(f"API returned status {response.status_code}")
+            logger.warning("API returned status %s for %s", response.status_code, api_url)
             return jobs
-        
+
         data = response.json()
-        
-        # Try to find job listings in common JSON structures
-        job_arrays = []
-        
-        # Direct array
-        if isinstance(data, list):
-            job_arrays.append(data)
-        
-        # Common nested structures
-        for key in ['jobs', 'positions', 'openings', 'postings', 'results', 'data', 'items']:
-            if isinstance(data, dict) and key in data:
-                if isinstance(data[key], list):
-                    job_arrays.append(data[key])
-        
-        # Extract jobs from found arrays
+        job_arrays = collect_job_arrays(data)
+
         for job_array in job_arrays:
             for item in job_array:
                 if not isinstance(item, dict):
                     continue
-                
-                # Extract fields from JSON
-                title = None
-                for title_key in ['title', 'name', 'position', 'jobTitle', 'job_title', 'positionTitle']:
-                    if title_key in item:
-                        title = item[title_key]
-                        break
-                
-                if not title or not is_valid_job_title(str(title)):
+                fields = parse_api_job_item(item, company_name, company_url)
+                if not fields:
                     continue
-                
-                # Extract other fields
-                location = None
-                for loc_key in ['location', 'city', 'office', 'workLocation', 'locations']:
-                    if loc_key in item:
-                        location = item[loc_key]
-                        if isinstance(location, list):
-                            location = ', '.join(str(l) for l in location)
-                        break
-                
-                description = None
-                for desc_key in ['description', 'summary', 'details', 'content', 'descriptionPlain']:
-                    if desc_key in item:
-                        description = item[desc_key]
-                        break
-                
-                url = None
-                for url_key in ['url', 'link', 'applyUrl', 'apply_url', 'absoluteUrl', 'hostedUrl']:
-                    if url_key in item:
-                        url = item[url_key]
-                        break
-                
-                employment_type = None
-                for type_key in ['employmentType', 'type', 'jobType', 'commitment']:
-                    if type_key in item:
-                        employment_type = item[type_key]
-                        break
-                
-                salary = None
-                for salary_key in ['salary', 'compensation', 'salaryRange', 'pay']:
-                    if salary_key in item:
-                        salary = item[salary_key]
-                        if isinstance(salary, dict):
-                            salary = f"{salary.get('min', '')} - {salary.get('max', '')}"
-                        break
-                
-                posted_date = None
-                for date_key in ['postedDate', 'createdAt', 'publishedAt', 'datePosted']:
-                    if date_key in item:
-                        posted_date = item[date_key]
-                        break
-                
+                if not is_valid_job_title(fields["title"]):
+                    continue
+
                 job = Job(
-                    title=clean_text(str(title)),
-                    company=company_name,
-                    location=clean_text(str(location)) if location else None,
-                    description=clean_text(str(description)[:500]) if description else None,
-                    url=url,
-                    employment_type=employment_type,
-                    salary=str(salary) if salary else None,
-                    posted_date=posted_date
+                    title=clean_text(fields["title"]),
+                    company=clean_text(fields["company"]) or company_name,
+                    company_url=fields.get("company_url") or company_url,
+                    location=clean_text(fields["location"]) if fields.get("location") else None,
+                    description=clean_text(fields["description"]) if fields.get("description") else None,
+                    url=fields.get("url"),
+                    employment_type=fields.get("employment_type"),
+                    salary_range=fields.get("salary_range"),
+                    posted_date=fields.get("posted_date"),
                 )
                 jobs.append(job)
-                print(f"  ✓ API Job: {job.title}")
-        
-        print(f"Extracted {len(jobs)} jobs from API")
-        
+
+        logger.info("Extracted %s jobs from API %s", len(jobs), api_url)
+
     except Exception as e:
-        print(f"Error scraping API endpoint: {e}")
-    
+        logger.error("Error scraping API endpoint %s: %s", api_url, e)
+
     return jobs
 
 
@@ -1636,7 +1618,7 @@ def extract_job_from_element_optimized(element, element_data: dict, base_url: st
             url=job_url,
             remote_type=remote_type,
             employment_type=employment_type,
-            salary=salary,
+            salary_range=salary,
             posted_date=posted_date,
             requirements=requirements
         )
@@ -1893,7 +1875,7 @@ def extract_job_from_element(element, base_url: str, company_name: str) -> Optio
             url=job_url,
             remote_type=remote_type,
             employment_type=employment_type,
-            salary=salary,
+            salary_range=salary,
             posted_date=posted_date,
             requirements=requirements
         )
@@ -2801,8 +2783,14 @@ async def extract_jobs_from_current_page(
     
     try:
         print("  📋 Preparing job selectors...")
+        from app.services.scraper_config import get_site_config
+        site_config = get_site_config(url)
+        board = detect_job_board(url) or career_detect_job_board(url)
+        config_selectors: List[str] = list(site_config.job_container_selectors)
+        if board:
+            config_selectors.extend(board["config"].get("selectors", []))
         # Comprehensive job selectors
-        job_selectors = [
+        job_selectors = config_selectors + [
             # Board-specific selectors FIRST (most accurate)
             '[data-ui="job"]', 'li[data-ui="job"]',  # Workable
             '.BambooHR-ATS-Jobs-Item',  # BambooHR
@@ -2812,7 +2800,10 @@ async def extract_jobs_from_current_page(
             '.jv-job-list-item',  # Jobvite
             '.opening-job',  # SmartRecruiters
             '[class*="JobsList"]',  # Ashby
-            
+            # Noo Job Board / WordPress career themes
+            '.noo_job', '.job-item', '.type-job', 'article.type-job',
+            'h3.job-title', '.job-title a', 'a[href*="/job/"]',
+
             # Shopify/theme-specific patterns
             '[class*="collapsible"]', '[class*="accordion"]',
             '[class*="collapsible-content"]', '[class*="accordion-content"]',
@@ -3482,7 +3473,7 @@ async def _scrape_with_selenium_impl(
             job_elements_data = None
             try:
                 job_elements_data = driver.execute_script("""
-            # ENHANCED: Better handling for Workday and other job boards
+                // ENHANCED: Better handling for Workday and other job boards
                 // Workday-specific: Find parent containers for jobs
                 const workdayJobTitles = document.querySelectorAll('[data-automation-id="jobTitle"]');
                 const workdayJobs = [];
@@ -3552,6 +3543,9 @@ async def _scrape_with_selenium_impl(
                     '.BambooHR-ATS-Jobs-Item',
                     '.postings-group', '.posting',
                     '.jv-job-list-item', '.opening-job',
+                    '.noo_job', '.job-item', '.type-job', 'article.type-job',
+                    '.job-list .job', '.jobs-listing .job', 'li.type-job',
+                    'h3.job-title', '.job-title a', 'a[href*="/job/"]',
                     '[data-job-id]', '[data-posting-id]',
                     
                     // Generic job containers
@@ -3624,8 +3618,23 @@ async def _scrape_with_selenium_impl(
             except Exception as elem_err:
                 logger.warning("Job elements script failed: %s", elem_err)
                 job_elements_data = None
-            
+
             elements = job_elements_data if job_elements_data else []
+            if not elements:
+                try:
+                    page_jobs = await extract_jobs_from_current_page(
+                        driver, url, company_name, max_results, set(),
+                        iframe_switched=iframe_switched,
+                    )
+                    if page_jobs:
+                        jobs.extend(page_jobs)
+                        logger.info(
+                            "Recovered %s jobs via extract_jobs_from_current_page fallback",
+                            len(page_jobs),
+                        )
+                except Exception as fallback_err:
+                    logger.warning("Iframe extraction fallback failed: %s", fallback_err)
+
             print(f"Found {len(elements)} unique job elements (after filtering)")
             
             # Debug: Log job titles if we found any Workday jobs
@@ -4165,7 +4174,8 @@ async def scrape_generic_career_page(
     url: str,
     max_results: Optional[int] = None,
     search_query: Optional[str] = None,
-    use_undetected: bool = False
+    use_undetected: bool = False,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> List[Job]:
     """
     Universal scraper for any career page
@@ -4204,17 +4214,41 @@ async def scrape_generic_career_page(
     from app.core.throttle import get_scraping_throttle
     
     async with get_scraping_throttle():
-        company_name = extract_company_name_from_url(url)
+        if progress_callback:
+            progress_callback(stage="fetching_metadata")
+
+        page_html = await fetch_initial_page_html(url)
+        resolved_org: ResolvedOrganization = resolve_organization(url, page_html)
+        company_name = resolved_org.name
+        logger.info(
+            "Company resolved: %s (confidence=%.2f, source=%s)",
+            company_name, resolved_org.confidence, resolved_org.source,
+        )
         print(f"\n{'='*80}")
         print(f"Starting scrape for: {company_name}")
         print(f"URL: {url}")
         print(f"Search query: {search_query if search_query else 'None (will return all jobs)'}")
         print(f"{'='*80}\n")
-        
+
         # Detect job board
-        job_board = detect_job_board(url)
+        job_board = detect_job_board(url) or career_detect_job_board(url)
         if job_board:
             print(f"Detected job board: {job_board['name']}")
+
+        # API-first for known ATS platforms
+        if not search_query:
+            if progress_callback:
+                progress_callback(stage="ats_api")
+            api_jobs = await try_scrape_via_ats_api(
+                url, company_name, company_url=resolved_org.company_url,
+            )
+            if api_jobs:
+                api_jobs = filter_invalid_jobs(api_jobs)
+                final = normalize_and_dedupe_jobs(api_jobs[:max_results], resolved_org)
+                if progress_callback:
+                    progress_callback(jobs_found=len(final), stage="completed")
+                print(f"ATS API returned {len(final)} jobs (skipping Selenium)")
+                return final
         
         # Parse multiple job titles if comma-separated
         job_titles = []
@@ -4336,14 +4370,16 @@ async def scrape_generic_career_page(
         
         # Ensure we always return a list (defensive for Railway/API)
         jobs = jobs if jobs is not None else []
-        # Return limited results
-        final_jobs = jobs[:max_results]
-        
+        final_jobs = normalize_and_dedupe_jobs(jobs[:max_results], resolved_org)
+
+        if progress_callback:
+            progress_callback(jobs_found=len(final_jobs), stage="completed")
+
         print(f"\n{'='*80}")
         print(f"Scraping complete: {len(final_jobs)} jobs extracted")
         print(f"{'='*80}\n")
-        
-        return (final_jobs or [])
+
+        return final_jobs or []
 
 
 async def scrape_multiple_career_pages(
@@ -4460,20 +4496,11 @@ async def scrape_multiple_career_pages(
     print(f"Total jobs collected: {len(all_jobs)}")
     print(f"{'#'*80}\n")
     
-    # Remove duplicates based on title and company
-    unique_jobs = []
-    seen = set()
-    
-    for job in all_jobs:
-        job_key = ((job.title or '').lower(), (job.company or '').lower())
-        if job_key not in seen:
-            seen.add(job_key)
-            unique_jobs.append(job)
-    
+    unique_jobs = normalize_and_dedupe_jobs(all_jobs)
     if len(unique_jobs) < len(all_jobs):
         print(f"Removed {len(all_jobs) - len(unique_jobs)} duplicate jobs")
         print(f"Final unique jobs: {len(unique_jobs)}\n")
-    
+
     return unique_jobs
 
 

@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, Query, HTTPException, Body
+from fastapi import APIRouter, Query, HTTPException, Body, Response
 from typing import List, Optional, Dict, Any, Callable, Tuple
 from datetime import datetime
 from enum import Enum
@@ -29,10 +29,35 @@ from app.services.simplyhired_playwright_service import (
     CloudflareBlockedError as SimplyHiredCloudflareBlockedError
 ) # pylint: disable=import-error
 from app.services.generic_career_scraper import scrape_generic_career_page, scrape_multiple_career_pages # pylint: disable=import-error
+from app.core.job_store import JobStore, JobStatus as RedisJobStatus, get_job_store
 from pydantic import BaseModel
 
-router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _enqueue_career_scrape(
+    url: str,
+    max_results: Optional[int] = None,
+    search_query: Optional[str] = None,
+) -> str:
+    """Create Redis job record and dispatch Celery task."""
+    store = get_job_store()
+    job_id = store.create(url=url, max_results=max_results, search_query=search_query)
+    try:
+        from app.workers.tasks import scrape_career_page_task
+        task = scrape_career_page_task.delay(job_id, url, max_results, search_query)
+        store.update(job_id, celery_task_id=task.id)
+    except Exception as exc:
+        logger.error("Failed to enqueue Celery task: %s", exc)
+        store.set_failed(job_id, f"Failed to enqueue scrape: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Job queue unavailable. Ensure Redis and Celery worker are running.",
+        ) from exc
+    return job_id
+
+
+router = APIRouter()
 
 
 def _validate_career_url(url: str) -> None:
@@ -128,6 +153,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class CareerPageRequest(BaseModel):
@@ -161,6 +187,27 @@ class ScrapeJobStatusResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = None
     result: Optional[List[Job]] = None
     error: Optional[str] = None
+
+
+def _job_status_response(job_data: Dict[str, Any]) -> ScrapeJobStatusResponse:
+    result = job_data.get("result")
+    jobs = [Job(**j) for j in result] if result is not None else None
+    return ScrapeJobStatusResponse(
+        job_id=job_data["job_id"],
+        status=job_data["status"],
+        created_at=job_data["created_at"],
+        updated_at=job_data.get("updated_at"),
+        progress=job_data.get("progress"),
+        result=jobs,
+        error=job_data.get("error"),
+    )
+
+
+def _get_job_data(job_id: str) -> Optional[Dict[str, Any]]:
+    data = get_job_store().get(job_id)
+    if data:
+        return data
+    return _job_storage.get(job_id)
 
 
 async def _execute_sync_scrape(
@@ -656,8 +703,7 @@ async def scrape_career_page_url(request: CareerPageRequest = Body(...)):
     """
     _validate_career_url(request.url)
     try:
-        async with scrape_execution_context():
-            jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
+        jobs = await scrape_generic_career_page(request.url, request.max_results, request.search_query)
     except ScrapeInProgressError as e:
         raise HTTPException(
             status_code=429,
@@ -721,19 +767,13 @@ async def scrape_career_page_url_get(
     """
     _validate_career_url(url)
     try:
-        async with scrape_execution_context():
-            jobs = await scrape_generic_career_page(url, max_results, search_query)
-    except ScrapeInProgressError as e:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
-        )
+        jobs = await scrape_generic_career_page(url, max_results, search_query)
     except ScrapeTimeoutError as e:
         raise HTTPException(
             status_code=504,
             detail=f"Scraping operation timed out. {str(e)}"
         )
-    except asyncio.TimeoutError as e:
+    except asyncio.TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="Scraping operation timed out. The site may be slow or unresponsive."
@@ -826,16 +866,15 @@ async def scrape_multiple_career_pages_endpoint(request: MultipleCareerPagesRequ
         total_max = MAX_TOTAL_RESULTS_DEFAULT
 
     try:
-        async with scrape_execution_context():
-            jobs = await asyncio.wait_for(
-                scrape_multiple_career_pages(
-                    urls=request.urls,
-                    max_results_per_url=max_per_url,
-                    search_query=request.search_query,
-                    total_max_results=total_max,
-                ),
-                timeout=MULTI_URL_SCRAPE_TIMEOUT,
-            )
+        jobs = await asyncio.wait_for(
+            scrape_multiple_career_pages(
+                urls=request.urls,
+                max_results_per_url=max_per_url,
+                search_query=request.search_query,
+                total_max_results=total_max,
+            ),
+            timeout=MULTI_URL_SCRAPE_TIMEOUT,
+        )
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=504,
@@ -1142,36 +1181,14 @@ async def scrape_career_page_url_async_get(
     4. When status is "failed", check the error field
     """
     _validate_career_url(url)
-    # Create request object from query parameters
     request = CareerPageRequest(url=url, max_results=max_results, search_query=search_query)
-    
-    # Generate unique job ID
-    job_id = str(uuid.uuid4())
-    
-    # Create job record
-    async with _get_job_lock():
-        _evict_old_jobs_if_needed()
-        _job_storage[job_id] = {
-            "job_id": job_id,
-            "status": JobStatus.PENDING,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": None,
-            "url": request.url,
-            "max_results": request.max_results,
-            "search_query": request.search_query,
-            "result": None,
-            "error": None,
-            "progress": None
-        }
-    
-    # Start background task
-    asyncio.create_task(_process_scrape_job(job_id, request.url, request.max_results, request.search_query))
-    
+    job_id = _enqueue_career_scrape(request.url, request.max_results, request.search_query)
+
     return ScrapeJobResponse(
         job_id=job_id,
         status=JobStatus.PENDING,
         message="Job created successfully. Poll the status_url to get results.",
-        status_url=f"/api/jobs/scrape-status/{job_id}",
+        status_url=f"/api/jobs/{job_id}",
         estimated_time="5-30 minutes (depending on page complexity)"
     )
 
@@ -1218,33 +1235,13 @@ async def scrape_career_page_url_async(request: CareerPageRequest = Body(...)):
        - Wait 15 seconds, repeat
     """
     _validate_career_url(request.url)
-    # Generate unique job ID
-    job_id = str(uuid.uuid4())
-    
-    # Create job record
-    async with _get_job_lock():
-        _evict_old_jobs_if_needed()
-        _job_storage[job_id] = {
-            "job_id": job_id,
-            "status": JobStatus.PENDING,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": None,
-            "url": request.url,
-            "max_results": request.max_results,
-            "search_query": request.search_query,
-            "result": None,
-            "error": None,
-            "progress": None
-        }
-    
-    # Start background task
-    asyncio.create_task(_process_scrape_job(job_id, request.url, request.max_results, request.search_query))
-    
+    job_id = _enqueue_career_scrape(request.url, request.max_results, request.search_query)
+
     return ScrapeJobResponse(
         job_id=job_id,
         status=JobStatus.PENDING,
         message="Job created successfully. Poll the status_url to get results.",
-        status_url=f"/api/jobs/scrape-status/{job_id}",
+        status_url=f"/api/jobs/{job_id}",
         estimated_time="5-30 minutes (depending on page complexity)"
     )
 
@@ -1289,21 +1286,10 @@ async def get_scrape_job_status(job_id: str):
         "error": "Error message here"
     }
     """
-    async with _get_job_lock():
-        job_data = _job_storage.get(job_id)
-    
+    job_data = _get_job_data(job_id)
     if not job_data:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
-    return ScrapeJobStatusResponse(
-        job_id=job_data["job_id"],
-        status=job_data["status"],
-        created_at=job_data["created_at"],
-        updated_at=job_data.get("updated_at"),
-        progress=job_data.get("progress"),
-        result=job_data.get("result"),
-        error=job_data.get("error")
-    )
+    return _job_status_response(job_data)
 
 
 @router.delete("/jobs/scrape-status/{job_id}")
@@ -1328,5 +1314,111 @@ async def delete_scrape_job(job_id: str):
         del _job_storage[job_id]
     
     return {"message": f"Job {job_id} deleted successfully", "status": "success"}
+
+
+@router.post("/jobs/scrape", response_model=ScrapeJobResponse, status_code=202)
+async def enqueue_career_scrape(request: CareerPageRequest = Body(...)):
+    """
+    Enqueue a career page scrape (production endpoint).
+
+    Returns immediately with job_id. Poll GET /api/jobs/{job_id} for status and results.
+    """
+    _validate_career_url(request.url)
+    job_id = _enqueue_career_scrape(request.url, request.max_results, request.search_query)
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Scrape job enqueued.",
+        status_url=f"/api/jobs/{job_id}",
+        estimated_time="5-30 minutes",
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=ScrapeJobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get scrape job status, progress, and results."""
+    job_data = _get_job_data(job_id)
+    if not job_data:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return _job_status_response(job_data)
+
+
+@router.get("/jobs/{job_id}/result", response_model=List[Job])
+async def get_job_result(job_id: str):
+    """Return job results only when scrape is completed."""
+    job_data = _get_job_data(job_id)
+    if not job_data:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job_data.get("status") != JobStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not completed (status={job_data.get('status')})",
+        )
+    result = job_data.get("result") or []
+    return [Job(**j) for j in result]
+
+
+@router.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a pending/processing scrape job."""
+    job_data = _get_job_data(job_id)
+    if not job_data:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    status = job_data.get("status")
+    if status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+        get_job_store().delete(job_id)
+        return {"message": f"Job {job_id} removed", "status": "success"}
+
+    task_id = job_data.get("celery_task_id")
+    if task_id:
+        try:
+            from app.workers.celery_app import celery_app
+            celery_app.control.revoke(task_id, terminate=True)
+        except Exception as exc:
+            logger.warning("Failed to revoke task %s: %s", task_id, exc)
+
+    get_job_store().set_status(job_id, RedisJobStatus.CANCELLED)
+    return {"message": f"Job {job_id} cancelled", "status": "cancelled"}
+
+
+@router.get("/health/workers")
+async def worker_health():
+    """Celery worker health and active task count."""
+    try:
+        from app.workers.celery_app import celery_app
+        inspect = celery_app.control.inspect(timeout=3.0)
+        ping = inspect.ping() or {}
+        active = inspect.active() or {}
+        active_count = sum(len(v) for v in active.values())
+        return {
+            "status": "healthy" if ping else "degraded",
+            "workers": list(ping.keys()) if ping else [],
+            "active_tasks": active_count,
+            "ping": ping,
+        }
+    except Exception as exc:
+        return {"status": "unavailable", "error": str(exc)}
+
+
+@router.get("/health/queue")
+async def queue_health():
+    """Queue depth from Redis."""
+    try:
+        import redis
+        from app.core.settings_workers import get_worker_settings
+        r = redis.from_url(get_worker_settings().REDIS_URL)
+        default_len = r.llen("scrape.default") if r.exists("scrape.default") else 0
+        retry_len = r.llen("scrape.retry") if r.exists("scrape.retry") else 0
+        dlq_len = r.llen("scrape.dlq") if r.exists("scrape.dlq") else 0
+        return {
+            "queues": {
+                "scrape.default": default_len,
+                "scrape.retry": retry_len,
+                "scrape.dlq": dlq_len,
+            }
+        }
+    except Exception as exc:
+        return {"status": "unavailable", "error": str(exc)}
 
 
