@@ -4131,6 +4131,55 @@ async def _scrape_with_selenium_impl(
     return jobs if jobs is not None else []
 
 
+_TITLE_ABBREV_MAP = {
+    "jr": "junior",
+    "sr": "senior",
+    "coord": "coordinator",
+    "mgr": "manager",
+    "asst": "assistant",
+    "spec": "specialist",
+    "dev": "developer",
+    "eng": "engineer",
+    "admin": "administrator",
+    "exec": "executive",
+    "dir": "director",
+    "mktg": "marketing",
+    "prod": "product",
+    "tech": "technical",
+    "anal": "analyst",
+    "vp": "vice president",
+}
+
+
+def _expand_title_abbreviations(text: str) -> str:
+    out = text.lower()
+    for abbrev, full in _TITLE_ABBREV_MAP.items():
+        out = re.sub(r"\b" + re.escape(abbrev) + r"\b", full, out)
+    return out
+
+
+def _normalize_match_text(text: str) -> str:
+    """Lowercase, unify punctuation, collapse whitespace for title matching."""
+    text = text.lower().strip()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def matches_job_title_loose(scraped_title: str, customer_query: str) -> bool:
+    """Fallback: normalized phrase or all significant query tokens appear in title."""
+    if not scraped_title or not customer_query:
+        return False
+    title = _normalize_match_text(_expand_title_abbreviations(scraped_title))
+    query = _normalize_match_text(_expand_title_abbreviations(customer_query))
+    if not query:
+        return False
+    if query in title:
+        return True
+    tokens = [w for w in query.split() if len(w) >= 2]
+    return bool(tokens) and all(tok in title for tok in tokens)
+
+
 def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     """
     Smart job title matching that ensures all words from customer query 
@@ -4151,46 +4200,31 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     """
     if not scraped_title or not customer_query:
         return False
+
+    if matches_job_title_loose(scraped_title, customer_query):
+        return True
     
     # Normalize both strings
-    scraped_lower = scraped_title.lower().strip()
-    query_lower = customer_query.lower().strip()
+    scraped_lower = _normalize_match_text(scraped_title)
+    query_lower = _normalize_match_text(customer_query)
     
-    # Handle common abbreviations and variations
-    # Map abbreviations to full words in scraped title for better matching
-    abbreviation_map = {
-        'jr': 'junior',
-        'sr': 'senior',
-        'coord': 'coordinator',
-        'mgr': 'manager',
-        'asst': 'assistant',
-        'spec': 'specialist',
-        'dev': 'developer',
-        'eng': 'engineer',
-        'admin': 'administrator',
-        'exec': 'executive',
-        'dir': 'director',
-        'mktg': 'marketing',
-        'prod': 'product',
-        'tech': 'technical',
-        'anal': 'analyst'
-    }
-    
-    # Replace abbreviations in scraped title for matching
-    scraped_for_matching = scraped_lower
-    for abbrev, full in abbreviation_map.items():
-        # Replace standalone abbreviations (word boundaries)
-        scraped_for_matching = re.sub(r'\b' + re.escape(abbrev) + r'\b', full, scraped_for_matching)
+    # Expand abbreviations in both title and query
+    scraped_for_matching = _expand_title_abbreviations(scraped_lower)
+    query_for_matching = _expand_title_abbreviations(query_lower)
     
     # Split query into words
-    query_words = query_lower.split()
+    query_words = query_for_matching.split()
     
     # If query is empty after split, no match
     if not query_words:
         return False
     
-    # Strategy 1: Check if the complete phrase exists (ideal match) - use normalized version for abbreviations
-    if query_lower in scraped_for_matching or query_lower in scraped_lower:
+    # Strategy 1: Check if the complete phrase exists (ideal match)
+    if (
+        query_for_matching in scraped_for_matching
+        or query_lower in scraped_lower
+        or query_lower in scraped_for_matching
+    ):
         return True
     
     # Strategy 2: Check if all words appear in order with at most 1 word gap between consecutive query words
@@ -4201,8 +4235,10 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     scraped_words_normalized = scraped_for_matching.split()
     scraped_words = scraped_lower.split()
     
-    # Check if all query words exist in scraped title (check both normalized and original)
+    # Check if all query words exist in scraped title
     for query_word in query_words:
+        if len(query_word) < 2:
+            continue
         if query_word not in scraped_for_matching and query_word not in scraped_lower:
             return False
     
@@ -4257,12 +4293,12 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
         
         return False
     
-    # Check if words appear in order and consecutively (no words in between)
-    # max_gap=0 means consecutive words only (semantic gap of 0 words between)
-    if check_positions_in_order_and_proximity(query_words, word_positions, max_gap=0):
+    # Allow one intervening word (e.g. "Senior Project Manager" for query "project manager")
+    significant = [w for w in query_words if len(w) >= 2]
+    if check_positions_in_order_and_proximity(significant or query_words, word_positions, max_gap=1):
         return True
-    
-    return False
+
+    return matches_job_title_loose(scraped_title, customer_query)
 
 
 def normalize_title_for_matching(title: str, job_url: Optional[str] = None) -> str:
@@ -4283,13 +4319,23 @@ def filter_jobs_by_queries(jobs: List[Job], queries: List[str]) -> List[Job]:
     for job in jobs:
         title_for_match = normalize_title_for_matching(job.title or "", job.url)
         for query in queries:
-            if matches_job_title(title_for_match, query):
+            if matches_job_title(title_for_match, query) or matches_job_title_loose(
+                title_for_match, query
+            ):
                 filtered.append(job)
                 break
     logger.info(
         "Matched %s/%s jobs against %s search title(s)",
         len(filtered), len(jobs), len(queries),
     )
+    if jobs and not filtered:
+        sample_titles = [j.title for j in jobs[:5] if j.title]
+        sample_queries = queries[:5]
+        logger.warning(
+            "Title filter matched 0 jobs. Sample scraped titles: %s | Sample queries: %s",
+            sample_titles,
+            sample_queries,
+        )
     return filtered
 
 
@@ -4412,6 +4458,14 @@ async def scrape_generic_career_page(
             print(f"\n📋 No search query - scraping all available jobs")
 
         scrape_cap = max(max_results * 3, max_results) if job_titles else max_results
+        if len(job_titles) > 1:
+            # Multi-title: filter in memory — cap listing size to avoid 10+ min scrapes / timeouts
+            multi_listing_cap = min(150, max(50, 12 * len(job_titles)))
+            scrape_cap = min(scrape_cap, multi_listing_cap)
+            print(
+                f"Multi-title search: capping listing scrape to {scrape_cap} jobs "
+                f"before OR filter ({len(job_titles)} titles)"
+            )
         jobs = await scrape_with_selenium(
             url=url,
             company_name=company_name,

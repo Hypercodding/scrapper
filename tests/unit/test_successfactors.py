@@ -111,6 +111,17 @@ class TestFilterJobsByQueries:
         out = filter_jobs_by_queries(jobs, ["Senior Project Manager"])
         assert len(out) == 1
 
+    def test_loose_match_senior_prefix(self):
+        jobs = [
+            Job(title="Senior Portfolio Analyst", company="X", description="", url="http://a/1"),
+        ]
+        out = filter_jobs_by_queries(jobs, ["Portfolio Analyst"])
+        assert len(out) == 1
+
+    def test_ampersand_title(self):
+        from app.services.generic_career_scraper import matches_job_title
+        assert matches_job_title("M&A Analyst, Financial Lines", "M&A Analyst")
+
 
 @pytest.mark.unit
 class TestOrganizationResolverSf:
