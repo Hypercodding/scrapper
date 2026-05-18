@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     # http://oliqrnln:crmu361j609a@142.111.48.253:7030,http://oliqrnln:crmu361j609a@107.172.163.27:6543,http://oliqrnln:crmu361j609a@198.23.239.134:6540
     # Note: Webshare proxies - ensure bandwidth is available on your account
     # Error 402 = bandwidth limit exceeded, need to add credits or wait for reset
-    # Leave empty to use direct connection (your home IP - often works better than datacenter proxies)
-    # PROXY_URLS: str = "http://cyyjmhrh:06q82f2l9jwz@63.246.130.236:6437,http://cyyjmhrh:06q82f2l9jwz@9.142.221.43:5207,http://cyyjmhrh:06q82f2l9jwz@9.142.199.59:5226"  # Add proxies separated by commas, or leave empty for direct connection
-    PROXY_URLS: str = "http://cyyjmhrh-rotate:06q82f2l9jwz@p.webshare.io:80"  # Add proxies separated by commas, or leave empty for direct connection
+    # Leave empty for direct connection. Set via .env / Railway Variables on worker service.
+    # Example: PROXY_URLS=http://user:pass@proxy1:port,http://user:pass@proxy2:port
+    PROXY_URLS: str = ""
     PROXY_ROTATION_INTERVAL: int = 240  # Rotate proxy every 240 seconds (4 minutes)
     
     # Legacy single proxy support (deprecated, use PROXY_URLS instead)

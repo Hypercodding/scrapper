@@ -97,6 +97,10 @@ JOB_BOARD_PATTERNS = {
         'domains': ['apply.workable.com'],
         'selectors': ['[data-ui="job"]', 'li[data-ui="job"]', '.jobs-list li'],
     },
+    'successfactors': {
+        'domains': ['sapsf.', 'successfactors.com', 'successfactors.eu'],
+        'selectors': ["a[href*='career_job_req_id']"],
+    },
 }
 
 # Common patterns for extracting job fields
@@ -213,8 +217,11 @@ def get_random_user_agent() -> str:
 
 
 def create_session_with_retries() -> requests.Session:
-    """Create a requests session with retry logic"""
+    """Create a requests session with retry logic and optional proxy."""
+    from app.core.proxy_config import configure_requests_session
+
     session = requests.Session()
+    configure_requests_session(session)
     retry = Retry(
         total=3,
         read=3,
@@ -421,6 +428,32 @@ def is_valid_job_url(url: str) -> bool:
     return True
 
 
+def _is_ats_ui_junk_title(title_lower: str) -> bool:
+    """Reject ATS filter chrome and navigation mistaken for job titles."""
+    junk_fragments = (
+        "multiselect combobox",
+        "no value selected",
+        "select one or more options",
+        "select action",
+        "jobs matched your search",
+        "jobs match the selections",
+        "no jobs matched",
+        "updating...",
+        "emphasized",
+        "posted in last:",
+        "search for openings",
+        "experience required",
+    )
+    return any(frag in title_lower for frag in junk_fragments)
+
+
+def _is_successfactors_host(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    from app.services.career.successfactors import is_successfactors_url
+    return is_successfactors_url(url)
+
+
 def is_valid_job_title(title: str) -> bool:
     """Check if extracted title looks like a valid job title"""
     if not title or len(title) < 5 or len(title) > 200:
@@ -501,10 +534,18 @@ def is_valid_job_title(title: str) -> bool:
         # Benefits/info sections
         'protecting your future', 'catalog', 'request a catalog',
         'generous health benefit', '401k', 'paid parental leave',
-        'life & disability insurance', 'conservation leadership'
+        'life & disability insurance', 'conservation leadership',
+        # SAP SuccessFactors / ATS filter UI
+        'multiselect', 'combobox', 'no value selected', 'select action',
+        'search jobs', 'sign in', 'emphasized', 'updating...', 'jobs matched',
+        'posted in last', 'search for openings', 'experience required',
+        'career opportunities',
     ]
     
     if any(kw in title_lower for kw in nav_keywords):
+        return False
+    
+    if _is_ats_ui_junk_title(title_lower):
         return False
     
     # Skip if it starts with common UI patterns
@@ -517,6 +558,8 @@ def is_valid_job_title(title: str) -> bool:
         r'^click\s+',      # "Click here"
         r'^\d+\s*result',  # "25 results"
         r'^we would',      # "we would love to get to know you"
+        r'^select one or more',  # SF filter widgets
+        r'^emphasized', r'^updating', r'^\d+\s*jobs?\s*matched',
     ]
     
     for pattern in ui_patterns:
@@ -640,6 +683,14 @@ def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
         return False
     
     title_lower = job.title.lower().strip()
+
+    if _is_ats_ui_junk_title(title_lower):
+        if debug:
+            print(f"       ❌ Failed: ATS UI junk title")
+        return False
+
+    if title_lower in ("career opportunities", "search jobs", "sign in", "select action"):
+        return False
     
     # Check URL - if it looks like a job URL, accept it immediately
     has_job_url = False
@@ -680,6 +731,15 @@ def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
             if debug:
                 print(f"       ❌ Failed: URL is search/filter page, not job detail: '{job.url[:80]}'")
             return False
+
+        # SAP SuccessFactors: only accept real requisition detail links
+        if _is_successfactors_host(job.url):
+            if "career_job_req_id=" not in url_lower and "jobreqid=" not in url_lower:
+                if debug:
+                    print(f"       ❌ Failed: SF listing URL without requisition id")
+                return False
+            if "loginflowrequired" in url_lower or "sign in" in title_lower:
+                return False
         
         # Workday-specific: URLs ending with /job/ (even without job ID) are valid job detail pages
         is_workday_job_url = bool(re.search(r'/job/?$', url_lower)) or bool(re.search(r'/job/\w', url_lower))
@@ -701,11 +761,15 @@ def is_valid_job_entry(job: Job, debug: bool = False) -> bool:
             if debug:
                 print(f"       ❌ Failed: Title is a job count")
             return False
+
+        if _is_ats_ui_junk_title(title_lower):
+            return False
         
         # Reject very obvious non-job titles only
         obvious_non_jobs = [
             'view all', 'all jobs', 'protomaps', 'openstreetmap', 
-            'map', 'maps', 'copyright', 'dipartimenti', 'sedi tutto'
+            'map', 'maps', 'copyright', 'dipartimenti', 'sedi tutto',
+            'search jobs', 'sign in', 'select action', 'career opportunities',
         ]
         
         # Check if title is exactly one of these or contains them as standalone words
@@ -3096,11 +3160,12 @@ async def _scrape_with_selenium_impl(
     """Internal implementation — always called while holding get_browser_semaphore()."""
     jobs = []
     driver = None
-    
+    active_proxy_url: Optional[str] = None
+
     service = None  # Track service for cleanup on failure
     max_retries = 3
     retry_delay = 2
-    
+
     try:
         # Setup Chrome options with enhanced stability for containerized environments
         chrome_options = Options()
@@ -3160,7 +3225,11 @@ async def _scrape_with_selenium_impl(
             'profile.default_content_setting_values.notifications': 2,
             'profile.default_content_settings.popups': 0,
         })
-        
+
+        from app.core.proxy_config import apply_proxy_to_chrome_options
+
+        active_proxy_url = apply_proxy_to_chrome_options(chrome_options)
+
         # Pre-launch cleanup: kill all stale Chrome/ChromeDriver processes before starting.
         # Stale processes from previous runs fill Railway's process table and cause
         # EAGAIN [Errno 11] on the next posix_spawn.
@@ -3390,12 +3459,16 @@ async def _scrape_with_selenium_impl(
                 pass
             
             # Try to interact with search filter if search_query is provided
+            is_sf_site = _is_successfactors_host(url)
             if search_query:
-                if use_enhanced_features:
+                if is_sf_site:
+                    from app.services.career.successfactors import apply_keyword_search
+                    sf_search_ok = await apply_keyword_search(driver, search_query)
+                    print(f"  SF keyword search: {'ok' if sf_search_ok else 'skipped/failed'}")
+                elif use_enhanced_features:
                     try:
                         search_success = await enhanced_search_functionality(driver, search_query)
                         if not search_success:
-                            # Fallback to old method
                             await try_search_filter(driver, search_query)
                     except Exception as e:
                         print(f"Enhanced search error (trying fallback): {e}")
@@ -3466,373 +3539,387 @@ async def _scrape_with_selenium_impl(
             await asyncio.sleep(1.5)  # Reduced from 3 seconds
             
             print("\nExtracting job listings from page 1...")
-            
-            # Initialize so we never have NameError on exception (Railway-safe)
-            elements = []
-            unique_elements = []
-            job_elements_data = None
-            try:
-                job_elements_data = driver.execute_script("""
-                // ENHANCED: Better handling for Workday and other job boards
-                // Workday-specific: Find parent containers for jobs
-                const workdayJobTitles = document.querySelectorAll('[data-automation-id="jobTitle"]');
-                const workdayJobs = [];
-                if (workdayJobTitles.length > 0) {
-                    // For each job title link, find its parent container (usually li or div)
-                    workdayJobTitles.forEach(titleLink => {
-                        if (titleLink.offsetParent === null) return; // skip hidden
-                        
-                        // Find parent container - go up the DOM tree to find list item or container
-                        let parent = titleLink.parentElement;
-                        let container = null;
-                        let depth = 0;
-                        const maxDepth = 5;
-                        
-                        while (parent && depth < maxDepth) {
-                            const tagName = parent.tagName.toLowerCase();
-                            const className = (parent.className || '').toLowerCase();
-                            
-                            // Look for list items or containers that likely hold a single job
-                            if (tagName === 'li' || 
-                                tagName === 'article' ||
-                                (tagName === 'div' && (className.includes('item') || className.includes('card') || className.includes('job'))) ||
-                                parent.hasAttribute('data-job-id') ||
-                                parent.hasAttribute('data-posting-id')) {
-                                container = parent;
-                                break;
-                            }
-                            
-                            parent = parent.parentElement;
-                            depth++;
-                        }
-                        
-                        // Use container if found, otherwise use the link itself
-                        const jobElement = container || titleLink;
-                        if (jobElement.offsetParent !== null) {
-                            workdayJobs.push(jobElement);
-                        }
-                    });
-                }
-                
-                // If we found Workday jobs, return them (avoid duplicates)
-                if (workdayJobs.length > 0) {
-                    // Deduplicate Workday jobs
-                    const uniqueWorkdayJobs = [];
-                    const seenWorkdayTexts = new Set();
-                    
-                    workdayJobs.forEach(el => {
-                        const text = el.textContent.toLowerCase().substring(0, 100);
-                        const textKey = text.substring(0, 50).trim();
-                        
-                        if (textKey.length >= 10 && !seenWorkdayTexts.has(textKey)) {
-                            seenWorkdayTexts.add(textKey);
-                            uniqueWorkdayJobs.push(el);
-                        }
-                    });
-                    
-                    if (uniqueWorkdayJobs.length > 0) {
-                        return uniqueWorkdayJobs;
-                    }
-                }
-                
-                // Fallback to standard selectors for other job boards
-                const selectors = [
-                    // Specific selectors (high priority)
-                    '[data-automation-id="jobTitle"]',
-                    '[data-ui="job"]', 'li[data-ui="job"]',
-                    '.BambooHR-ATS-Jobs-Item',
-                    '.postings-group', '.posting',
-                    '.jv-job-list-item', '.opening-job',
-                    '.noo_job', '.job-item', '.type-job', 'article.type-job',
-                    '.job-list .job', '.jobs-listing .job', 'li.type-job',
-                    'h3.job-title', '.job-title a', 'a[href*="/job/"]',
-                    '[data-job-id]', '[data-posting-id]',
-                    
-                    // Generic job containers
-                    '[class*="job-card"]', '[class*="jobCard"]',
-                    '[class*="job-item"]', '[class*="job-posting"]',
-                    '[class*="jobPosting"]', '[class*="JobPosting"]',
-                    'article[class*="job"]', 'li[class*="job"]',
-                    'div[class*="job"]',
-                    
-                    // Position/Opening containers
-                    '[class*="position"]', '[class*="opening"]',
-                    
-                    // Links
-                    'a[href*="/job"]', 'a[href*="/req"]',
-                    'a[href*="job"]', 'a[href*="position"]'
-                ];
-                
-                const foundElements = new Set();
-                const headerPatterns = ['current openings', 'all openings', 'job openings', 
-                                       'search', 'filter', 'select location', 'select job type'];
-                const jobIndicators = ['full time', 'part time', 'contract', 'remote', 
-                                      'manager', 'director', 'engineer', 'days ago', 'coordinator'];
-                
-                // Find elements
-                for (const selector of selectors) {
-                    try {
-                        const elements = document.querySelectorAll(selector);
-                        elements.forEach(el => {
-                            if (el.offsetParent !== null) { // visible check
-                                foundElements.add(el);
-                            }
-                        });
-                    } catch (e) {}
-                }
-                
-                // Filter and deduplicate
-                const uniqueElements = [];
-                const seenPositions = new Set();
-                const seenTexts = new Set();
-                
-                foundElements.forEach(el => {
-                    const text = el.textContent.toLowerCase().substring(0, 200);
-                    const textKey = text.substring(0, 50);
-                    
-                    // Skip headers/navigation
-                    const isHeader = headerPatterns.some(p => text.includes(p)) && 
-                                    text.split('\\n').length < 3;
-                    if (isHeader) return;
-                    
-                    // Skip short UI elements
-                    if (text.length < 10) return;
-                    
-                    // Check for job indicators
-                    const hasJobIndicators = jobIndicators.some(ind => text.includes(ind));
-                    if (!hasJobIndicators && text.length < 30) return;
-                    
-                    // Deduplicate by position AND text (more lenient)
-                    const rect = el.getBoundingClientRect();
-                    const posKey = Math.round(rect.x/10) + ',' + Math.round(rect.y/10); // Round to avoid exact match issues
-                    
-                    if (!seenPositions.has(posKey) && !seenTexts.has(textKey)) {
-                        seenPositions.add(posKey);
-                        seenTexts.add(textKey);
-                        uniqueElements.push(el);
-                    }
-                });
-                
-                return uniqueElements;
-            """)
-            except Exception as elem_err:
-                logger.warning("Job elements script failed: %s", elem_err)
-                job_elements_data = None
 
-            elements = job_elements_data if job_elements_data else []
-            if not elements:
-                try:
-                    page_jobs = await extract_jobs_from_current_page(
-                        driver, url, company_name, max_results, set(),
-                        iframe_switched=iframe_switched,
+            sf_jobs_extracted = False
+            if is_sf_site:
+                from app.services.career.successfactors import extract_jobs_from_driver
+                page_url = driver.current_url or url
+                sf_jobs = extract_jobs_from_driver(driver, page_url, company_name)
+                if sf_jobs:
+                    jobs.extend(sf_jobs[:max_results])
+                    sf_jobs_extracted = True
+                    print(
+                        f"  SuccessFactors extractor: {len(sf_jobs)} jobs "
+                        "(skipping generic DOM scrape)"
                     )
-                    if page_jobs:
-                        jobs.extend(page_jobs)
-                        logger.info(
-                            "Recovered %s jobs via extract_jobs_from_current_page fallback",
-                            len(page_jobs),
-                        )
-                except Exception as fallback_err:
-                    logger.warning("Iframe extraction fallback failed: %s", fallback_err)
 
-            print(f"Found {len(elements)} unique job elements (after filtering)")
-            
-            # Debug: Log job titles if we found any Workday jobs
-            if len(elements) > 0:
+            if not sf_jobs_extracted:
+
+                # Initialize so we never have NameError on exception (Railway-safe)
+                elements = []
+                unique_elements = []
+                job_elements_data = None
                 try:
-                    job_titles_found = driver.execute_script("""
-                        return arguments[0].map(el => {
-                            const titleEl = el.querySelector('[data-automation-id="jobTitle"]');
-                            if (titleEl) return titleEl.textContent.trim();
-                            return el.textContent.trim().substring(0, 60);
+                    job_elements_data = driver.execute_script("""
+                    // ENHANCED: Better handling for Workday and other job boards
+                    // Workday-specific: Find parent containers for jobs
+                    const workdayJobTitles = document.querySelectorAll('[data-automation-id="jobTitle"]');
+                    const workdayJobs = [];
+                    if (workdayJobTitles.length > 0) {
+                        // For each job title link, find its parent container (usually li or div)
+                        workdayJobTitles.forEach(titleLink => {
+                            if (titleLink.offsetParent === null) return; // skip hidden
+
+                            // Find parent container - go up the DOM tree to find list item or container
+                            let parent = titleLink.parentElement;
+                            let container = null;
+                            let depth = 0;
+                            const maxDepth = 5;
+
+                            while (parent && depth < maxDepth) {
+                                const tagName = parent.tagName.toLowerCase();
+                                const className = (parent.className || '').toLowerCase();
+
+                                // Look for list items or containers that likely hold a single job
+                                if (tagName === 'li' || 
+                                    tagName === 'article' ||
+                                    (tagName === 'div' && (className.includes('item') || className.includes('card') || className.includes('job'))) ||
+                                    parent.hasAttribute('data-job-id') ||
+                                    parent.hasAttribute('data-posting-id')) {
+                                    container = parent;
+                                    break;
+                                }
+
+                                parent = parent.parentElement;
+                                depth++;
+                            }
+
+                            // Use container if found, otherwise use the link itself
+                            const jobElement = container || titleLink;
+                            if (jobElement.offsetParent !== null) {
+                                workdayJobs.push(jobElement);
+                            }
                         });
-                    """, elements)
-                    if job_titles_found:
-                        print(f"  Job titles found: {job_titles_found}")
-                except Exception:
-                    pass
-            
-            unique_elements = elements  # Already filtered by JavaScript
-            
-            # Fallback: If no elements found with standard selectors, try text-based search - OPTIMIZED
-            if len(unique_elements) == 0:
-                print("\n⚠️  No elements found with standard selectors. Trying text-based fallback...")
-                try:
-                    # Use JavaScript to find elements with job title patterns (much faster)
-                    fallback_elements = driver.execute_script("""
-                        const patterns = ['Director', 'Manager', 'Engineer', 'Developer', 'Analyst',
-                                        'Specialist', 'Coordinator', 'Assistant', 'Associate'];
-                        const found = new Set();
-                        
-                        // Search through all visible elements
-                        const allElements = document.querySelectorAll('*');
-                        for (const el of allElements) {
-                            if (el.offsetParent === null) continue; // skip hidden
-                            
-                            const text = el.textContent;
-                            if (text.length < 10 || text.length > 200) continue;
-                            
-                            // Check if contains job title pattern
-                            const hasPattern = patterns.some(p => text.includes(p));
-                            if (hasPattern) {
-                                // Avoid nested duplicates - prefer leaf nodes
-                                const isLeaf = el.children.length === 0 || 
-                                             [...el.children].every(child => child.offsetParent === null);
-                                if (isLeaf) {
-                                    found.add(el);
-                                    if (found.size >= 50) break; // Limit results
+                    }
+
+                    // If we found Workday jobs, return them (avoid duplicates)
+                    if (workdayJobs.length > 0) {
+                        // Deduplicate Workday jobs
+                        const uniqueWorkdayJobs = [];
+                        const seenWorkdayTexts = new Set();
+
+                        workdayJobs.forEach(el => {
+                            const text = el.textContent.toLowerCase().substring(0, 100);
+                            const textKey = text.substring(0, 50).trim();
+
+                            if (textKey.length >= 10 && !seenWorkdayTexts.has(textKey)) {
+                                seenWorkdayTexts.add(textKey);
+                                uniqueWorkdayJobs.push(el);
+                            }
+                        });
+
+                        if (uniqueWorkdayJobs.length > 0) {
+                            return uniqueWorkdayJobs;
+                        }
+                    }
+
+                    // Fallback to standard selectors for other job boards
+                    const selectors = [
+                        // Specific selectors (high priority)
+                        '[data-automation-id="jobTitle"]',
+                        '[data-ui="job"]', 'li[data-ui="job"]',
+                        '.BambooHR-ATS-Jobs-Item',
+                        '.postings-group', '.posting',
+                        '.jv-job-list-item', '.opening-job',
+                        '.noo_job', '.job-item', '.type-job', 'article.type-job',
+                        '.job-list .job', '.jobs-listing .job', 'li.type-job',
+                        'h3.job-title', '.job-title a', 'a[href*="/job/"]',
+                        '[data-job-id]', '[data-posting-id]',
+
+                        // Generic job containers
+                        '[class*="job-card"]', '[class*="jobCard"]',
+                        '[class*="job-item"]', '[class*="job-posting"]',
+                        '[class*="jobPosting"]', '[class*="JobPosting"]',
+                        'article[class*="job"]', 'li[class*="job"]',
+                        'div[class*="job"]',
+
+                        // Position/Opening containers
+                        '[class*="position"]', '[class*="opening"]',
+
+                        // Links
+                        'a[href*="/job"]', 'a[href*="/req"]',
+                        'a[href*="job"]', 'a[href*="position"]'
+                    ];
+
+                    const foundElements = new Set();
+                    const headerPatterns = ['current openings', 'all openings', 'job openings', 
+                                           'search', 'filter', 'select location', 'select job type'];
+                    const jobIndicators = ['full time', 'part time', 'contract', 'remote', 
+                                          'manager', 'director', 'engineer', 'days ago', 'coordinator'];
+
+                    // Find elements
+                    for (const selector of selectors) {
+                        try {
+                            const elements = document.querySelectorAll(selector);
+                            elements.forEach(el => {
+                                if (el.offsetParent !== null) { // visible check
+                                    foundElements.add(el);
+                                }
+                            });
+                        } catch (e) {}
+                    }
+
+                    // Filter and deduplicate
+                    const uniqueElements = [];
+                    const seenPositions = new Set();
+                    const seenTexts = new Set();
+
+                    foundElements.forEach(el => {
+                        const text = el.textContent.toLowerCase().substring(0, 200);
+                        const textKey = text.substring(0, 50);
+
+                        // Skip headers/navigation
+                        const isHeader = headerPatterns.some(p => text.includes(p)) && 
+                                        text.split('\\n').length < 3;
+                        if (isHeader) return;
+
+                        // Skip short UI elements
+                        if (text.length < 10) return;
+
+                        // Check for job indicators
+                        const hasJobIndicators = jobIndicators.some(ind => text.includes(ind));
+                        if (!hasJobIndicators && text.length < 30) return;
+
+                        // Deduplicate by position AND text (more lenient)
+                        const rect = el.getBoundingClientRect();
+                        const posKey = Math.round(rect.x/10) + ',' + Math.round(rect.y/10); // Round to avoid exact match issues
+
+                        if (!seenPositions.has(posKey) && !seenTexts.has(textKey)) {
+                            seenPositions.add(posKey);
+                            seenTexts.add(textKey);
+                            uniqueElements.push(el);
+                        }
+                    });
+
+                    return uniqueElements;
+                """)
+                except Exception as elem_err:
+                    logger.warning("Job elements script failed: %s", elem_err)
+                    job_elements_data = None
+
+                elements = job_elements_data if job_elements_data else []
+                if not elements:
+                    try:
+                        page_jobs = await extract_jobs_from_current_page(
+                            driver, url, company_name, max_results, set(),
+                            iframe_switched=iframe_switched,
+                        )
+                        if page_jobs:
+                            jobs.extend(page_jobs)
+                            logger.info(
+                                "Recovered %s jobs via extract_jobs_from_current_page fallback",
+                                len(page_jobs),
+                            )
+                    except Exception as fallback_err:
+                        logger.warning("Iframe extraction fallback failed: %s", fallback_err)
+
+                print(f"Found {len(elements)} unique job elements (after filtering)")
+
+                # Debug: Log job titles if we found any Workday jobs
+                if len(elements) > 0:
+                    try:
+                        job_titles_found = driver.execute_script("""
+                            return arguments[0].map(el => {
+                                const titleEl = el.querySelector('[data-automation-id="jobTitle"]');
+                                if (titleEl) return titleEl.textContent.trim();
+                                return el.textContent.trim().substring(0, 60);
+                            });
+                        """, elements)
+                        if job_titles_found:
+                            print(f"  Job titles found: {job_titles_found}")
+                    except Exception:
+                        pass
+
+                unique_elements = elements  # Already filtered by JavaScript
+
+                # Fallback: If no elements found with standard selectors, try text-based search - OPTIMIZED
+                if len(unique_elements) == 0:
+                    print("\n⚠️  No elements found with standard selectors. Trying text-based fallback...")
+                    try:
+                        # Use JavaScript to find elements with job title patterns (much faster)
+                        fallback_elements = driver.execute_script("""
+                            const patterns = ['Director', 'Manager', 'Engineer', 'Developer', 'Analyst',
+                                            'Specialist', 'Coordinator', 'Assistant', 'Associate'];
+                            const found = new Set();
+
+                            // Search through all visible elements
+                            const allElements = document.querySelectorAll('*');
+                            for (const el of allElements) {
+                                if (el.offsetParent === null) continue; // skip hidden
+
+                                const text = el.textContent;
+                                if (text.length < 10 || text.length > 200) continue;
+
+                                // Check if contains job title pattern
+                                const hasPattern = patterns.some(p => text.includes(p));
+                                if (hasPattern) {
+                                    // Avoid nested duplicates - prefer leaf nodes
+                                    const isLeaf = el.children.length === 0 || 
+                                                 [...el.children].every(child => child.offsetParent === null);
+                                    if (isLeaf) {
+                                        found.add(el);
+                                        if (found.size >= 50) break; // Limit results
+                                    }
                                 }
                             }
-                        }
-                        
-                        return Array.from(found);
-                    """)
-                    
-                    if fallback_elements:
-                        print(f"  Found {len(fallback_elements)} potential job titles via text search")
-                        unique_elements = fallback_elements[:max_results * 2]  # Limit to avoid too many
-                except Exception as e:
-                    print(f"  Fallback text search failed: {e}")
-            
-            # If still no elements found, save page source for debugging
-            if len(unique_elements) == 0:
-                print("\n⚠️  No job elements found. Saving page source for debugging...")
-                page_source = safe_get_page_source(driver)
-                if not page_source:
-                    print("  ⚠️  Could not retrieve page source (timeout/error)")
-                    page_source = "<html><body>Failed to retrieve page source</body></html>"
-                debug_file = "/tmp/career_page_debug.html"
-                try:
-                    with open(debug_file, "w", encoding="utf-8") as f:
-                        f.write(page_source)
-                    print(f"Page source saved to: {debug_file}")
-                    
-                    # Try to extract any visible text to see what's on the page
-                    soup = BeautifulSoup(page_source, 'html.parser')
-                    
-                    # Remove scripts and styles
-                    for script in soup(["script", "style"]):
-                        script.decompose()
-                    
-                    visible_text = soup.get_text(separator=' ', strip=True)
-                    
-                    # Check if this is a marketing/landing page vs job listings page
-                    landing_page_indicators = [
-                        'work at', 'life at', 'join our team', 'why work', 
-                        'explore careers', 'learn about', 'our culture',
-                        'meet the team', 'see our teams', 'our values'
-                    ]
-                    is_landing_page = any(indicator in visible_text.lower()[:1000] for indicator in landing_page_indicators)
-                    
-                    if is_landing_page:
-                        print(f"  ⚠️  This appears to be a LANDING/MARKETING page, not a job listings page")
-                        print(f"  💡 Try looking for a 'Search Jobs' or 'View All Jobs' link to get actual listings")
-                        
-                        # Look for job search links
-                        search_links = soup.find_all('a', href=True)
-                        potential_job_urls = []
-                        for link in search_links[:50]:
-                            href = link.get('href', '').lower()
-                            link_text = link.get_text(strip=True).lower()
-                            if any(kw in href or kw in link_text for kw in ['search', 'listings', 'openings', 'browse', 'all jobs']):
-                                full_url = urljoin(url, link.get('href'))
-                                potential_job_urls.append(full_url)
-                        
-                        if potential_job_urls:
-                            print(f"  💡 Found {len(potential_job_urls)} potential job listing pages:")
-                            for purl in potential_job_urls[:3]:
-                                print(f"     • {purl}")
-                    
-                    # Check if there's job-related content at all
-                    job_keywords = ['job', 'position', 'career', 'opening', 'vacancy', 'role', 'hiring']
-                    found_keywords = [kw for kw in job_keywords if kw in visible_text.lower()]
-                    
-                    if found_keywords:
-                        print(f"  Page contains job-related keywords: {', '.join(found_keywords)}")
-                        print(f"  Visible text sample (first 500 chars): {visible_text[:500]}")
-                    else:
-                        print("  Page doesn't seem to contain job listings")
-                        
-                except Exception as e:
-                    print(f"  Could not save debug file: {e}")
-            
-            # Extract jobs - prioritize elements with links to job detail pages - OPTIMIZED
-            seen_titles = set()
-            
-            # Use JavaScript to check which elements have links (much faster)
-            elements_link_status = driver.execute_script("""
-                return arguments[0].map(el => ({
-                    element: el,
-                    hasLink: el.tagName === 'A' || el.querySelector('a') !== null
-                }));
-            """, unique_elements)
-            elements_link_status = elements_link_status or []
-            
-            elements_with_links = [item['element'] for item in elements_link_status if item['hasLink']]
-            elements_without_links = [item['element'] for item in elements_link_status if not item['hasLink']]
-            
-            print(f"  Elements with links: {len(elements_with_links)}, without links: {len(elements_without_links)}")
-            
-            # Process elements with links first (more likely to be real jobs)
-            print(f"\n  Attempting to extract jobs from {len(elements_with_links + elements_without_links)} elements...")
-            extraction_failures = 0
-            
-            # Pre-fetch all element data in one batch (MAJOR OPTIMIZATION)
-            all_elements = elements_with_links + elements_without_links
-            print(f"  Pre-fetching element data...")
-            
-            element_data_batch = driver.execute_script("""
-                return arguments[0].map(el => {
-                    const links = [...el.querySelectorAll('a[href]')];
-                    return {
-                        outerHTML: el.outerHTML,
-                        text: (el.textContent || '').trim(),
-                        textPreview: (el.textContent || '').trim().substring(0, 100),
-                        links: links.map(a => a.href)
-                    };
-                });
-            """, all_elements)
-            element_data_batch = element_data_batch or []
-            
-            print(f"  Extracting job data from elements...")
-            
-            for i, element in enumerate(all_elements):
-                if len(jobs) >= max_results:
-                    break
-                
-                try:
-                    # Get element data (already fetched)
-                    element_data = element_data_batch[i] if i < len(element_data_batch) else {}
-                    element_text = element_data.get('textPreview', 'No text')
-                    
-                    job = extract_job_from_element_optimized(element, element_data, url, company_name)
-                    if job:
-                        if job.title in seen_titles:
-                            continue
-                        # Comprehensive validation using is_valid_job_entry
-                        validation_result = is_valid_job_entry(job, debug=True)
-                        if not validation_result:
-                            print(f"  ✗ Skipped (invalid entry): {job.title}")
-                            if job.url:
-                                print(f"     URL: {job.url[:80] if len(job.url) > 80 else job.url}")
-                            continue
-                        # All checks passed
-                        seen_titles.add(job.title)
-                        jobs.append(job)
-                        print(f"  ✓ Extracted: {job.title}")
-                    else:
+
+                            return Array.from(found);
+                        """)
+
+                        if fallback_elements:
+                            print(f"  Found {len(fallback_elements)} potential job titles via text search")
+                            unique_elements = fallback_elements[:max_results * 2]  # Limit to avoid too many
+                    except Exception as e:
+                        print(f"  Fallback text search failed: {e}")
+
+                # If still no elements found, save page source for debugging
+                if len(unique_elements) == 0:
+                    print("\n⚠️  No job elements found. Saving page source for debugging...")
+                    page_source = safe_get_page_source(driver)
+                    if not page_source:
+                        print("  ⚠️  Could not retrieve page source (timeout/error)")
+                        page_source = "<html><body>Failed to retrieve page source</body></html>"
+                    debug_file = "/tmp/career_page_debug.html"
+                    try:
+                        with open(debug_file, "w", encoding="utf-8") as f:
+                            f.write(page_source)
+                        print(f"Page source saved to: {debug_file}")
+
+                        # Try to extract any visible text to see what's on the page
+                        soup = BeautifulSoup(page_source, 'html.parser')
+
+                        # Remove scripts and styles
+                        for script in soup(["script", "style"]):
+                            script.decompose()
+
+                        visible_text = soup.get_text(separator=' ', strip=True)
+
+                        # Check if this is a marketing/landing page vs job listings page
+                        landing_page_indicators = [
+                            'work at', 'life at', 'join our team', 'why work', 
+                            'explore careers', 'learn about', 'our culture',
+                            'meet the team', 'see our teams', 'our values'
+                        ]
+                        is_landing_page = any(indicator in visible_text.lower()[:1000] for indicator in landing_page_indicators)
+
+                        if is_landing_page:
+                            print(f"  ⚠️  This appears to be a LANDING/MARKETING page, not a job listings page")
+                            print(f"  💡 Try looking for a 'Search Jobs' or 'View All Jobs' link to get actual listings")
+
+                            # Look for job search links
+                            search_links = soup.find_all('a', href=True)
+                            potential_job_urls = []
+                            for link in search_links[:50]:
+                                href = link.get('href', '').lower()
+                                link_text = link.get_text(strip=True).lower()
+                                if any(kw in href or kw in link_text for kw in ['search', 'listings', 'openings', 'browse', 'all jobs']):
+                                    full_url = urljoin(url, link.get('href'))
+                                    potential_job_urls.append(full_url)
+
+                            if potential_job_urls:
+                                print(f"  💡 Found {len(potential_job_urls)} potential job listing pages:")
+                                for purl in potential_job_urls[:3]:
+                                    print(f"     • {purl}")
+
+                        # Check if there's job-related content at all
+                        job_keywords = ['job', 'position', 'career', 'opening', 'vacancy', 'role', 'hiring']
+                        found_keywords = [kw for kw in job_keywords if kw in visible_text.lower()]
+
+                        if found_keywords:
+                            print(f"  Page contains job-related keywords: {', '.join(found_keywords)}")
+                            print(f"  Visible text sample (first 500 chars): {visible_text[:500]}")
+                        else:
+                            print("  Page doesn't seem to contain job listings")
+
+                    except Exception as e:
+                        print(f"  Could not save debug file: {e}")
+
+                # Extract jobs - prioritize elements with links to job detail pages - OPTIMIZED
+                seen_titles = set()
+
+                # Use JavaScript to check which elements have links (much faster)
+                elements_link_status = driver.execute_script("""
+                    return arguments[0].map(el => ({
+                        element: el,
+                        hasLink: el.tagName === 'A' || el.querySelector('a') !== null
+                    }));
+                """, unique_elements)
+                elements_link_status = elements_link_status or []
+
+                elements_with_links = [item['element'] for item in elements_link_status if item['hasLink']]
+                elements_without_links = [item['element'] for item in elements_link_status if not item['hasLink']]
+
+                print(f"  Elements with links: {len(elements_with_links)}, without links: {len(elements_without_links)}")
+
+                # Process elements with links first (more likely to be real jobs)
+                print(f"\n  Attempting to extract jobs from {len(elements_with_links + elements_without_links)} elements...")
+                extraction_failures = 0
+
+                # Pre-fetch all element data in one batch (MAJOR OPTIMIZATION)
+                all_elements = elements_with_links + elements_without_links
+                print(f"  Pre-fetching element data...")
+
+                element_data_batch = driver.execute_script("""
+                    return arguments[0].map(el => {
+                        const links = [...el.querySelectorAll('a[href]')];
+                        return {
+                            outerHTML: el.outerHTML,
+                            text: (el.textContent || '').trim(),
+                            textPreview: (el.textContent || '').trim().substring(0, 100),
+                            links: links.map(a => a.href)
+                        };
+                    });
+                """, all_elements)
+                element_data_batch = element_data_batch or []
+
+                print(f"  Extracting job data from elements...")
+
+                for i, element in enumerate(all_elements):
+                    if len(jobs) >= max_results:
+                        break
+
+                    try:
+                        # Get element data (already fetched)
+                        element_data = element_data_batch[i] if i < len(element_data_batch) else {}
+                        element_text = element_data.get('textPreview', 'No text')
+
+                        job = extract_job_from_element_optimized(element, element_data, url, company_name)
+                        if job:
+                            if job.title in seen_titles:
+                                continue
+                            # Comprehensive validation using is_valid_job_entry
+                            validation_result = is_valid_job_entry(job, debug=True)
+                            if not validation_result:
+                                print(f"  ✗ Skipped (invalid entry): {job.title}")
+                                if job.url:
+                                    print(f"     URL: {job.url[:80] if len(job.url) > 80 else job.url}")
+                                continue
+                            # All checks passed
+                            seen_titles.add(job.title)
+                            jobs.append(job)
+                            print(f"  ✓ Extracted: {job.title}")
+                        else:
+                            extraction_failures += 1
+                            if extraction_failures <= 3:  # Only show first 3 failures
+                                print(f"  ⚠️  Failed to extract job from element {i+1}: '{element_text}'")
+                    except Exception as e:
                         extraction_failures += 1
-                        if extraction_failures <= 3:  # Only show first 3 failures
-                            print(f"  ⚠️  Failed to extract job from element {i+1}: '{element_text}'")
-                except Exception as e:
-                    extraction_failures += 1
-                    if extraction_failures <= 3:
-                        print(f"  ⚠️  Error extracting from element {i+1}: {e}")
-                    continue
-            
-            if extraction_failures > 0:
-                print(f"  ⚠️  Failed to extract jobs from {extraction_failures} elements")
-            
+                        if extraction_failures <= 3:
+                            print(f"  ⚠️  Error extracting from element {i+1}: {e}")
+                        continue
+
+                if extraction_failures > 0:
+                    print(f"  ⚠️  Failed to extract jobs from {extraction_failures} elements")
             # Switch back to default content if we were in an iframe
             # (Pagination is usually in the main document, not in iframes)
             if iframe_switched:
@@ -3974,7 +4061,11 @@ async def _scrape_with_selenium_impl(
             print(f"\nApplying comprehensive validation filters...")
             jobs = filter_invalid_jobs(jobs)
             print(f"Jobs after filtering: {len(jobs)}")
-        
+
+        if active_proxy_url:
+            from app.core.proxy_config import mark_proxy_success
+            mark_proxy_success(active_proxy_url)
+
     except TimeoutException as e:
         print(f"Timeout error in Selenium scraping: {e}")
         print("The page took too long to load or respond")
@@ -3997,7 +4088,11 @@ async def _scrape_with_selenium_impl(
         ]
         
         is_pool_error = any(keyword in error_msg.lower() for keyword in pool_error_keywords)
-        
+
+        if active_proxy_url:
+            from app.core.proxy_config import mark_proxy_failure
+            mark_proxy_failure(active_proxy_url)
+
         if is_pool_error:
             print("🚨 CRITICAL: CONNECTION POOL/RESOURCE EXHAUSTION ERROR DETECTED!")
             print("   This error can cause Railway deployment to crash.")
@@ -4170,6 +4265,34 @@ def matches_job_title(scraped_title: str, customer_query: str) -> bool:
     return False
 
 
+def normalize_title_for_matching(title: str, job_url: Optional[str] = None) -> str:
+    """Normalize job title before title-query matching (SF suffix stripping)."""
+    if not title:
+        return ""
+    if job_url and _is_successfactors_host(job_url):
+        from app.services.career.successfactors import normalize_sf_title
+        return normalize_sf_title(title)
+    return title.strip()
+
+
+def filter_jobs_by_queries(jobs: List[Job], queries: List[str]) -> List[Job]:
+    """Keep jobs matching any search query (OR logic)."""
+    if not queries:
+        return jobs
+    filtered: List[Job] = []
+    for job in jobs:
+        title_for_match = normalize_title_for_matching(job.title or "", job.url)
+        for query in queries:
+            if matches_job_title(title_for_match, query):
+                filtered.append(job)
+                break
+    logger.info(
+        "Matched %s/%s jobs against %s search title(s)",
+        len(filtered), len(jobs), len(queries),
+    )
+    return filtered
+
+
 async def scrape_generic_career_page(
     url: str,
     max_results: Optional[int] = None,
@@ -4228,6 +4351,11 @@ async def scrape_generic_career_page(
         print(f"Starting scrape for: {company_name}")
         print(f"URL: {url}")
         print(f"Search query: {search_query if search_query else 'None (will return all jobs)'}")
+        from app.core.proxy_config import proxies_enabled
+        if proxies_enabled():
+            print("Proxy: enabled (PROXY_URLS / PROXY_URL) — browser and HTTP requests")
+        else:
+            print("Proxy: disabled — direct connection")
         print(f"{'='*80}\n")
 
         # Detect job board
@@ -4235,138 +4363,65 @@ async def scrape_generic_career_page(
         if job_board:
             print(f"Detected job board: {job_board['name']}")
 
-        # API-first for known ATS platforms
-        if not search_query:
-            if progress_callback:
-                progress_callback(stage="ats_api")
-            api_jobs = await try_scrape_via_ats_api(
-                url, company_name, company_url=resolved_org.company_url,
-            )
-            if api_jobs:
-                api_jobs = filter_invalid_jobs(api_jobs)
-                final = normalize_and_dedupe_jobs(api_jobs[:max_results], resolved_org)
-                if progress_callback:
-                    progress_callback(jobs_found=len(final), stage="completed")
-                print(f"ATS API returned {len(final)} jobs (skipping Selenium)")
-                return final
-        
-        # Parse multiple job titles if comma-separated
-        job_titles = []
+        # Parse comma-separated search titles
+        job_titles: List[str] = []
         if search_query:
-            job_titles = [title.strip() for title in search_query.split(',') if title.strip()]
+            job_titles = [t.strip() for t in search_query.split(",") if t.strip()]
             print(f"\n📋 Parsed {len(job_titles)} job title(s) from search query:")
             for idx, title in enumerate(job_titles, 1):
                 print(f"  {idx}. '{title}'")
-        
-        # BEST PRACTICE: Search each title separately and combine results
-        # This is more reliable than searching all at once (comma-separated queries may not work on all sites)
-        all_jobs = []
-        seen_job_keys = set()  # For deduplication: (title_lower, company_lower)
-        
-        if job_titles and len(job_titles) > 1:
-            print(f"\n🔍 Searching each title separately (best practice for multiple titles)...")
-            
-            for idx, title in enumerate(job_titles, 1):
-                print(f"\n{'='*60}")
-                print(f"Search {idx}/{len(job_titles)}: '{title}'")
-                print(f"{'='*60}")
-                
-                # Search for this specific title
-                title_jobs = await scrape_with_selenium(
-                    url=url,
-                    company_name=company_name,
-                    max_results=max_results * 2,  # Get extra per search
-                    search_query=title,  # Single title, not comma-separated
-                    use_undetected=use_undetected
+
+        # API-first for known ATS platforms (including when search_query is set)
+        if progress_callback:
+            progress_callback(stage="ats_api")
+        api_jobs = await try_scrape_via_ats_api(
+            url, company_name, company_url=resolved_org.company_url,
+        )
+        if api_jobs:
+            api_jobs = filter_invalid_jobs(api_jobs)
+            if job_titles:
+                api_jobs = filter_jobs_by_queries(api_jobs, job_titles)
+            final = normalize_and_dedupe_jobs(api_jobs[:max_results], resolved_org)
+            if progress_callback:
+                progress_callback(jobs_found=len(final), stage="completed")
+            print(f"ATS API returned {len(final)} jobs (skipping Selenium)")
+            return final
+
+        # One browser scrape; keyword search only for a single title
+        browser_search = job_titles[0] if len(job_titles) == 1 else None
+        if job_titles:
+            if len(job_titles) == 1:
+                print(f"\n🔍 One scrape with browser search: '{browser_search}'")
+            else:
+                print(
+                    f"\n🔍 One scrape for {len(job_titles)} titles "
+                    "(no per-title browser loop; OR filter after extract)"
                 )
-                
-                print(f"  Found {len(title_jobs)} jobs for '{title}'")
-                
-                # Add unique jobs to combined list (but don't filter yet - will filter after all searches)
-                for job in title_jobs:
-                    # Create deduplication key
-                    job_key = (
-                        (job.title or '').lower().strip(),
-                        (job.company or company_name or '').lower().strip()
-                    )
-                    
-                    if job_key not in seen_job_keys:
-                        seen_job_keys.add(job_key)
-                        all_jobs.append(job)
-                        print(f"    ✓ Added: {job.title}")
-                    else:
-                        print(f"    ⊘ Duplicate skipped: {job.title}")
-                
-                # CRITICAL: Explicit cleanup after each search query to prevent resource accumulation
-                # scrape_with_selenium should already cleanup in its finally block, but this ensures
-                # any remaining processes are killed before the next search
-                if idx < len(job_titles):
-                    print(f"  🧹 Cleaning up resources after search {idx}/{len(job_titles)}...")
-                    killed = hard_kill_all_browsers()
-                    if killed > 0:
-                        print(f"     ✓ Hard-killed {killed} browser process(es)")
-                    await asyncio.sleep(1.0)  # Allow system to release resources
-                    
-                    # Small delay between searches to avoid rate limiting
-                    print(f"  Waiting 1 second before next search...")
-                    await asyncio.sleep(1)
-            
-            # CRITICAL: Filter combined results to ensure they match at least one search query
-            # This prevents irrelevant results from being included
-            print(f"\n🔍 Filtering combined results to ensure relevance...")
-            print(f"   Checking {len(all_jobs)} jobs against {len(job_titles)} search term(s)...")
-            
-            filtered_jobs = []
-            for job in all_jobs:
-                job_matched = False
-                matched_query = None
-                
-                # Check if job matches any of the search queries
-                for query_title in job_titles:
-                    if matches_job_title(job.title or '', query_title):
-                        job_matched = True
-                        matched_query = query_title
-                        break
-                
-                if job_matched:
-                    filtered_jobs.append(job)
-                    print(f"  ✓ Matched '{matched_query}': {job.title}")
-                else:
-                    print(f"  ✗ Filtered out (doesn't match any search term): {job.title}")
-            
-            jobs = filtered_jobs
-            print(f"\n✅ Final results: {len(jobs)} jobs matching search criteria (filtered from {len(all_jobs)} total)")
-            
-        elif job_titles and len(job_titles) == 1:
-            # Single title - search normally
-            print(f"\n🔍 Searching for single title: '{job_titles[0]}'")
-            jobs = await scrape_with_selenium(
-                url=url,
-                company_name=company_name,
-                max_results=max_results * 2,
-                search_query=job_titles[0],
-                use_undetected=use_undetected
-            )
         else:
-            # No search query - get all jobs
             print(f"\n📋 No search query - scraping all available jobs")
-            jobs = await scrape_with_selenium(
-                url=url,
-                company_name=company_name,
-                max_results=max_results,
-                search_query=None,
-                use_undetected=use_undetected
-            )
-        
-        # Note: No need for post-filtering since we already searched each title separately
-        if not search_query and jobs:
-            print(f"\n✓ Returning all {len(jobs)} jobs found (no search filter)")
-        
-        # Apply final validation filter to catch any remaining invalid entries
+
+        scrape_cap = max(max_results * 3, max_results) if job_titles else max_results
+        jobs = await scrape_with_selenium(
+            url=url,
+            company_name=company_name,
+            max_results=scrape_cap,
+            search_query=browser_search,
+            use_undetected=use_undetected,
+        )
+
         if jobs:
-            print(f"\nApplying final validation filter...")
+            print(f"\nApplying validation filter on {len(jobs)} jobs...")
             jobs = filter_invalid_jobs(jobs)
-            print(f"Jobs after final filtering: {len(jobs)}")
+            print(f"Jobs after validation: {len(jobs)}")
+            if job_titles:
+                before = len(jobs)
+                jobs = filter_jobs_by_queries(jobs, job_titles)
+                print(
+                    f"Title filter: {len(jobs)} jobs match "
+                    f"{len(job_titles)} search title(s) (from {before})"
+                )
+        elif not search_query:
+            print(f"\n✓ No jobs found")
         
         # Ensure we always return a list (defensive for Railway/API)
         jobs = jobs if jobs is not None else []
@@ -4630,39 +4685,6 @@ async def scrape_with_retry_strategies(
         print(f"\nNo search query provided - returning all {len(jobs)} jobs found")
     
     return jobs[:max_results]
-
-
-# ============================================================================
-# PROXY SUPPORT (Optional)
-# ============================================================================
-
-class ProxyRotator:
-    """Simple proxy rotator - add your proxy list here"""
-    
-    def __init__(self, proxy_list: Optional[List[str]] = None):
-        self.proxies = proxy_list or []
-        self.current_index = 0
-    
-    def get_next_proxy(self) -> Optional[Dict[str, str]]:
-        """Get next proxy in rotation"""
-        if not self.proxies:
-            return None
-        
-        proxy = self.proxies[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.proxies)
-        
-        return {
-            'http': proxy,
-            'https': proxy
-        }
-    
-    def add_to_chrome_options(self, options: Options) -> Options:
-        """Add proxy to Chrome options"""
-        proxy = self.get_next_proxy()
-        if proxy:
-            proxy_str = proxy['http'].replace('http://', '')
-            options.add_argument(f'--proxy-server={proxy_str}')
-        return options
 
 
 # ============================================================================

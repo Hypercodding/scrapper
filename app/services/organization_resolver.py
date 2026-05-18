@@ -11,7 +11,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Any, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import tldextract
 from bs4 import BeautifulSoup
@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 # Generic terms that must never be used as company names
 COMPANY_NAME_BLOCKLIST = frozenset({
     "careers", "jobs", "job", "apply", "hiring", "vacancies", "vacancy",
-    "opportunities", "opportunity", "boards", "board", "jobsite", "workday",
+    "opportunities", "opportunity", "career opportunities", "boards", "board",
+    "jobsite", "workday",
     "join", "team", "talent", "recruiting", "recruitment", "employment",
     "openings", "opening", "positions", "position", "work", "home",
     "about", "company", "corporate", "portal", "site", "www",
@@ -130,6 +131,27 @@ def is_blocklisted(name: str) -> bool:
     if len(words) == 1 and words[0] in COMPANY_NAME_BLOCKLIST:
         return True
     return False
+
+
+def extract_sf_company_from_url(url: str) -> Optional[OrganizationCandidate]:
+    """Resolve company from SAP SuccessFactors ?company= query parameter."""
+    host = (urlparse(url).netloc or "").lower()
+    if "sapsf." not in host and "successfactors" not in host:
+        return None
+    qs = parse_qs(urlparse(url).query)
+    company_vals = qs.get("company") or qs.get("career_company")
+    if not company_vals or not company_vals[0]:
+        return None
+    slug = company_vals[0].strip()
+    name = _slug_to_name(slug)
+    if name and not is_blocklisted(name):
+        return OrganizationCandidate(
+            name=name,
+            confidence=0.88,
+            source="sf_company_param",
+            company_url=None,
+        )
+    return None
 
 
 def extract_ats_slug_from_url(url: str) -> Optional[OrganizationCandidate]:
@@ -296,6 +318,10 @@ def collect_candidates(url: str, page_html: str, soup: Optional[BeautifulSoup] =
         soup = BeautifulSoup(page_html or "", "lxml")
 
     candidates: List[OrganizationCandidate] = []
+
+    sf_company = extract_sf_company_from_url(url)
+    if sf_company:
+        candidates.append(sf_company)
 
     ats = extract_ats_slug_from_url(url)
     if ats:

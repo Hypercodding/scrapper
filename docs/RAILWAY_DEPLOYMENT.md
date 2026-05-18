@@ -273,8 +273,13 @@ On the **worker** service → **Variables**, use the **same** `REDIS_URL` as the
 | `JOB_RESULT_TTL_SECONDS` | `86400` | Optional |
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Optional |
 | `CIRCUIT_BREAKER_WINDOW_SECONDS` | `600` | Optional |
+| `PROXY_URLS` | Comma-separated proxy URLs | Optional — leave empty for direct connection |
+| `PROXY_URL` | Single proxy (legacy) | Optional — use `PROXY_URLS` for rotation |
+| `PROXY_ROTATION_INTERVAL` | `240` | Optional — seconds between proxy rotations |
 
 `SERVICE_ROLE` is set automatically by `start-worker.sh` to `worker`.
+
+**Proxy (optional):** Set `PROXY_URLS` on the **worker** service only when sites block Railway IPs. When unset, career scrapes use a direct connection (recommended to try first). ATS API scrapes also use the proxy for HTTP when configured. Do not set proxy on the API service unless you use Indeed/SimplyHired endpoints there.
 
 ### 8.6 Networking
 
@@ -325,6 +330,9 @@ CHROME_BIN=/usr/bin/google-chrome
 CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
 MAX_WORKER_MEMORY_MB=3500
 JOB_RESULT_TTL_SECONDS=86400
+# Optional — only if career sites block Railway IPs:
+# PROXY_URLS=http://user:pass@proxy1:port,http://user:pass@proxy2:port
+# PROXY_ROTATION_INTERVAL=240
 ```
 
 Copy from `.env.example` in the repo for local development; production values live only in Railway.

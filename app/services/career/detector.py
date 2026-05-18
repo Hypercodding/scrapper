@@ -33,6 +33,9 @@ JOB_BOARD_PATTERNS: Dict[str, Dict[str, Any]] = {
         "domains": ["apply.workable.com"],
         "api_url_template": "https://apply.workable.com/api/v1/widget/accounts/{slug}/jobs",
     },
+    "successfactors": {
+        "domains": ["sapsf.", "successfactors.com", "successfactors.eu"],
+    },
 }
 
 

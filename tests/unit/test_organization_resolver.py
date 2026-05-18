@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from app.services.organization_resolver import (
     COMPANY_NAME_BLOCKLIST,
     extract_ats_slug_from_url,
+    extract_sf_company_from_url,
     is_blocklisted,
     resolve_organization,
 )
@@ -51,6 +52,13 @@ class TestAtsSlug:
         org = resolve_organization("https://jobs.lever.co/anthropic", _load("lever_anthropic.html"))
         assert org.name == "Anthropic"
         assert org.name.lower() != "jobs"
+
+    def test_sf_company_param(self):
+        cand = extract_sf_company_from_url(
+            "https://career55.sapsf.eu/career?company=systemvent"
+        )
+        assert cand is not None
+        assert cand.name == "Systemvent"
 
 
 @pytest.mark.unit
