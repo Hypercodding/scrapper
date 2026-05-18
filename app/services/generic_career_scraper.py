@@ -4378,14 +4378,25 @@ async def scrape_generic_career_page(
             url, company_name, company_url=resolved_org.company_url,
         )
         if api_jobs:
-            api_jobs = filter_invalid_jobs(api_jobs)
+            api_validated = filter_invalid_jobs(api_jobs)
             if job_titles:
-                api_jobs = filter_jobs_by_queries(api_jobs, job_titles)
-            final = normalize_and_dedupe_jobs(api_jobs[:max_results], resolved_org)
-            if progress_callback:
-                progress_callback(jobs_found=len(final), stage="completed")
-            print(f"ATS API returned {len(final)} jobs (skipping Selenium)")
-            return final
+                api_matched = filter_jobs_by_queries(api_validated, job_titles)
+                if api_matched:
+                    final = normalize_and_dedupe_jobs(api_matched[:max_results], resolved_org)
+                    if progress_callback:
+                        progress_callback(jobs_found=len(final), stage="completed")
+                    print(f"ATS API returned {len(final)} jobs matching search (skipping Selenium)")
+                    return final
+                print(
+                    f"ATS API returned {len(api_validated)} jobs but 0 matched search; "
+                    "falling back to browser listing + in-memory filter"
+                )
+            else:
+                final = normalize_and_dedupe_jobs(api_validated[:max_results], resolved_org)
+                if progress_callback:
+                    progress_callback(jobs_found=len(final), stage="completed")
+                print(f"ATS API returned {len(final)} jobs (skipping Selenium)")
+                return final
 
         # One browser scrape; keyword search only for a single title
         browser_search = job_titles[0] if len(job_titles) == 1 else None
@@ -4420,7 +4431,26 @@ async def scrape_generic_career_page(
                     f"Title filter: {len(jobs)} jobs match "
                     f"{len(job_titles)} search title(s) (from {before})"
                 )
-        elif not search_query:
+
+        # Workday and similar sites: in-page keyword search often fails; retry full listing
+        if job_titles and not jobs and browser_search:
+            print(
+                "\n⚠️  Browser keyword search returned no matching jobs; "
+                "retrying full listing + in-memory title filter..."
+            )
+            jobs = await scrape_with_selenium(
+                url=url,
+                company_name=company_name,
+                max_results=scrape_cap,
+                search_query=None,
+                use_undetected=use_undetected,
+            )
+            if jobs:
+                jobs = filter_invalid_jobs(jobs)
+                jobs = filter_jobs_by_queries(jobs, job_titles)
+                print(f"Full listing fallback matched {len(jobs)} job(s)")
+
+        if not jobs and not search_query:
             print(f"\n✓ No jobs found")
         
         # Ensure we always return a list (defensive for Railway/API)
