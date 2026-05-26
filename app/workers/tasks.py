@@ -105,6 +105,8 @@ def scrape_indeed_task(
     employment_type: Optional[str] = None,
     days_old: Optional[int] = None,
     fetch_full_details: bool = True,
+    sort: Optional[str] = None,
+    radius: Optional[int] = None,
 ):
     """
     Scrape Indeed jobs via Playwright, enforcing a global Redis-backed concurrency cap
@@ -144,6 +146,8 @@ def scrape_indeed_task(
                     days_old=days_old,
                     fetch_full_details=fetch_full_details,
                     force_rotate_proxy=force_rotate,
+                    sort=sort,
+                    radius=radius,
                 )
             )
 

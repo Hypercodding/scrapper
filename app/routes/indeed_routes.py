@@ -30,6 +30,8 @@ class IndeedScrapeRequest(BaseModel):
     days_old: Optional[int] = None
     max_results: int = 20
     fetch_full_details: bool = True
+    sort: Optional[str] = None  # "date" or "relevance" (default)
+    radius: Optional[int] = None  # miles: 0 | 5 | 10 | 15 | 25 | 50 | 100
 
 
 class ScrapeJobResponse(BaseModel):
@@ -54,14 +56,31 @@ class ScrapeJobStatusResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-_VALID_JOB_TYPES = {"remote", "hybrid", "onsite", "on-site", "work from home", "wfh"}
-_VALID_EXPERIENCE = {
-    "intern", "internship", "assistant", "entry", "junior",
-    "mid", "mid-senior", "senior", "director", "manager", "executive",
+_VALID_JOB_TYPES = {
+    "remote", "hybrid", "onsite", "on-site", "in-person", "in person",
+    "work from home", "wfh", "telecommute", "telework",
 }
+# Indeed only exposes three SERP buckets — extras here are mapped onto those
+# buckets in app.services.indeed_url_builder.EXPERIENCE_MAP.
+_VALID_EXPERIENCE = {
+    "intern", "internship", "assistant",
+    "entry", "entry-level", "entry level", "junior", "jr",
+    "mid", "mid-level", "mid level", "mid-senior", "mid senior", "intermediate",
+    "senior", "senior-level", "senior level", "sr", "lead", "principal", "staff",
+    "manager", "director", "executive", "vp",
+}
+_VALID_SORT = {"date", "relevance"}
+_VALID_RADIUS = {0, 5, 10, 15, 25, 50, 100}
 
 
-def _validate(query: str, max_results: int, job_type: Optional[str], experience_level: Optional[str]) -> None:
+def _validate(
+    query: str,
+    max_results: int,
+    job_type: Optional[str],
+    experience_level: Optional[str],
+    sort: Optional[str] = None,
+    radius: Optional[int] = None,
+) -> None:
     if not query or not query.strip():
         raise HTTPException(status_code=400, detail="query is required and cannot be blank.")
     if len(query) > 300:
@@ -72,6 +91,13 @@ def _validate(query: str, max_results: int, job_type: Optional[str], experience_
         raise HTTPException(status_code=400, detail=f"Invalid job_type '{job_type}'.")
     if experience_level and experience_level.lower() not in _VALID_EXPERIENCE:
         raise HTTPException(status_code=400, detail=f"Invalid experience_level '{experience_level}'.")
+    if sort is not None and sort.lower() not in _VALID_SORT:
+        raise HTTPException(status_code=400, detail=f"Invalid sort '{sort}'. Use 'date' or 'relevance'.")
+    if radius is not None and int(radius) not in _VALID_RADIUS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid radius {radius}. Allowed: {sorted(_VALID_RADIUS)}.",
+        )
 
 
 def _enqueue(
@@ -85,16 +111,22 @@ def _enqueue(
     employment_type: Optional[str],
     days_old: Optional[int],
     fetch_full_details: bool,
+    sort: Optional[str] = None,
+    radius: Optional[int] = None,
 ) -> str:
     store = get_job_store()
     job_id = store.create(url=f"https://www.indeed.com/jobs?q={query}", max_results=max_results)
     try:
         from app.workers.tasks import scrape_indeed_task
+        # New params (sort, radius) passed as kwargs to keep positional args
+        # stable for any in-flight queued tasks during the rolling deploy.
         task = scrape_indeed_task.delay(
             job_id, query, location, max_results,
             job_type, salary_min, salary_max,
             experience_level, employment_type, days_old,
             fetch_full_details,
+            sort=sort,
+            radius=radius,
         )
         store.update(job_id, celery_task_id=task.id)
     except Exception as exc:
@@ -126,13 +158,15 @@ async def search_jobs_get(
     query: str = Query(..., description="Search term, e.g. 'python developer'"),
     location: Optional[str] = Query(None, description="Location: 'remote', 'New York, NY', 'USA', etc."),
     job_type: Optional[str] = Query(None, description="remote | hybrid | onsite"),
-    salary_min: Optional[int] = Query(None),
-    salary_max: Optional[int] = Query(None),
-    experience_level: Optional[str] = Query(None, description="entry | mid | senior | etc."),
-    employment_type: Optional[str] = Query(None, description="Full-Time | Part-Time | Contract | Internship"),
+    salary_min: Optional[int] = Query(None, description="Minimum salary (annual USD); applied as Indeed sc=salary() facet"),
+    salary_max: Optional[int] = Query(None, description="Maximum salary (post-scrape filter only)"),
+    experience_level: Optional[str] = Query(None, description="entry | mid | senior (intern→entry, manager/director→senior)"),
+    employment_type: Optional[str] = Query(None, description="Full-Time | Part-Time | Contract | Internship | Temporary"),
     days_old: Optional[int] = Query(None, description="Jobs posted within last N days"),
     max_results: int = Query(20, description="1–1000"),
     fetch_full_details: bool = Query(True, description="Visit each job page for full description (slower but richer)"),
+    sort: Optional[str] = Query(None, description="'date' (newest first) or 'relevance' (default)"),
+    radius: Optional[int] = Query(None, description="Search radius in miles: 0 | 5 | 10 | 15 | 25 | 50 | 100"),
 ):
     """
     Enqueue an Indeed job search and return a job_id immediately.
@@ -141,9 +175,10 @@ async def search_jobs_get(
     Backed by 10 Railway worker replicas, each running one Chrome. Retries
     Cloudflare blocks up to 3× with proxy rotation and exponential backoff.
     """
-    _validate(query, max_results, job_type, experience_level)
+    _validate(query, max_results, job_type, experience_level, sort, radius)
     job_id = _enqueue(query, location, max_results, job_type, salary_min, salary_max,
-                      experience_level, employment_type, days_old, fetch_full_details)
+                      experience_level, employment_type, days_old, fetch_full_details,
+                      sort=sort, radius=radius)
     return _make_response(job_id)
 
 
@@ -154,12 +189,14 @@ async def search_jobs_post(request: IndeedScrapeRequest):
 
     Same as GET /jobs/search but accepts a JSON body — useful for n8n HTTP nodes.
     """
-    _validate(request.query, request.max_results, request.job_type, request.experience_level)
+    _validate(request.query, request.max_results, request.job_type, request.experience_level,
+              request.sort, request.radius)
     job_id = _enqueue(
         request.query, request.location, request.max_results,
         request.job_type, request.salary_min, request.salary_max,
         request.experience_level, request.employment_type,
         request.days_old, request.fetch_full_details,
+        sort=request.sort, radius=request.radius,
     )
     return _make_response(job_id)
 

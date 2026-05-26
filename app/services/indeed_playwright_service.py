@@ -15,12 +15,14 @@ import time
 import random
 import asyncio
 import re
-from typing import Optional, List, Dict
+from datetime import date, timedelta
+from typing import Optional, List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
 from bs4 import BeautifulSoup
 from app.models.job_model import Job
 from app.core.config import settings
 from app.core.proxy_manager import ProxyManager
+from app.services.indeed_url_builder import build_indeed_search_url
 
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
@@ -316,6 +318,8 @@ async def scrape_indeed_playwright(
     days_old: Optional[int] = None,
     fetch_full_details: bool = True,
     force_rotate_proxy: bool = False,
+    sort: Optional[str] = None,
+    radius: Optional[int] = None,
 ) -> List[Job]:
     """
     Scrape Indeed jobs using Playwright.
@@ -380,39 +384,23 @@ async def scrape_indeed_playwright(
         )
 
     try:
-        # Build Indeed URL
-        base_url = "https://www.indeed.com/jobs"
-        url = f"{base_url}?q={quote_plus(query)}"
-        
-        # Handle job_type filter - if remote, bypass location and search all over United States
-        # Similar to how SimplyHired handles remote jobs
-        if job_type and job_type.lower() in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
-            # For remote jobs, use location=remote to search all over United States
-            # This bypasses any specific location filter
-            job_type_location = _get_indeed_job_type_filter(job_type)
-            if job_type_location:
-                url += f"&l={quote_plus(job_type_location)}"
-                print(f"DEBUG - Job type '{job_type}' mapped to location '{job_type_location}' (bypassing location, searching all US)")
-        elif location:
-            # Only add location if job_type is not remote
-            location_param = _format_location_for_indeed(location)
-            url += f"&l={quote_plus(location_param)}"
-            print(f"DEBUG - Location '{location}' formatted as '{location_param}'")
-        
-        # Add job type filter for hybrid/onsite (if not already handled above)
-        if job_type and job_type.lower() not in ['remote', 'work from home', 'wfh', 'telecommute', 'telework']:
-            # For hybrid/onsite, Indeed doesn't have URL-level filters via location
-            # We'll rely on post-scraping filtering
-            print(f"DEBUG - Job type '{job_type}' will be filtered post-scraping (no URL location parameter available)")
-        
-        # Add salary filter if provided
-        if salary_min:
-            salary_param = f"{salary_min}-{salary_max or ''}"
-            url += f"&salary={quote_plus(salary_param)}"
-            print(f"DEBUG - Salary filter: {salary_param}")
-        
+        # Build Indeed SERP URL via the shared builder. All filters (job_type,
+        # employment_type, experience_level, days_old, salary_min, sort, radius)
+        # now reach Indeed in its native encoding instead of being silently dropped.
+        url = build_indeed_search_url(
+            query=query,
+            location=location,
+            job_type=job_type,
+            employment_type=employment_type,
+            experience_level=experience_level,
+            salary_min=salary_min,
+            days_old=days_old,
+            sort=sort,
+            radius=radius,
+            start=0,
+        )
         print(f"🌐 Navigating to: {url}")
-        
+
         # Save the original search URL (without any job view parameters)
         original_search_url = url
         
@@ -656,66 +644,100 @@ async def scrape_indeed_playwright(
                 browser, context = await _launch_browser_with_context(pw, proxy_config)
                 page = await context.new_page()
         
-        # Progressive scroll to load more jobs
-        await _progressive_scroll_playwright(page)
-        
-        # Get page content
-        content = await page.content()
-        
-        # Parse with BeautifulSoup
-        soup = BeautifulSoup(content, "html.parser")
-        
-        # Extract job cards (reuse existing extraction logic)
-        job_cards = _find_job_cards_indeed(soup)
-        
-        print(f"📋 Found {len(job_cards)} job cards")
-        
-        # Extract job data from listing page
-        jobs = []
-        browser_alive = True  # Track if browser is still usable
-        
+        # Pagination over Indeed SERP pages (start=0, 10, 20, …). Indeed shows
+        # ~10 results per page; walk pages until max_results, no new cards, or
+        # MAX_SERP_PAGES is hit. Page 1 is already loaded above.
+        max_serp_pages = getattr(settings, "MAX_SERP_PAGES", 20)
+        page_size = 10
+
+        jobs: List[Job] = []
+        seen_job_keys: set = set()
+        browser_alive = True
+
         if not fetch_full_details:
             print("ℹ️  Fast mode: skipping job detail pages (using search results data only)")
-        
-        # NEW: Track job fetches and implement proxy rotation strategy
-        job_fetch_count = 0  # Track number of jobs fetched for proxy rotation
-        cloudflare_block_count = 0  # Track Cloudflare blocks on job pages
-        max_cloudflare_blocks = getattr(settings, "MAX_JOB_PAGE_CLOUDFLARE_BLOCKS", 3)  # Stop fetching details after N blocks
-        
-        # For rotating residential proxies (like Webshare), recreate browser per job
-        # This forces a fresh TCP connection and new IP from the proxy pool
+
+        # Detail-fetch rotation settings (apply per detail fetch, not per SERP page)
+        job_fetch_count = 0
+        cloudflare_block_count = 0
+        max_cloudflare_blocks = getattr(settings, "MAX_JOB_PAGE_CLOUDFLARE_BLOCKS", 3)
         use_auto_rotating_proxy = getattr(settings, "USE_AUTO_ROTATING_PROXY", True)
-        
-        # Delays configuration
-        min_delay_between_fetches = getattr(settings, "JOB_DETAIL_MIN_DELAY", 4.0)  # Longer delays for residential
-        max_delay_between_fetches = getattr(settings, "JOB_DETAIL_MAX_DELAY", 8.0)  # More variation
-        
-        for card in job_cards[:max_results * 2]:  # Get more cards to account for filtering
+        min_delay_between_fetches = getattr(settings, "JOB_DETAIL_MIN_DELAY", 4.0)
+        max_delay_between_fetches = getattr(settings, "JOB_DETAIL_MAX_DELAY", 8.0)
+
+        for serp_page_idx in range(max_serp_pages):
+            # Navigate to subsequent SERP pages. Page 0 is already loaded.
+            if serp_page_idx > 0:
+                if not browser_alive or not page or page.is_closed():
+                    print(f"⚠️  Browser unusable before page {serp_page_idx + 1} — stopping pagination")
+                    break
+
+                next_url = build_indeed_search_url(
+                    query=query, location=location, job_type=job_type,
+                    employment_type=employment_type, experience_level=experience_level,
+                    salary_min=salary_min, days_old=days_old, sort=sort, radius=radius,
+                    start=serp_page_idx * page_size,
+                )
+                inter_page_delay = random.uniform(3.0, 6.0)
+                print(f"📄 SERP page {serp_page_idx + 1} after {inter_page_delay:.1f}s delay: {next_url}")
+                await asyncio.sleep(inter_page_delay)
+                try:
+                    await page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(2000)
+                except Exception as page_nav_err:
+                    print(f"⚠️  Failed to navigate to SERP page {serp_page_idx + 1}: {page_nav_err}")
+                    break
+
+            # Progressive scroll to surface lazy-loaded cards
+            await _progressive_scroll_playwright(page)
+
             try:
-                job = _extract_job_from_card(card, query, location)
-                if job and job.title and job.url:
-                    # Check if we should stop fetching details due to too many Cloudflare blocks
+                content = await page.content()
+            except Exception as e:
+                print(f"⚠️  Failed to read page content on SERP page {serp_page_idx + 1}: {e}")
+                break
+
+            soup = BeautifulSoup(content, "html.parser")
+            job_cards = _find_job_cards_indeed(soup)
+            print(f"📋 SERP page {serp_page_idx + 1}: found {len(job_cards)} job cards")
+
+            if not job_cards:
+                if serp_page_idx == 0:
+                    print("ℹ️  No cards on first page — search returned no results")
+                else:
+                    print("ℹ️  No more results — stopping pagination")
+                break
+
+            new_on_this_page = 0
+            for card in job_cards:
+                try:
+                    job = _extract_job_from_card(card, query, location)
+                    if not (job and job.title and job.url):
+                        continue
+
+                    # Cross-page dedup: Indeed repeats sponsored cards on every page
+                    dedup_key = job.job_key or job.url
+                    if dedup_key in seen_job_keys:
+                        continue
+                    seen_job_keys.add(dedup_key)
+                    new_on_this_page += 1
+
+                    # Disable detail fetching after too many Cloudflare blocks
                     if cloudflare_block_count >= max_cloudflare_blocks:
                         print(f"  ⚠️  Too many Cloudflare blocks ({cloudflare_block_count}) - switching to fast mode (no job detail pages)")
-                        fetch_full_details = False  # Disable detailed fetching
-                    
-                    # Enhanced extraction: Visit individual job page for complete data
-                    # Only attempt if browser is still alive AND fetch_full_details is True
+                        fetch_full_details = False
+
                     if fetch_full_details and browser_alive:
                         print(f"  → Fetching complete data from job page: {job.title}")
-                        
-                        # NEW: Add delay before fetching (randomized for more human-like behavior)
+
                         delay = random.uniform(min_delay_between_fetches, max_delay_between_fetches)
                         print(f"    ⏳ Waiting {delay:.1f}s before fetch...")
                         await asyncio.sleep(delay)
-                        
-                        # NEW: Perform human-like interactions BEFORE navigating to job page
+
                         if getattr(settings, "HUMANIZE", True):
                             try:
-                                # Scroll a bit on search results page
                                 await page.evaluate("window.scrollBy(0, Math.random() * 300)")
                                 await page.wait_for_timeout(random.uniform(500, 1000))
-                                # Move mouse randomly
                                 await page.mouse.move(
                                     random.randint(100, 800),
                                     random.randint(100, 500)
@@ -723,11 +745,9 @@ async def scrape_indeed_playwright(
                                 await page.wait_for_timeout(random.uniform(200, 500))
                             except Exception:
                                 pass
-                        
-                        # SIMPLE APPROACH: Recreate browser to get fresh proxy connection
-                        # This forces Webshare to assign a new IP from the pool
+
                         rotate_browser_per_job = getattr(settings, "ROTATE_BROWSER_PER_JOB", True)
-                        
+
                         if use_auto_rotating_proxy and rotate_browser_per_job:
                             try:
                                 print(f"    🔄 Recreating browser to force fresh proxy connection...")
@@ -737,7 +757,6 @@ async def scrape_indeed_playwright(
                                 except Exception:
                                     pass
                                 await _close_browser(browser, context)
-                                # Reuse same pw instance; get fresh proxy config (time-based rotation)
                                 proxy_config = _get_current_proxy_config()
                                 browser, context = await _launch_browser_with_context(pw, proxy_config)
                                 page = await context.new_page()
@@ -746,54 +765,65 @@ async def scrape_indeed_playwright(
                             except Exception as browser_error:
                                 print(f"    ⚠️  Error recreating browser: {browser_error}")
                                 browser_alive = False
+                                # Keep the basic SERP job and proceed; we'll exit the loop after this card
+                                if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
+                                    jobs.append(job)
+                                if len(jobs) >= max_results:
+                                    break
                                 continue
-                        
+
                         try:
-                            # Check if page is still connected before navigating
                             if page.is_closed():
                                 print("  ⚠️  Page was closed - skipping job detail extraction for remaining jobs")
                                 browser_alive = False
                             else:
                                 enhanced_job = await _extract_complete_job_details_from_url_playwright(
-                                    page, job, original_search_url, 
+                                    page, job, original_search_url,
                                     skip_nav_back=use_auto_rotating_proxy and rotate_browser_per_job
                                 )
                                 if enhanced_job:
-                                    # Check if we got blocked (job would have Ray ID in requirements)
                                     if enhanced_job.requirements and any('Ray ID' in str(req) for req in enhanced_job.requirements):
                                         cloudflare_block_count += 1
                                         print(f"    ⚠️  Cloudflare block detected (total: {cloudflare_block_count}/{max_cloudflare_blocks})")
                                     else:
                                         job = enhanced_job
                                         job_fetch_count += 1
-                                
-                                # NEW: Add delay after fetching (slightly shorter than pre-fetch delay)
+
                                 post_fetch_delay = random.uniform(1.5, 3.0)
                                 await asyncio.sleep(post_fetch_delay)
                         except Exception as enhance_error:
                             error_msg = str(enhance_error).lower()
                             if "closed" in error_msg or "target" in error_msg:
-                                # Browser/page was closed - stop trying to navigate
                                 print(f"  ⚠️  Browser closed during job detail extraction - using basic data for remaining jobs")
                                 browser_alive = False
                             else:
                                 print(f"  ⚠️  Error enhancing job details: {enhance_error}")
-                            # Continue with basic job data if enhancement fails
-                    
-                    # Apply filters
+
+                    # Apply post-scrape filters
                     if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
                         jobs.append(job)
-                        
-                        # Stop if we've reached max_results
+
                         if len(jobs) >= max_results:
                             break
-            except Exception as e:
-                print(f"⚠️  Error extracting job from card: {e}")
-                continue
-        
-        print(f"✓ Extracted {len(jobs)} jobs (fetched details from {job_fetch_count} job pages)")
+                except Exception as e:
+                    print(f"⚠️  Error extracting job from card: {e}")
+                    continue
+
+            # Outer-loop stop conditions
+            if len(jobs) >= max_results:
+                print(f"✓ Reached max_results={max_results}")
+                break
+            if new_on_this_page == 0:
+                print(f"ℹ️  No new jobs on page {serp_page_idx + 1} (all duplicates) — stopping pagination")
+                break
+            if fetch_full_details and not browser_alive:
+                print("ℹ️  Browser dead after detail fetches — cannot paginate further")
+                break
+
+        print(f"✓ Extracted {len(jobs)} jobs across {serp_page_idx + 1} SERP page(s); fetched details from {job_fetch_count} job pages")
         return jobs
-        
+
+
     except Exception as e:
         error_msg = str(e)
         print(f"❌ Error during scraping: {error_msg}")
@@ -929,6 +959,136 @@ def _find_job_cards_indeed(soup: BeautifulSoup) -> List:
     return unique_cards
 
 
+_SALARY_NUMBER_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([Kk])?")
+_SALARY_CURRENCY_RE = re.compile(r"([€£¥$]|USD|EUR|GBP|CAD|AUD)", re.IGNORECASE)
+_SALARY_PERIOD_RE = re.compile(
+    r"(per\s+|/\s*|a\s+)(hour|hr|year|yr|annum|month|mo|week|wk|day)",
+    re.IGNORECASE,
+)
+_SALARY_FROM_RE = re.compile(r"\bfrom\s+\$?\s*([\d,]+(?:\.\d+)?)\s*([Kk])?", re.IGNORECASE)
+_SALARY_UPTO_RE = re.compile(r"\bup\s+to\s+\$?\s*([\d,]+(?:\.\d+)?)\s*([Kk])?", re.IGNORECASE)
+
+_CURRENCY_SYMBOL_TO_CODE = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+}
+
+_PERIOD_NORMALIZED = {
+    "hour": "hour", "hr": "hour",
+    "year": "year", "yr": "year", "annum": "year",
+    "month": "month", "mo": "month",
+    "week": "week", "wk": "week",
+    "day": "day",
+}
+
+
+def _parse_salary_number(raw_num: str, k_suffix: Optional[str]) -> float:
+    n = float(raw_num.replace(",", ""))
+    if k_suffix:  # "$80K" → 80,000
+        n *= 1000
+    return n
+
+
+def _parse_salary(raw: Optional[str]) -> Dict[str, Optional[object]]:
+    """Parse Indeed salary strings into structured fields.
+
+    Handles: "$50K-$80K a year", "$50,000 - $70,000 a year", "$30/hour",
+    "From $80,000 a year", "Up to $100,000". Returns a dict with min, max,
+    currency, period — any field may be None if not recoverable.
+    """
+    result: Dict[str, Optional[object]] = {
+        "min": None, "max": None, "currency": None, "period": None,
+    }
+    if not raw:
+        return result
+
+    text = raw.strip()
+
+    # Currency: explicit symbol/code; default USD when a dollar sign is present.
+    cur_match = _SALARY_CURRENCY_RE.search(text)
+    if cur_match:
+        sym = cur_match.group(1).upper()
+        result["currency"] = _CURRENCY_SYMBOL_TO_CODE.get(sym, sym)
+
+    # Period
+    period_match = _SALARY_PERIOD_RE.search(text)
+    if period_match:
+        result["period"] = _PERIOD_NORMALIZED.get(period_match.group(2).lower())
+    elif re.search(r"/\s*hr\b", text, re.IGNORECASE):
+        result["period"] = "hour"
+
+    # "From X" — only a minimum
+    from_match = _SALARY_FROM_RE.search(text)
+    upto_match = _SALARY_UPTO_RE.search(text)
+
+    if from_match and not upto_match:
+        result["min"] = _parse_salary_number(from_match.group(1), from_match.group(2))
+        return result
+    if upto_match and not from_match:
+        result["max"] = _parse_salary_number(upto_match.group(1), upto_match.group(2))
+        return result
+
+    # Range: "$50K - $80K", "$50,000 to $70,000"
+    range_match = re.search(
+        r"\$?\s*([\d,]+(?:\.\d+)?)\s*([Kk])?\s*(?:-|–|to)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([Kk])?",
+        text,
+    )
+    if range_match:
+        result["min"] = _parse_salary_number(range_match.group(1), range_match.group(2))
+        result["max"] = _parse_salary_number(range_match.group(3), range_match.group(4))
+        return result
+
+    # Single value
+    single_match = _SALARY_NUMBER_RE.search(text)
+    if single_match:
+        val = _parse_salary_number(single_match.group(1), single_match.group(2))
+        result["min"] = val
+        result["max"] = val
+
+    return result
+
+
+_RELATIVE_DATE_RE = re.compile(
+    r"(\d+)\s*\+?\s*(minute|min|hour|hr|day|week|month)s?\s+ago",
+    re.IGNORECASE,
+)
+
+
+def _relative_date_to_iso(raw: Optional[str], today: Optional[date] = None) -> Optional[str]:
+    """Convert Indeed's relative date strings to an ISO date (YYYY-MM-DD).
+
+    Handles "Just posted", "Today", "Yesterday", "3 days ago", "30+ days ago",
+    "2 weeks ago", "1 month ago". Returns None if the input is unrecognizable.
+    """
+    if not raw:
+        return None
+    base = today or date.today()
+    text = raw.strip().lower()
+
+    if "just posted" in text or "today" in text or "posted today" in text:
+        return base.isoformat()
+    if "yesterday" in text:
+        return (base - timedelta(days=1)).isoformat()
+
+    match = _RELATIVE_DATE_RE.search(text)
+    if not match:
+        return None
+
+    n = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit in ("minute", "min", "hour", "hr"):
+        return base.isoformat()
+    if unit == "day":
+        return (base - timedelta(days=n)).isoformat()
+    if unit == "week":
+        return (base - timedelta(weeks=n)).isoformat()
+    if unit == "month":
+        return (base - timedelta(days=n * 30)).isoformat()
+    return None
+
+
 def _extract_job_id_indeed(card) -> Optional[str]:
     """Extract job ID from Indeed job card with comprehensive fallbacks."""
     # Look for data-jk attribute on the card itself
@@ -1000,7 +1160,15 @@ def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optiona
         # Extract industry and company size
         industry = _extract_industry_indeed(card)
         company_size = _extract_company_size_indeed(card)
-        
+
+        # Indeed-specific high-value fields
+        apply_url = _extract_apply_url_indeed(card, job_id)
+        easy_apply = _extract_easy_apply_indeed(card)
+        sponsored = _extract_sponsored_indeed(card)
+        company_rating, review_count = _extract_company_rating_indeed(card)
+        posted_date_iso = _relative_date_to_iso(posted_date)
+        salary_parts = _parse_salary(salary_range)
+
         return Job(
             title=title,
             company=company or "Unknown",
@@ -1019,7 +1187,18 @@ def _extract_job_from_card(card, query: str, location: Optional[str]) -> Optiona
             employment_type=employment_type,
             industry=industry,
             company_size=company_size,
-            job_id=job_id
+            job_id=job_id,
+            job_key=job_id or None,
+            apply_url=apply_url,
+            easy_apply=easy_apply,
+            sponsored=sponsored,
+            company_rating=company_rating,
+            review_count=review_count,
+            posted_date_iso=posted_date_iso,
+            salary_min=salary_parts["min"],
+            salary_max=salary_parts["max"],
+            salary_currency=salary_parts["currency"],
+            salary_period=salary_parts["period"],
         )
     except Exception as e:
         print(f"⚠️  Error extracting job data: {e}")
@@ -1402,11 +1581,97 @@ def _extract_job_url_indeed(card, job_id: str) -> Optional[str]:
     if title_elem and title_elem.get('href'):
         href = title_elem.get('href')
         return f"https://www.indeed.com{href}" if href.startswith('/') else href
-    
+
     if job_id:
         return f"https://www.indeed.com/viewjob?jk={job_id}"
-    
+
     return None
+
+
+def _extract_apply_url_indeed(card, job_id: str) -> Optional[str]:
+    """Best-effort direct apply URL from the SERP card.
+
+    Indeed only exposes a direct apply link on Easy Apply cards; otherwise it
+    routes through /rc/clk redirect. Fall back to the canonical viewjob URL —
+    consumers can resolve it server-side if they want the final destination.
+    """
+    apply_elem = card.select_one(
+        'a[class*="indeedApply"], a[data-testid*="apply"], a[href*="indeedApply"]'
+    )
+    if apply_elem and apply_elem.get('href'):
+        href = apply_elem['href']
+        return f"https://www.indeed.com{href}" if href.startswith('/') else href
+    if job_id:
+        return f"https://www.indeed.com/viewjob?jk={job_id}"
+    return None
+
+
+def _extract_easy_apply_indeed(card) -> Optional[bool]:
+    """True if the card advertises Indeed Easy Apply."""
+    if card.select_one(
+        'button[id*="indeedApplyButton"], span[class*="indeedApply"], '
+        '[data-testid*="indeed-apply"], a[class*="indeedApply"]'
+    ):
+        return True
+    text = card.get_text(" ", strip=True).lower()
+    if "easily apply" in text or "easy apply" in text:
+        return True
+    return False
+
+
+def _extract_sponsored_indeed(card) -> Optional[bool]:
+    """True if the card is a paid/sponsored placement."""
+    if card.select_one(
+        'span.sponsoredJob, [data-testid*="sponsored"], '
+        'span[class*="sponsored" i]'
+    ):
+        return True
+    # Indeed sometimes renders the word "Sponsored" inside a small <span>.
+    sponsored_span = card.find(string=re.compile(r"^\s*sponsored\s*$", re.IGNORECASE))
+    return True if sponsored_span else False
+
+
+def _extract_company_rating_indeed(card) -> Tuple[Optional[float], Optional[int]]:
+    """Extract numeric company rating (1.0–5.0) and review count."""
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+
+    rating_elem = card.select_one(
+        'span[aria-label*="out of 5 stars"], span[aria-label*="of 5"]'
+    )
+    if rating_elem:
+        label = rating_elem.get("aria-label", "")
+        m = re.search(r"([0-9]\.[0-9])", label)
+        if m:
+            try:
+                rating = float(m.group(1))
+            except ValueError:
+                pass
+
+    if rating is None:
+        # Fallback: a free-standing "4.2" near the rating star icon.
+        rating_text = card.select_one('span[class*="ratingNumber"], span[data-testid*="rating"]')
+        if rating_text:
+            m = re.search(r"([0-5]\.[0-9])", rating_text.get_text(strip=True))
+            if m:
+                try:
+                    rating = float(m.group(1))
+                except ValueError:
+                    pass
+
+    reviews_elem = card.select_one(
+        'span[data-testid="reviewCount"], a[class*="reviewCount"], '
+        'span[class*="reviewCount"]'
+    )
+    if reviews_elem:
+        m = re.search(r"([\d,]+)", reviews_elem.get_text(strip=True))
+        if m:
+            try:
+                review_count = int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+
+    return rating, review_count
 
 
 def _extract_skills_indeed(card) -> List[str]:
