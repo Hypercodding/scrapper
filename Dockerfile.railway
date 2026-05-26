@@ -71,8 +71,8 @@ RUN python -m playwright install-deps chromium || true
 COPY app ./app
 
 # Copy startup scripts (Railway overrides CMD via railway.json / railway.worker.json)
-COPY start.sh start-api.sh start-worker.sh ./
-RUN chmod +x start.sh start-api.sh start-worker.sh
+COPY start.sh start-api.sh start-worker.sh start-api-indeed.sh start-worker-indeed.sh ./
+RUN chmod +x start.sh start-api.sh start-worker.sh start-api-indeed.sh start-worker-indeed.sh
 
 # Environment
 ENV CHROME_BIN=/usr/bin/google-chrome \
