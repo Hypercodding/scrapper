@@ -12,7 +12,7 @@ from app.core.config import settings # pylint: disable=import-error
 from app.core.scrape_executor import scrape_execution_context, ScrapeInProgressError, ScrapeTimeoutError, get_execution_status, SCRAPE_TIMEOUT # pylint: disable=import-error
 from app.core.browser_executor import hard_kill_all_browsers, verify_cleanup # pylint: disable=import-error
 from app.services.indeed_selenium_service import (
-    scrape_indeed_selenium, 
+    scrape_indeed_selenium,
     CloudflareBlockedError,
     check_chrome_process_count
 ) # pylint: disable=import-error
@@ -55,6 +55,65 @@ def _enqueue_career_scrape(
             detail="Job queue unavailable. Ensure Redis and Celery worker are running.",
         ) from exc
     return job_id
+
+
+def _enqueue_indeed_scrape(
+    query: str,
+    location: Optional[str] = None,
+    max_results: int = 20,
+    job_type: Optional[str] = None,
+    salary_min: Optional[int] = None,
+    salary_max: Optional[int] = None,
+    experience_level: Optional[str] = None,
+    employment_type: Optional[str] = None,
+    days_old: Optional[int] = None,
+    fetch_full_details: bool = True,
+) -> str:
+    """Create Redis job record and dispatch scrape_indeed_task to the indeed worker queue."""
+    store = get_job_store()
+    # Store minimal metadata in the job record
+    job_id = store.create(url=f"https://www.indeed.com/jobs?q={query}", max_results=max_results)
+    try:
+        from app.workers.tasks import scrape_indeed_task
+        task = scrape_indeed_task.delay(
+            job_id, query, location, max_results,
+            job_type, salary_min, salary_max,
+            experience_level, employment_type, days_old,
+            fetch_full_details,
+        )
+        store.update(job_id, celery_task_id=task.id)
+    except Exception as exc:
+        logger.error("Failed to enqueue Indeed Celery task: %s", exc)
+        store.set_failed(job_id, f"Failed to enqueue Indeed scrape: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Indeed job queue unavailable. "
+                "Ensure Redis and the indeed-worker service are running."
+            ),
+        ) from exc
+    return job_id
+
+
+def _validate_indeed_params(
+    query: str,
+    max_results: int,
+    job_type: Optional[str],
+    experience_level: Optional[str],
+) -> None:
+    """Raise HTTPException for obviously bad Indeed request parameters."""
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="query is required and cannot be blank.")
+    if len(query) > 300:
+        raise HTTPException(status_code=400, detail="query is too long (max 300 chars).")
+    if max_results < 1 or max_results > 1000:
+        raise HTTPException(status_code=400, detail="max_results must be between 1 and 1000.")
+    valid_job_types = {"remote", "hybrid", "onsite", "on-site", "work from home", "wfh", None}
+    if job_type and job_type.lower() not in valid_job_types:
+        raise HTTPException(status_code=400, detail=f"Invalid job_type '{job_type}'.")
+    valid_experience = {"intern", "internship", "assistant", "entry", "junior", "mid", "mid-senior", "senior", "director", "manager", "executive", None}
+    if experience_level and experience_level.lower() not in valid_experience:
+        raise HTTPException(status_code=400, detail=f"Invalid experience_level '{experience_level}'.")
 
 
 router = APIRouter()
@@ -246,247 +305,168 @@ async def _execute_async_scrape(
         return await scrape_func(*args, **kwargs)
 
 
-@router.get("/jobs", response_model=List[Job])
+@router.get("/jobs/indeed-async", response_model=ScrapeJobResponse, status_code=202)
+async def get_indeed_jobs_async(
+    query: str = Query(..., description="Search term, e.g. 'python developer'"),
+    location: Optional[str] = Query(None, description="Job location. Examples: 'remote', 'New York, NY', 'USA'"),
+    job_type: Optional[str] = Query(None, description="Job type: 'remote', 'hybrid', 'onsite'"),
+    salary_min: Optional[int] = Query(None, description="Minimum salary filter"),
+    salary_max: Optional[int] = Query(None, description="Maximum salary filter"),
+    experience_level: Optional[str] = Query(None, description="Experience level: 'entry', 'mid', 'senior', etc."),
+    employment_type: Optional[str] = Query(None, description="Employment type: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
+    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days"),
+    max_results: int = Query(20, description="Maximum number of results (1–1000)"),
+    fetch_full_details: bool = Query(True, description="Visit each job page for complete details (slower but richer data)"),
+):
+    """
+    [ASYNC] Search Indeed jobs via distributed workers — returns immediately with a job_id.
+
+    Use GET /api/jobs/{job_id} to poll for results. Status transitions:
+    pending → processing → completed | failed
+
+    Scale: backed by 10 Railway worker replicas (concurrency=1 each, one Chrome per replica).
+    Retries Cloudflare blocks up to 3 times with proxy rotation and exponential backoff.
+    """
+    _validate_indeed_params(query, max_results, job_type, experience_level)
+    job_id = _enqueue_indeed_scrape(
+        query=query, location=location, max_results=max_results,
+        job_type=job_type, salary_min=salary_min, salary_max=salary_max,
+        experience_level=experience_level, employment_type=employment_type,
+        days_old=days_old, fetch_full_details=fetch_full_details,
+    )
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Indeed scrape job enqueued. Poll the status_url for results.",
+        status_url=f"/api/jobs/{job_id}",
+        estimated_time="2–10 minutes depending on max_results and proxy latency",
+    )
+
+
+@router.post("/jobs/indeed-async", response_model=ScrapeJobResponse, status_code=202)
+async def post_indeed_jobs_async(
+    query: str = Body(...),
+    location: Optional[str] = Body(None),
+    job_type: Optional[str] = Body(None),
+    salary_min: Optional[int] = Body(None),
+    salary_max: Optional[int] = Body(None),
+    experience_level: Optional[str] = Body(None),
+    employment_type: Optional[str] = Body(None),
+    days_old: Optional[int] = Body(None),
+    max_results: int = Body(20),
+    fetch_full_details: bool = Body(True),
+):
+    """
+    [ASYNC] Search Indeed jobs via distributed workers — returns immediately with a job_id.
+
+    Same as GET /api/jobs/indeed-async but accepts a JSON body.
+    """
+    _validate_indeed_params(query, max_results, job_type, experience_level)
+    job_id = _enqueue_indeed_scrape(
+        query=query, location=location, max_results=max_results,
+        job_type=job_type, salary_min=salary_min, salary_max=salary_max,
+        experience_level=experience_level, employment_type=employment_type,
+        days_old=days_old, fetch_full_details=fetch_full_details,
+    )
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Indeed scrape job enqueued. Poll the status_url for results.",
+        status_url=f"/api/jobs/{job_id}",
+        estimated_time="2–10 minutes depending on max_results and proxy latency",
+    )
+
+
+@router.get("/jobs", response_model=ScrapeJobResponse, status_code=202)
 async def get_jobs(
     query: str = Query(..., description="Search term, e.g. 'python developer'"),
-    location: Optional[str] = Query(None, description="Job location (flexible format like LinkedIn). Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'"),
-    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
-    salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
-    salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
-    experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
-    employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
-    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
-    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
+    location: Optional[str] = Query(None),
+    job_type: Optional[str] = Query(None),
+    salary_min: Optional[int] = Query(None),
+    salary_max: Optional[int] = Query(None),
+    experience_level: Optional[str] = Query(None),
+    employment_type: Optional[str] = Query(None),
+    days_old: Optional[int] = Query(None),
+    max_results: int = Query(20),
+    response: Response = None,
 ):
     """
-    Get jobs from Indeed using enhanced browser automation (Selenium)
-    
-    ⭐ ENHANCED VERSION: Now works like ZipRecruiter with comprehensive data extraction and advanced filtering!
-    
-    Features:
-    - Extracts salary ranges, company URLs, job descriptions
-    - Job types, experience levels, benefits, requirements, skills
-    - Raw job card data (HTML + text) for complete information access
-    - Dynamic location filtering (flexible format like LinkedIn search URLs)
-    - Salary range filtering
-    - Experience level filtering
-    - Employment type filtering
-    - Pagination support for more results
-    - Better error handling and debugging
-    
-    Location Filter (Dynamic - works like LinkedIn):
-    - Accepts any location format that Indeed supports
-    - Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'
-    - 'San Francisco, CA', 'London, UK', 'Toronto, ON', etc.
-    - Any valid location string will be URL-encoded and passed to Indeed
-    
-    Job Type Filter:
-    - 'remote' - Remote jobs only
-    - 'hybrid' - Hybrid jobs only  
-    - 'onsite' or 'on-site' - On-site jobs only
-    
-    Salary Filters:
-    - salary_min: Minimum salary (e.g., 50000)
-    - salary_max: Maximum salary (e.g., 100000)
-    
-    Experience Level Filter:
-    - 'intern' / 'internship' - Internship jobs
-    - 'assistant' - Assistant-level jobs
-    - 'entry' / 'junior' - Entry-level jobs
-    - 'mid' / 'mid-senior' - Mid-level jobs
-    - 'senior' - Senior-level jobs
-    - 'director' / 'manager' - Director/Manager-level jobs
-    - 'executive' - Executive-level jobs
-    
-    Employment Type Filter:
-    - 'full-time' - Full-time jobs
-    - 'part-time' - Part-time jobs
-    - 'contract' - Contract jobs
-    - 'internship' - Internship jobs
-    
-    Date Filter:
-    - days_old: Filter jobs posted within last N days
-    - 30 - Jobs posted in last 30 days
-    - 7 - Jobs posted in last 7 days
-    - 1 - Jobs posted today
+    [DEPRECATED] Use GET /api/jobs/indeed-async instead.
+
+    This endpoint now returns 202 + job_id immediately (async pattern) rather than
+    blocking until scraping completes. Existing callers should migrate to polling
+    GET /api/jobs/{job_id} for results.
     """
-    try:
-        # Execute with single-concurrency enforcement and guaranteed cleanup
-        jobs = await _execute_sync_scrape(
-            scrape_indeed_selenium,
-            query, location, max_results, job_type, 
-            salary_min, salary_max, experience_level, employment_type, days_old
-        )
-    except ScrapeInProgressError as e:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
-        )
-    except ScrapeTimeoutError as e:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Scraping operation timed out. {str(e)}"
-        )
-    except CloudflareBlockedError as e:
-        # Indeed is blocked - return clear error with solution
-        raise HTTPException(
-            status_code=503,
-            detail=f"Indeed blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Use /api/jobs/ziprecruiter-enhanced endpoint 3) Wait and retry"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return jobs
+    if response:
+        response.headers["Deprecation"] = "true"
+        response.headers["Link"] = '</api/jobs/indeed-async>; rel="successor-version"'
+    _validate_indeed_params(query, max_results, job_type, experience_level)
+    job_id = _enqueue_indeed_scrape(
+        query=query, location=location, max_results=max_results,
+        job_type=job_type, salary_min=salary_min, salary_max=salary_max,
+        experience_level=experience_level, employment_type=employment_type,
+        days_old=days_old,
+    )
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message=(
+            "DEPRECATED: This endpoint is now async. "
+            "Poll GET /api/jobs/{job_id} for results. "
+            "Migrate callers to /api/jobs/indeed-async."
+        ),
+        status_url=f"/api/jobs/{job_id}",
+        estimated_time="2–10 minutes",
+    )
 
 
-@router.get("/jobs/indeed-playwright", response_model=List[Job])
+@router.get("/jobs/indeed-playwright", response_model=ScrapeJobResponse, status_code=202)
 async def get_indeed_playwright_jobs(
-    query: str = Query(..., description="Search term, e.g. 'python developer'"),
-    location: Optional[str] = Query(None, description="Job location (flexible format). Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California'"),
-    job_type: Optional[str] = Query(None, description="Job type filter: 'remote', 'hybrid', 'onsite', 'On-site'"),
-    salary_min: Optional[int] = Query(None, description="Minimum salary filter (e.g., 50000)"),
-    salary_max: Optional[int] = Query(None, description="Maximum salary filter (e.g., 100000)"),
-    experience_level: Optional[str] = Query(None, description="Experience level filter: 'intern', 'assistant', 'entry', 'junior', 'mid', 'mid-senior', 'senior', 'director', 'executive'"),
-    employment_type: Optional[str] = Query(None, description="Employment type filter: 'Full-Time', 'Part-Time', 'Contract', 'Internship'"),
-    days_old: Optional[int] = Query(None, description="Filter jobs posted within last N days (e.g., 30 for last 30 days)"),
-    max_results: int = Query(20, description="Maximum number of results (default: 20)"),
-    fetch_full_details: bool = Query(True, description="Fetch full job details by visiting each job page (slower but more data). Set to false for faster scraping (~5s vs ~50s)"),
+    query: str = Query(...),
+    location: Optional[str] = Query(None),
+    job_type: Optional[str] = Query(None),
+    salary_min: Optional[int] = Query(None),
+    salary_max: Optional[int] = Query(None),
+    experience_level: Optional[str] = Query(None),
+    employment_type: Optional[str] = Query(None),
+    days_old: Optional[int] = Query(None),
+    max_results: int = Query(20),
+    fetch_full_details: bool = Query(True),
+    response: Response = None,
 ):
-    """
-    Get jobs from Indeed using Playwright (More stable alternative to Selenium)
-    
-    ⭐ PLAYWRIGHT VERSION: Better resource management, no ChromeDriver issues!
-    
-    Benefits over Selenium:
-    - No ChromeDriver version mismatches (Playwright bundles its own browser)
-    - Better memory management and stability
-    - More reliable in headless mode
-    - Better error handling
-    
-    Features:
-    - Extracts job title, company, location, URL, description
-    - Dynamic location filtering (flexible format)
-    - Salary range filtering
-    - Experience level filtering
-    - Employment type filtering
-    - Date filtering
-    
-    Location Filter (Dynamic):
-    - Accepts any location format that Indeed supports
-    - Examples: 'remote', 'New York, NY', 'Lahore, Pakistan', 'USA', 'California, USA'
-    - 'San Francisco, CA', 'London, UK', 'Toronto, ON', etc.
-    
-    Job Type Filter:
-    - 'remote' - Remote jobs only
-    - 'hybrid' - Hybrid jobs only  
-    - 'onsite' or 'on-site' - On-site jobs only
-    
-    Salary Filters:
-    - salary_min: Minimum salary (e.g., 50000)
-    - salary_max: Maximum salary (e.g., 100000)
-    
-    Experience Level Filter:
-    - 'intern' / 'internship' - Internship jobs
-    - 'assistant' - Assistant-level jobs
-    - 'entry' / 'junior' - Entry-level jobs
-    - 'mid' / 'mid-senior' - Mid-level jobs
-    - 'senior' - Senior-level jobs
-    - 'director' / 'manager' - Director/Manager-level jobs
-    - 'executive' - Executive-level jobs
-    
-    Employment Type Filter:
-    - 'full-time' - Full-time jobs
-    - 'part-time' - Part-time jobs
-    - 'contract' - Contract jobs
-    - 'internship' - Internship jobs
-    
-    Date Filter:
-    - days_old: Filter jobs posted within last N days
-    - 30 - Jobs posted in last 30 days
-    - 7 - Jobs posted in last 7 days
-    - 1 - Jobs posted today
-    
-    Installation Required:
-    ```bash
-    pip install playwright
-    python -m playwright install chromium
-    ```
-    """
-    if not PLAYWRIGHT_AVAILABLE:
-        raise HTTPException(
-            status_code=503,
-            detail="Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium"
-        )
-    
-    try:
-        async with scrape_execution_context():
-            jobs = await scrape_indeed_playwright(
-                query, location, max_results, job_type,
-                salary_min, salary_max, experience_level, employment_type, days_old,
-                fetch_full_details=fetch_full_details
-            )
-    except ScrapeInProgressError as e:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Another scraping operation is currently in progress. Please wait and try again. {str(e)}"
-        )
-    except ScrapeTimeoutError as e:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Scraping operation timed out. {str(e)}"
-        )
-    except ImportError as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium. Error: {str(e)}"
-        )
-    except PlaywrightCloudflareBlockedError as e:
-        # Indeed is blocked - return clear error with solution
-        raise HTTPException(
-            status_code=503,
-            detail=f"Indeed blocked by Cloudflare. {str(e)}. Solutions: 1) Configure PROXY_URL in .env file 2) Use /api/jobs/ziprecruiter-enhanced endpoint 3) Wait and retry"
-        )
-    except Exception as e:
-        error_detail = str(e)
-        # Log the full error for debugging on Railway
-        import traceback
-        print(f"❌ [PLAYWRIGHT ENDPOINT] Error: {error_detail}")
-        print(f"   Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=error_detail)
-
-    return jobs
+    """[DEPRECATED] Alias for GET /api/jobs/indeed-async."""
+    if response:
+        response.headers["Deprecation"] = "true"
+        response.headers["Link"] = '</api/jobs/indeed-async>; rel="successor-version"'
+    _validate_indeed_params(query, max_results, job_type, experience_level)
+    job_id = _enqueue_indeed_scrape(
+        query=query, location=location, max_results=max_results,
+        job_type=job_type, salary_min=salary_min, salary_max=salary_max,
+        experience_level=experience_level, employment_type=employment_type,
+        days_old=days_old, fetch_full_details=fetch_full_details,
+    )
+    return ScrapeJobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Deprecated — use /api/jobs/indeed-async. Poll /api/jobs/{job_id} for results.",
+        status_url=f"/api/jobs/{job_id}",
+        estimated_time="2–10 minutes",
+    )
 
 
 @router.get("/jobs/indeed-self-test")
 async def indeed_self_test(q: str = Query("python developer"), l: Optional[str] = Query("remote")):
-    """Quickly test Indeed scraping with small limits to verify Cloudflare workarounds."""
+    """Enqueue a small Indeed scrape (max_results=5) to verify the worker pipeline end-to-end."""
     try:
-        jobs = await _execute_sync_scrape(scrape_indeed_selenium, q, l, max_results=5)
+        job_id = _enqueue_indeed_scrape(query=q, location=l, max_results=5)
         return {
             "ok": True,
-            "count": len(jobs),
-            "note": "If count is 0 repeatedly, Cloudflare may still be blocking.",
+            "job_id": job_id,
+            "status_url": f"/api/jobs/{job_id}",
+            "note": "Poll status_url every 15s; check status=='completed' for results.",
         }
-    except ScrapeInProgressError as e:
-        return {
-            "ok": False,
-            "busy": True,
-            "detail": str(e),
-            "hint": "Another scrape is in progress. Please wait and try again.",
-        }
-    except ScrapeTimeoutError as e:
-        return {
-            "ok": False,
-            "timeout": True,
-            "detail": str(e),
-        }
-    except CloudflareBlockedError as e:
-        return {
-            "ok": False,
-            "blocked": True,
-            "detail": str(e),
-            "hint": "Set PROXY_URL in .env, increase BACKOFF_MAX, or retry later.",
-        }
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

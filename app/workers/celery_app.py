@@ -27,9 +27,11 @@ celery_app.conf.update(
     task_max_retries=3,
     task_routes={
         "app.workers.tasks.scrape_career_page_task": {"queue": "scrape.default"},
+        "app.workers.tasks.scrape_indeed_task": {"queue": "scrape.indeed"},
     },
     task_queues={
         "scrape.default": {"exchange": "scrape.default", "routing_key": "scrape.default"},
+        "scrape.indeed": {"exchange": "scrape.indeed", "routing_key": "scrape.indeed"},
         "scrape.retry": {"exchange": "scrape.retry", "routing_key": "scrape.retry"},
         "scrape.dlq": {"exchange": "scrape.dlq", "routing_key": "scrape.dlq"},
     },
