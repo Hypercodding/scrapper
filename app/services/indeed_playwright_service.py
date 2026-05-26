@@ -419,7 +419,8 @@ async def scrape_indeed_playwright(
         # Navigate with retry logic for Cloudflare
         max_retries = getattr(settings, "MAX_RETRIES", 3)
         cloudflare_retries = 0
-        
+        direct_connection_tried = False  # fallback flag for proxy failures
+
         while True:
             try:
                 # Optimized navigation strategy for Playwright
@@ -491,7 +492,8 @@ async def scrape_indeed_playwright(
                 
                 # Get page content
                 page_html = await page.content()
-                
+                body_length = 0  # default; updated below
+
                 # Check page state
                 try:
                     page_title = await page.title()
@@ -557,7 +559,33 @@ async def scrape_indeed_playwright(
                 if has_indeed_content:
                     is_actually_blocked = False
                     print("✓ Indeed content detected - proceeding with scraping")
-                
+
+                # Detect proxy/network failure: completely empty page, no Cloudflare indicators.
+                # An empty response (body=0 chars) is NOT a Cloudflare block — it means the proxy
+                # accepted the TCP connection but returned no HTTP data.  Retry with direct connection.
+                if not is_actually_blocked and len(page_html) < 200 and body_length == 0:
+                    if proxy_config and not direct_connection_tried:
+                        print("⚠️  Empty page detected — proxy non-functional, retrying with direct connection...")
+                        try:
+                            if page and not page.is_closed():
+                                await page.close()
+                        except Exception:
+                            pass
+                        await _close_browser(browser, context)
+                        browser, context = await _launch_browser_with_context(pw, None)
+                        page = await context.new_page()
+                        proxy_config = None
+                        direct_connection_tried = True
+                        cloudflare_retries += 1
+                        await asyncio.sleep(2.0)
+                        continue
+                    else:
+                        raise Exception(
+                            "Indeed returned an empty page on "
+                            f"{'direct connection' if direct_connection_tried else 'proxy and direct connection'}. "
+                            "Check network connectivity from the worker host."
+                        )
+
                 if not is_actually_blocked:
                     # Success - no Cloudflare block, mark proxy as successful
                     _mark_proxy_success()
