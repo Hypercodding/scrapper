@@ -417,23 +417,45 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
             f"Failed to launch Chromium: {e}. Run: python -m playwright install chromium"
         )
 
-    accept_lang = getattr(settings, "ACCEPT_LANGUAGE", "en-US,en;q=0.9") or "en-US,en;q=0.9"
-    locale = accept_lang.split(",")[0].strip() if accept_lang else "en-US"
+    # Per-session fingerprint: UA / viewport / TZ / locale / geo / Sec-CH-UA
+    # are now derived from a deterministic profile seeded by a uuid4. Same
+    # session_id → same profile (matters for Step 7 storage_state reuse).
+    # Different sessions → independent canvas / audio / UA / viewport.
+    from app.core.fingerprint_profile import FingerprintProfile
+    # Step 6 will pass the proxy egress country here; until then default US.
+    _proxy_country = "US"
+    _fp = FingerprintProfile.for_session(proxy_country=_proxy_country)
+    print(
+        f"🎭 Fingerprint: ua={_fp.user_agent.split('Chrome/')[1].split(' ')[0]} "
+        f"viewport={_fp.viewport['width']}x{_fp.viewport['height']} "
+        f"tz={_fp.timezone_id} locale={_fp.locale} platform={_fp.platform}"
+    )
 
     context_options: dict = {
-        "viewport": {"width": 1280, "height": 720},
-        "user_agent": settings.USER_AGENT,
-        "locale": locale,
-        "timezone_id": "America/New_York",
+        "viewport": _fp.viewport,
+        "user_agent": _fp.user_agent,
+        "locale": _fp.locale,
+        "timezone_id": _fp.timezone_id,
+        "geolocation": _fp.geolocation,
+        "permissions": ["geolocation"],
+        "device_scale_factor": _fp.dpr,
         "java_script_enabled": True,
         "bypass_csp": True,
         "ignore_https_errors": True,
         "accept_downloads": False,
+        "extra_http_headers": _fp.extra_http_headers(),
     }
     if proxy_config:
         context_options["proxy"] = proxy_config
 
     context = await browser.new_context(**context_options)
+
+    # Canvas + audio noise — applied BEFORE playwright-stealth so stealth
+    # can layer its own webdriver/plugins patches on top. The two scripts
+    # are deterministic per session (same seed → same noise pattern), so
+    # the fingerprint hash is stable within a session but unique across.
+    await context.add_init_script(_fp.canvas_noise_script())
+    await context.add_init_script(_fp.audio_noise_script())
 
     if STEALTH_AVAILABLE and _stealth:
         await _stealth.apply_stealth_async(context)
