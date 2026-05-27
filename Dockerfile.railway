@@ -43,10 +43,16 @@ RUN apt-get update && apt-get install -y \
 
 
 # Install Google Chrome Stable
+# `update-alternatives` doesn't always wire up the bare `/usr/bin/google-chrome`
+# symlink on python:3.13-slim — Patchright + channel="chrome" defaults to that
+# path. Force-create the symlink and fail the build if neither binary exists.
 RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get update \
     && apt-get install -y ./google-chrome-stable_current_amd64.deb --no-install-recommends \
     && rm google-chrome-stable_current_amd64.deb \
+    && ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome \
+    && /usr/bin/google-chrome --version \
+    && /usr/bin/google-chrome-stable --version \
     && rm -rf /var/lib/apt/lists/*
 
 

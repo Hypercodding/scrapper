@@ -425,12 +425,30 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
     if headful:
         print("🖥️  Launching headful Chrome (HEADFUL=true; assumes xvfb-run wrapper)")
     if use_real_chrome:
-        # Patchright + channel="chrome" uses /usr/bin/google-chrome from
-        # apt-get instead of Playwright's bundled Chromium. Real Chrome has
-        # the genuine chrome.runtime shape, Widevine, and codec mix that
-        # bot-detection scripts read.
-        launch_kwargs["channel"] = settings.BROWSER_CHANNEL
-        print(f"🔧 Launching real Chrome via Patchright (channel={settings.BROWSER_CHANNEL})")
+        # Patchright + channel="chrome" defaults to /usr/bin/google-chrome on
+        # Linux, but the google-chrome-stable .deb on python:3.13-slim only
+        # creates /usr/bin/google-chrome-stable — `update-alternatives` isn't
+        # always configured to add the bare `google-chrome` symlink. Probe
+        # the well-known paths and CHROME_BIN env, then pass executable_path
+        # explicitly so the launch doesn't fail on a missing symlink.
+        import os as _os
+        candidates = [
+            _os.environ.get("CHROME_BIN") or "",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/opt/google/chrome/google-chrome",
+        ]
+        chrome_path = next((p for p in candidates if p and _os.path.exists(p)), None)
+        if chrome_path:
+            launch_kwargs["executable_path"] = chrome_path
+            print(f"🔧 Launching real Chrome via Patchright at {chrome_path}")
+        else:
+            # No real Chrome on this host — fall back to channel and let
+            # Patchright surface the real error message.
+            launch_kwargs["channel"] = settings.BROWSER_CHANNEL
+            print(f"⚠️  CHROME_BIN not found in {candidates!r}; falling back to channel={settings.BROWSER_CHANNEL}")
 
     try:
         browser = await pw.chromium.launch(**launch_kwargs)
