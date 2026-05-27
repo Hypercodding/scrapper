@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y \
     libu2f-udev \
     libvulkan1 \
     xvfb \
+    xauth \
     dbus-x11 \
     fonts-noto-color-emoji \
     build-essential \
