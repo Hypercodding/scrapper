@@ -592,22 +592,30 @@ async def scrape_indeed_playwright(
                 navigation_timeout = 30000  # 30 seconds - optimized for direct connection
                 navigation_success = False
                 
+                # Capture HTTP status from the navigation response so the
+                # block detector can authoritatively flag 403/429 (the old
+                # text-only check let those slip through as "success").
+                serp_status_code = 0
                 # Strategy 1: domcontentloaded (fastest, best for Playwright)
                 try:
                     print(f"   Navigating (domcontentloaded, {navigation_timeout/1000}s timeout)...")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
-                    print("✓ Navigation completed")
+                    resp = await page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
+                    if resp is not None:
+                        serp_status_code = resp.status
+                    print(f"✓ Navigation completed (status={serp_status_code})")
                     navigation_success = True
                 except Exception as nav_error1:
                     error_type = type(nav_error1).__name__
                     error_msg = str(nav_error1)
                     print(f"⚠️  domcontentloaded failed: {error_msg[:100]}...")
-                    
+
                     # Strategy 2: commit + manual waiting (most reliable fallback)
                     try:
                         print(f"   Trying commit strategy...")
-                        await page.goto(url, wait_until="commit", timeout=15000)
-                        print("✓ Navigation started (commit)")
+                        resp = await page.goto(url, wait_until="commit", timeout=15000)
+                        if resp is not None:
+                            serp_status_code = resp.status
+                        print(f"✓ Navigation started (commit, status={serp_status_code})")
                         
                         # Wait for body element
                         await page.wait_for_selector('body', timeout=20000, state='attached')
@@ -688,18 +696,20 @@ async def scrape_indeed_playwright(
                         raise
                     pass
                 
-                # Check for Cloudflare blocking (more comprehensive detection)
-                has_cloudflare_indicators = (
-                    "Checking your browser" in page_html
-                    or "Enable JavaScript and cookies to continue" in page_html
-                    or "challenge-platform" in page_html
-                    or "cf-browser-verification" in page_html
-                    or "Just a moment" in page_html
-                    or "Ray ID" in page_html  # Cloudflare Ray ID
-                    or "cf-challenge" in page_html.lower()
-                    or "challenge-form" in page_html.lower()
+                # HTTP-aware block check. Falls back gracefully when status
+                # could not be read (serp_status_code == 0).
+                try:
+                    page_title = await page.title()
+                except Exception:
+                    page_title = ""
+                from app.core.block_detector import classify as _classify_block
+                _verdict = _classify_block(
+                    http_status=serp_status_code,
+                    body=page_html,
+                    title=page_title,
                 )
-                
+                has_cloudflare_indicators = bool(_verdict)
+
                 # Check for Indeed content (more comprehensive)
                 has_indeed_content = (
                     'id="mosaic-provider-jobcards"' in page_html
@@ -709,16 +719,18 @@ async def scrape_indeed_playwright(
                     or 'indeed.com/jobs' in page_html
                     or 'jobTitle' in page_html
                 )
-                
-                # Also check page title
-                try:
-                    page_title = await page.title()
-                    if "Just a moment" in page_title or "Checking" in page_title:
-                        has_cloudflare_indicators = True
-                except Exception:
-                    pass
-                
-                is_actually_blocked = has_cloudflare_indicators and not has_indeed_content
+
+                # HTTP 403/429/5xx is authoritative — cannot be overridden by
+                # body content (Indeed never serves real listings on those).
+                http_hard_block = serp_status_code in (403, 429) or (
+                    500 <= serp_status_code < 600
+                )
+
+                is_actually_blocked = http_hard_block or (
+                    has_cloudflare_indicators and not has_indeed_content
+                )
+                if is_actually_blocked and _verdict.reason is not None:
+                    print(f"🚫 SERP block: {_verdict.reason.value} ({_verdict.detail})")
                 
                 # If we have Indeed content, we're good (even if there are some Cloudflare indicators)
                 if has_indeed_content:
@@ -2475,7 +2487,8 @@ async def _extract_complete_job_details_from_url_playwright(
             
             # Navigate with shorter timeout, we'll handle waiting manually
             job_page_timeout = getattr(settings, "JOB_PAGE_TIMEOUT", 15000)  # Reduced to 15s
-            
+
+            status_code = 0  # 0 = "could not read status" (timeout / network error)
             try:
                 response = await page.goto(job.url, wait_until="commit", timeout=job_page_timeout)
                 status_code = response.status if response else 0
@@ -2538,26 +2551,37 @@ async def _extract_complete_job_details_from_url_playwright(
             full_page_content = await page.content()
             current_title = await page.title()
             
-            # Final check for Cloudflare blocking
-            has_cloudflare_indicators = (
-                "Checking your browser" in full_page_content
-                or "Enable JavaScript and cookies to continue" in full_page_content
-                or "challenge-platform" in full_page_content
-                or "cf-browser-verification" in full_page_content
-                or "Just a moment" in current_title
-                or ("Ray ID" in full_page_content and len(full_page_content) < 5000)
+            # Combined HTTP-status + body block detection. The old code only
+            # inspected the body, so a 403/429 response whose body still
+            # contained "indeed.com" or some job-card markup slipped through
+            # as "success" and got shipped to clients as a degraded row.
+            from app.core.block_detector import classify as _classify_block
+            verdict = _classify_block(
+                http_status=status_code,
+                body=full_page_content,
+                title=current_title,
             )
-            
-            # Check for actual job content
+            has_cloudflare_indicators = bool(verdict)
+
+            # Check for actual job content — used as an override: if Indeed
+            # served real job markup, treat soft CF markers in scripts as
+            # noise rather than a hard block.
             has_job_content = (
                 'jobsearch-JobComponent' in full_page_content
                 or 'jobDescriptionText' in full_page_content
                 or 'job-description' in full_page_content.lower()
                 or (len(full_page_content) > 10000 and 'indeed.com' in full_page_content)
             )
-            
-            # Determine if actually blocked
-            is_actually_blocked = has_cloudflare_indicators and not has_job_content
+
+            # HTTP 403/429/5xx is authoritative — body content cannot override
+            # a hard status code (Indeed never serves real listings on those).
+            http_hard_block = status_code in (403, 429) or (500 <= status_code < 600)
+
+            is_actually_blocked = http_hard_block or (
+                has_cloudflare_indicators and not has_job_content
+            )
+            if is_actually_blocked and verdict.reason is not None:
+                print(f"    🚫 Block detected: {verdict.reason.value} ({verdict.detail})")
             
             if is_actually_blocked:
                 metrics.incr("cf_blocks")
