@@ -131,6 +131,66 @@ def scrape_indeed_task(
         # Force proxy rotation on retries so each attempt uses a different IP.
         force_rotate = retry_index > 0
 
+        # Step 12 — Resumability: on a Celery retry, if the previous attempt
+        # finished the SERP scan before failing during detail fetches, skip
+        # the SERP entirely and re-run only the detail phase via the per-jk
+        # retry queue (same machinery as Step 2). This protects long batches
+        # from losing the entire SERP cost on a single mid-run failure.
+        existing = store.get(job_id) or {}
+        prior_progress = existing.get("progress") or {}
+        prior_result = existing.get("result") or []
+        already_fetched_jks = {
+            r.get("job_key") for r in prior_result if r.get("job_key")
+        }
+        discovered_jks = prior_progress.get("discovered_jks") or []
+
+        if (
+            retry_index > 0
+            and prior_progress.get("serp_done")
+            and discovered_jks
+            and fetch_full_details
+        ):
+            # Resume path: enqueue per-jk retries for everything the previous
+            # attempt knew about but didn't deliver. Bounded by the same per-
+            # batch cap that the normal Step 2 path uses.
+            from app.core.config import settings as scrape_settings
+            from app.core import metrics
+
+            remaining = [
+                jk for jk in discovered_jks if jk not in already_fetched_jks
+            ]
+            cap = getattr(scrape_settings, "MAX_PER_JK_RETRIES_PER_BATCH", 25)
+            remaining = remaining[:cap]
+            logger.info(
+                "Indeed job %s resuming from SERP checkpoint: %d/%d jks remain to fetch",
+                job_id, len(remaining), len(discovered_jks),
+            )
+            store.set_result(
+                job_id,
+                prior_result,
+                pending_retries=len(remaining),
+            )
+            for failed_jk in remaining:
+                scrape_indeed_single_jk_task.apply_async(
+                    args=(job_id, failed_jk, query, location),
+                    queue="scrape.indeed.retry",
+                )
+                metrics.incr("per_jk_retry_enqueued")
+            record_success(INDEED_HOST)
+            return {
+                "job_id": job_id,
+                "resumed": True,
+                "jobs_already_delivered": len(prior_result),
+                "pending_retries": len(remaining),
+            }
+
+        # Fresh-or-non-resumable path: full primary scrape.
+        def _progress_cb(**kwargs):
+            try:
+                store.set_progress(job_id, **kwargs)
+            except Exception:
+                pass
+
         with host_throttle(INDEED_HOST, max_concurrent=settings.MAX_CONCURRENT_SCRAPES_PER_HOST):
             store.set_progress(job_id, stage="navigating")
             jobs = _run_async(
@@ -148,6 +208,7 @@ def scrape_indeed_task(
                     force_rotate_proxy=force_rotate,
                     sort=sort,
                     radius=radius,
+                    progress_callback=_progress_cb,
                 )
             )
 

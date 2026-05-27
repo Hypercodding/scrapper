@@ -553,6 +553,7 @@ async def scrape_indeed_playwright(
     force_rotate_proxy: bool = False,
     sort: Optional[str] = None,
     radius: Optional[int] = None,
+    progress_callback=None,
 ) -> List[Job]:
     """
     Scrape Indeed jobs using Playwright.
@@ -653,6 +654,7 @@ async def scrape_indeed_playwright(
         _warm_state = storage_state_store.load(_CURRENT_SESSION_ID)
         _have_cf_clearance = storage_state_store.has_cf_clearance(_warm_state)
         if not _have_cf_clearance and getattr(settings, "WARMUP_ENABLED", True):
+            from app.core.human_behavior import human_pause
             try:
                 print("🔥 Warm-up: visiting indeed.com homepage…")
                 await page.goto(
@@ -660,12 +662,11 @@ async def scrape_indeed_playwright(
                     wait_until="domcontentloaded",
                     timeout=20000,
                 )
-                # 1.2–2.8s reading time + small scroll, matches the rhythm
-                # of a user deciding what to click next.
-                await page.wait_for_timeout(random.uniform(1200, 2800))
+                # Dwell like a user deciding what to click next.
+                await human_pause(page, "read")
                 try:
                     await page.mouse.wheel(0, random.randint(200, 600))
-                    await page.wait_for_timeout(random.uniform(400, 900))
+                    await human_pause(page, "scroll")
                 except Exception:
                     pass
                 print("✓ Warm-up done")
@@ -1172,6 +1173,19 @@ async def scrape_indeed_playwright(
                 break
 
         print(f"✓ Extracted {len(jobs)} jobs across {serp_page_idx + 1} SERP page(s); fetched details from {job_fetch_count} job pages")
+
+        # Step 12: persist discovered jks so a Celery retry of this same task
+        # can skip the SERP phase and only re-fetch the details that didn't
+        # land. Best-effort: callback failure must not break a successful scrape.
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    serp_done=True,
+                    discovered_jks=sorted(seen_job_keys),
+                )
+            except Exception as cb_err:
+                print(f"⚠️  progress_callback(serp_done) failed (non-fatal): {cb_err}")
+
         return jobs
 
 
