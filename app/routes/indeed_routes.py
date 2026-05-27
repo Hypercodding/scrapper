@@ -248,11 +248,25 @@ async def health():
 
 
 @router.get("/health/workers")
-async def worker_health():
-    """Check Redis connectivity and throttle slot counts."""
+async def worker_health(window_minutes: int = Query(60, ge=1, le=1440)):
+    """Check Redis connectivity, throttle slot counts, and run-quality metrics.
+
+    `window_minutes` controls the snapshot window for the metrics rollup
+    (default 60, max 1440 / 24h). Used to monitor block rate, CAPTCHA rate,
+    description completeness, and SERP retry recovery without log diving.
+    """
     try:
         from app.core.host_throttle import get_throttle_counts
+        from app.core import metrics
+
         counts = get_throttle_counts()
-        return {"status": "ok", "throttle_counts": counts}
+        snap = metrics.snapshot(last_n_minutes=window_minutes)
+        return {
+            "status": "ok",
+            "throttle_counts": counts,
+            "metrics_window_minutes": window_minutes,
+            "counters": snap,
+            "ratios": metrics.derived(snap),
+        }
     except Exception as exc:
         return {"status": "error", "detail": str(exc)}

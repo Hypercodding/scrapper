@@ -1,5 +1,8 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Literal, Optional, List
+
+
+DetailFetchStatus = Literal["ok", "blocked", "parse_failed", "skipped"]
 
 
 class Job(BaseModel):
@@ -35,3 +38,8 @@ class Job(BaseModel):
     salary_max: Optional[float] = None
     salary_currency: Optional[str] = None  # USD/EUR/GBP — defaults USD on indeed.com
     salary_period: Optional[str] = None  # "year" | "month" | "week" | "day" | "hour"
+
+    # Quality marker for the detail-page fetch. "ok" means description was
+    # extracted from /viewjob and meets MIN_DESCRIPTION_LEN. Anything else
+    # tells clients (or the per-jk retry path) the row is degraded.
+    detail_fetch_status: DetailFetchStatus = "ok"

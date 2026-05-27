@@ -41,6 +41,23 @@ class Settings(BaseSettings):
     # Redis / queue (see also app.core.settings_workers)
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # Description quality gate. Detail-page descriptions shorter than this
+    # are treated as a parse/block failure rather than shipped as-is.
+    # 500 chars ≈ one full job-description paragraph; below this is almost
+    # always card-snippet fallback or Cloudflare interstitial leftovers.
+    MIN_DESCRIPTION_LEN: int = 500
+
+    # When True, jobs whose detail fetch fails after retries are dropped
+    # from the primary task result (and re-enqueued via the per-jk retry
+    # queue if that path is enabled). When False, they are retained with
+    # detail_fetch_status != "ok" so clients can decide.
+    STRICT_DESCRIPTION_MODE: bool = True
+
+    # Cap on per-jk retries enqueued for one search batch. Prevents a
+    # pathological batch (e.g. Cloudflare hard-blocked the worker) from
+    # flooding scrape.indeed.retry.
+    MAX_PER_JK_RETRIES_PER_BATCH: int = 25
+
     class Config:  # pylint: disable=R0903
         env_file = ".env"
         extra = "ignore"  # Ignore extra fields from .env file

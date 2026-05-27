@@ -20,9 +20,25 @@ from typing import Optional, List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
 from bs4 import BeautifulSoup
 from app.models.job_model import Job
+from app.core import metrics
 from app.core.config import settings
 from app.core.proxy_manager import ProxyManager
 from app.services.indeed_url_builder import build_indeed_search_url
+
+
+# Module-level list of jks the worker failed to fully enrich during the last
+# scrape. Read by app.workers.tasks.scrape_indeed_task to enqueue per-jk
+# retries via the scrape.indeed.retry queue (wired in Step 2 of the rollout).
+# Reset at the start of every scrape_indeed_playwright() call.
+_LAST_FAILED_JKS: List[str] = []
+
+
+def get_last_failed_jks() -> List[str]:
+    """Return (and clear) the failed-jk list from the most recent scrape."""
+    global _LAST_FAILED_JKS
+    out = list(_LAST_FAILED_JKS)
+    _LAST_FAILED_JKS = []
+    return out
 
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
@@ -341,7 +357,11 @@ async def scrape_indeed_playwright(
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
 
-    global _last_fetch
+    global _last_fetch, _LAST_FAILED_JKS
+
+    # Reset the per-scrape failed-jk collector so the next call (or a Celery
+    # retry on the same worker process) doesn't leak ghosts from the previous run.
+    _LAST_FAILED_JKS = []
 
     # In-process rate limiting (Redis HostThrottle handles global cross-replica limiting)
     now = time.monotonic()
@@ -400,6 +420,7 @@ async def scrape_indeed_playwright(
             start=0,
         )
         print(f"🌐 Navigating to: {url}")
+        metrics.incr("serp_attempts")
 
         # Save the original search URL (without any job view parameters)
         original_search_url = url
@@ -547,6 +568,7 @@ async def scrape_indeed_playwright(
                 if has_indeed_content:
                     is_actually_blocked = False
                     print("✓ Indeed content detected - proceeding with scraping")
+                    metrics.incr("serp_success")
 
                 # Detect proxy/network failure: completely empty page, no Cloudflare indicators.
                 # An empty response (body=0 chars) is NOT a Cloudflare block — it means the proxy
@@ -722,13 +744,24 @@ async def scrape_indeed_playwright(
                     seen_job_keys.add(dedup_key)
                     new_on_this_page += 1
 
-                    # Disable detail fetching after too many Cloudflare blocks
+                    # Too many CF blocks: stop the SERP loop entirely instead
+                    # of silently flipping to fast-mode (which used to ship
+                    # card-snippet "descriptions" as if they were real). The
+                    # remaining jks become Step-2 retry candidates.
                     if cloudflare_block_count >= max_cloudflare_blocks:
-                        print(f"  ⚠️  Too many Cloudflare blocks ({cloudflare_block_count}) - switching to fast mode (no job detail pages)")
-                        fetch_full_details = False
+                        print(
+                            f"  ⚠️  Too many Cloudflare blocks ({cloudflare_block_count}/"
+                            f"{max_cloudflare_blocks}) — aborting SERP loop, "
+                            f"remaining jks will be retried per-jk"
+                        )
+                        if job.job_key:
+                            _LAST_FAILED_JKS.append(job.job_key)
+                        browser_alive = False  # break outer pagination loop too
+                        break
 
                     if fetch_full_details and browser_alive:
                         print(f"  → Fetching complete data from job page: {job.title}")
+                        metrics.incr("detail_attempts")
 
                         delay = random.uniform(min_delay_between_fetches, max_delay_between_fetches)
                         print(f"    ⏳ Waiting {delay:.1f}s before fetch...")
@@ -765,7 +798,15 @@ async def scrape_indeed_playwright(
                             except Exception as browser_error:
                                 print(f"    ⚠️  Error recreating browser: {browser_error}")
                                 browser_alive = False
-                                # Keep the basic SERP job and proceed; we'll exit the loop after this card
+                                # Browser dead before we could fetch this job's
+                                # detail page — flag the row and add the jk to
+                                # the per-jk retry list (handled in Step 2).
+                                job.detail_fetch_status = "parse_failed"
+                                if job.job_key:
+                                    _LAST_FAILED_JKS.append(job.job_key)
+                                # In STRICT mode, drop the row entirely.
+                                if getattr(settings, "STRICT_DESCRIPTION_MODE", True):
+                                    continue
                                 if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
                                     jobs.append(job)
                                 if len(jobs) >= max_results:
@@ -784,7 +825,12 @@ async def scrape_indeed_playwright(
                                 if enhanced_job:
                                     if enhanced_job.requirements and any('Ray ID' in str(req) for req in enhanced_job.requirements):
                                         cloudflare_block_count += 1
+                                        metrics.incr("cf_blocks")
                                         print(f"    ⚠️  Cloudflare block detected (total: {cloudflare_block_count}/{max_cloudflare_blocks})")
+                                        # Keep `job` as the SERP-card version but
+                                        # mark blocked so STRICT mode drops it
+                                        # and the per-jk retry queue picks it up.
+                                        job.detail_fetch_status = "blocked"
                                     else:
                                         job = enhanced_job
                                         job_fetch_count += 1
@@ -793,11 +839,33 @@ async def scrape_indeed_playwright(
                                 await asyncio.sleep(post_fetch_delay)
                         except Exception as enhance_error:
                             error_msg = str(enhance_error).lower()
+                            job.detail_fetch_status = "parse_failed"
                             if "closed" in error_msg or "target" in error_msg:
-                                print(f"  ⚠️  Browser closed during job detail extraction - using basic data for remaining jobs")
+                                print(f"  ⚠️  Browser closed during job detail extraction - flagging parse_failed for remaining jobs")
                                 browser_alive = False
                             else:
                                 print(f"  ⚠️  Error enhancing job details: {enhance_error}")
+                    elif not fetch_full_details:
+                        # Caller opted into fast mode — card-snippet description
+                        # is by design, but mark the row so clients can tell.
+                        job.detail_fetch_status = "skipped"
+
+                    # Drop degraded rows in STRICT mode, but only when the
+                    # client asked for full details. Fast-mode (skipped) rows
+                    # are intentional and always pass through.
+                    strict = getattr(settings, "STRICT_DESCRIPTION_MODE", True)
+                    if (
+                        strict
+                        and fetch_full_details
+                        and job.detail_fetch_status != "ok"
+                    ):
+                        if job.job_key:
+                            _LAST_FAILED_JKS.append(job.job_key)
+                        print(
+                            f"  ⨯ Dropping degraded row (status={job.detail_fetch_status}, "
+                            f"jk={job.job_key}) — queued for per-jk retry"
+                        )
+                        continue
 
                     # Apply post-scrape filters
                     if _should_include_job(job, job_type, salary_min, salary_max, experience_level, employment_type, days_old):
@@ -1476,10 +1544,13 @@ def _clean_description(description: str) -> str:
     # Remove "Employer responds within X days"
     description = re.sub(r'Employer (?:actively reviewing|responds within).*?(?:\.|$)', '', description, flags=re.IGNORECASE)
     
-    # Truncate if too long
-    if len(description) > 1000:
-        description = description[:1000].rsplit(' ', 1)[0] + '...'
-    
+    # Hard ceiling kept only to avoid pathological 10MB payloads on a
+    # broken page. Real Indeed descriptions sit comfortably under 50k.
+    # The old 1000-char cap was the reason fast-mode/snippet rows looked
+    # truncated to clients even when the source HTML was longer.
+    if len(description) > 50000:
+        description = description[:50000].rsplit(' ', 1)[0] + '...'
+
     return description.strip()
 
 
@@ -2333,10 +2404,12 @@ async def _extract_complete_job_details_from_url_playwright(
             is_actually_blocked = has_cloudflare_indicators and not has_job_content
             
             if is_actually_blocked:
+                metrics.incr("cf_blocks")
                 if job_retry_count >= max_job_retries:
-                    print(f"    ❌ Job page blocked by Cloudflare after {job_retry_count + 1} attempts - skipping enhanced details")
+                    print(f"    ❌ Job page blocked by Cloudflare after {job_retry_count + 1} attempts - marking blocked")
+                    job.detail_fetch_status = "blocked"
                     return job
-                
+
                 # Retry with longer wait
                 backoff = random.uniform(5.0, 8.0) * (1 + job_retry_count)
                 print(f"    ⚠️  Still blocked, retry {job_retry_count + 1}/{max_job_retries}, waiting {backoff:.1f}s...")
@@ -2392,10 +2465,26 @@ async def _extract_complete_job_details_from_url_playwright(
                 job.posted_date = enhanced_date
                 print(f"    ✓ Enhanced date: {enhanced_date}")
             
-            # Always update description with full job description from detail page
-            if enhanced_description and len(enhanced_description) > 100:
+            # Always update description with full job description from detail page.
+            # Floor (MIN_DESCRIPTION_LEN, default 500) separates a real
+            # job-description block from card-snippet leftovers and CF
+            # "Ray ID" stubs that snuck past block-detection.
+            min_desc = getattr(settings, "MIN_DESCRIPTION_LEN", 500)
+            if enhanced_description and len(enhanced_description) >= min_desc:
                 job.description = enhanced_description
+                job.detail_fetch_status = "ok"
+                metrics.incr("desc_ok")
+                metrics.incr("detail_success")
                 print(f"    ✓ Enhanced description: {len(enhanced_description)} characters")
+            else:
+                # Detail page rendered without our expected description block,
+                # or block was below floor. Either way: do NOT keep the card
+                # snippet silently — flag the row so STRICT mode can drop it
+                # and the per-jk retry queue can recover it (Step 2).
+                got = len(enhanced_description) if enhanced_description else 0
+                print(f"    ⚠️  Description below floor ({got} < {min_desc}) — marking parse_failed")
+                job.detail_fetch_status = "parse_failed"
+                metrics.incr("selector_drift")
             
             if enhanced_experience and not job.experience_level:
                 job.experience_level = enhanced_experience
@@ -2427,8 +2516,9 @@ async def _extract_complete_job_details_from_url_playwright(
         except Exception as e:
             if job_retry_count >= max_job_retries:
                 print(f"    ⚠️  Error extracting enhanced details after {job_retry_count + 1} attempts: {e}")
-                return job  # Continue with basic job data if enhancement fails
-            
+                job.detail_fetch_status = "parse_failed"
+                return job  # caller decides whether to drop / retry / keep
+
             print(f"    ⚠️  Error on attempt {job_retry_count + 1}, retrying: {e}")
             job_retry_count += 1
             await asyncio.sleep(random.uniform(2.0, 4.0))
