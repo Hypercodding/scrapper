@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     # API quirks, missing outerHeight, SwiftShader GPU vendor, etc.
     HEADFUL: bool = False
 
+    # When True, every scrape visits indeed.com homepage before issuing the
+    # search URL — real users rarely deep-link a SERP from a cold cookie
+    # jar. Skipped automatically when the storage_state cache already has
+    # a cf_clearance cookie (no point re-warming a warm session).
+    WARMUP_ENABLED: bool = True
+
     class Config:  # pylint: disable=R0903
         env_file = ".env"
         extra = "ignore"  # Ignore extra fields from .env file

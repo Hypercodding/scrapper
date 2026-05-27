@@ -235,6 +235,28 @@ _current_proxy: Optional[str] = None
 # In-process rate-limit timestamp (the Redis HostThrottle is the real global limiter)
 _last_fetch: float = 0
 
+# Process-stable session id. Same worker process → same FingerprintProfile
+# → same storage_state Redis key. Restarting a worker (or a Celery
+# max-tasks-per-child rotation) gets a fresh session, which is desirable
+# because Cloudflare's cf_clearance cookie expires anyway. Step 6's
+# ProxySession will override this with a proxy-derived id so a single
+# worker can run multiple proxy sessions concurrently.
+import uuid as _uuid_mod
+_PROCESS_SESSION_ID: str = _uuid_mod.uuid4().hex
+_CURRENT_SESSION_ID: str = _PROCESS_SESSION_ID
+
+
+def get_current_session_id() -> str:
+    return _CURRENT_SESSION_ID
+
+
+def set_current_session_id(session_id: str) -> None:
+    """Override the session id for the next browser launch. Used by Step 6
+    (ProxySession) to align fingerprint + storage_state with the proxy
+    session id. Reset by calling with _PROCESS_SESSION_ID."""
+    global _CURRENT_SESSION_ID
+    _CURRENT_SESSION_ID = session_id or _PROCESS_SESSION_ID
+
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Optional[Dict]:
     """
@@ -417,18 +439,28 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
             f"Failed to launch Chromium: {e}. Run: python -m playwright install chromium"
         )
 
-    # Per-session fingerprint: UA / viewport / TZ / locale / geo / Sec-CH-UA
-    # are now derived from a deterministic profile seeded by a uuid4. Same
-    # session_id → same profile (matters for Step 7 storage_state reuse).
-    # Different sessions → independent canvas / audio / UA / viewport.
+    # Per-session fingerprint, keyed by _CURRENT_SESSION_ID so storage_state
+    # reuse hits the same fingerprint on each cache hit (Cloudflare correlates
+    # cf_clearance ↔ fingerprint; rotating the FP while reusing the cookie is
+    # a stronger signal than either alone).
     from app.core.fingerprint_profile import FingerprintProfile
+    from app.core import storage_state_store
+
+    session_id = _CURRENT_SESSION_ID
     # Step 6 will pass the proxy egress country here; until then default US.
     _proxy_country = "US"
-    _fp = FingerprintProfile.for_session(proxy_country=_proxy_country)
+    _fp = FingerprintProfile.for_session(
+        session_id=session_id, proxy_country=_proxy_country
+    )
+
+    cached_state = storage_state_store.load(session_id)
+    has_cf = storage_state_store.has_cf_clearance(cached_state)
     print(
-        f"🎭 Fingerprint: ua={_fp.user_agent.split('Chrome/')[1].split(' ')[0]} "
+        f"🎭 Fingerprint sid={session_id[:8]} "
+        f"ua={_fp.user_agent.split('Chrome/')[1].split(' ')[0]} "
         f"viewport={_fp.viewport['width']}x{_fp.viewport['height']} "
-        f"tz={_fp.timezone_id} locale={_fp.locale} platform={_fp.platform}"
+        f"tz={_fp.timezone_id} platform={_fp.platform} "
+        f"storage_state={'hit+cf_clearance' if has_cf else ('hit' if cached_state else 'miss')}"
     )
 
     context_options: dict = {
@@ -447,6 +479,8 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
     }
     if proxy_config:
         context_options["proxy"] = proxy_config
+    if cached_state:
+        context_options["storage_state"] = cached_state
 
     context = await browser.new_context(**context_options)
 
@@ -607,7 +641,37 @@ async def scrape_indeed_playwright(
 
         # Save the original search URL (without any job view parameters)
         original_search_url = url
-        
+
+        # Warm-up: real users almost never deep-link a SERP from a cold
+        # cookie jar. Visiting indeed.com first establishes the typical
+        # referer chain and gives Cloudflare a chance to set its baseline
+        # cookies on a low-stakes page. Skipped when the storage_state
+        # cache already has a cf_clearance — that means a recent scrape
+        # already solved the challenge and reusing it is faster than
+        # re-warming.
+        from app.core import storage_state_store
+        _warm_state = storage_state_store.load(_CURRENT_SESSION_ID)
+        _have_cf_clearance = storage_state_store.has_cf_clearance(_warm_state)
+        if not _have_cf_clearance and getattr(settings, "WARMUP_ENABLED", True):
+            try:
+                print("🔥 Warm-up: visiting indeed.com homepage…")
+                await page.goto(
+                    "https://www.indeed.com/",
+                    wait_until="domcontentloaded",
+                    timeout=20000,
+                )
+                # 1.2–2.8s reading time + small scroll, matches the rhythm
+                # of a user deciding what to click next.
+                await page.wait_for_timeout(random.uniform(1200, 2800))
+                try:
+                    await page.mouse.wheel(0, random.randint(200, 600))
+                    await page.wait_for_timeout(random.uniform(400, 900))
+                except Exception:
+                    pass
+                print("✓ Warm-up done")
+            except Exception as warmup_err:
+                print(f"⚠️  Warm-up failed (non-fatal): {warmup_err}")
+
         # Navigate with retry logic for Cloudflare
         max_retries = getattr(settings, "MAX_RETRIES", 3)
         cloudflare_retries = 0
@@ -794,10 +858,27 @@ async def scrape_indeed_playwright(
                 if not is_actually_blocked:
                     # Success - no Cloudflare block, mark proxy as successful
                     _mark_proxy_success()
+                    # Persist storage_state (cookies incl. cf_clearance,
+                    # localStorage, sessionStorage) for ~25 minutes so the
+                    # next scrape in the same session skips the CF challenge.
+                    try:
+                        _state = await context.storage_state()
+                        storage_state_store.save(_CURRENT_SESSION_ID, _state)
+                        if storage_state_store.has_cf_clearance(_state):
+                            print(f"💾 Saved storage_state for sid={_CURRENT_SESSION_ID[:8]} (cf_clearance present)")
+                    except Exception as save_err:
+                        print(f"⚠️  storage_state save failed (non-fatal): {save_err}")
                     break
                 
                 # Cloudflare detected - retry logic
                 if cloudflare_retries >= max_retries:
+                    # Rotate the process session id so the next task on this
+                    # worker doesn't reuse the same fingerprint Cloudflare
+                    # just rejected. _PROCESS_SESSION_ID is intentionally
+                    # *not* reseeded — that's the worker-lifecycle anchor.
+                    global _CURRENT_SESSION_ID
+                    _CURRENT_SESSION_ID = _uuid_mod.uuid4().hex
+                    print(f"🔁 Rotated session id after CF block; new sid={_CURRENT_SESSION_ID[:8]}")
                     raise CloudflareBlockedError(
                         f"Indeed blocked by Cloudflare. Tried {cloudflare_retries + 1} times. "
                         f"Try again later or use a different IP address."
@@ -806,13 +887,20 @@ async def scrape_indeed_playwright(
                 # Retry with backoff
                 backoff = random.uniform(3.0, 6.0) * (1 + 0.5 * cloudflare_retries)
                 print(f"⚠️  Cloudflare detected, retry {cloudflare_retries + 1}/{max_retries}, waiting {backoff:.1f}s...")
-                
+
                 # Perform human-like interactions
                 if getattr(settings, "HUMANIZE", True):
                     await _perform_human_interactions_playwright(page)
-                
-                # Clear cookies and wait
+
+                # Clear cookies AND evict the cached storage_state — the
+                # cookies that just got us blocked are useless to keep, and
+                # the next launch should start cold rather than re-loading
+                # the same poisoned jar.
                 await context.clear_cookies()
+                try:
+                    storage_state_store.evict(_CURRENT_SESSION_ID)
+                except Exception:
+                    pass
                 await asyncio.sleep(backoff)
                 
                 # Recreate browser with a rotated proxy for fresh start
