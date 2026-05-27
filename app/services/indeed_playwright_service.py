@@ -40,6 +40,90 @@ def get_last_failed_jks() -> List[str]:
     _LAST_FAILED_JKS = []
     return out
 
+
+async def scrape_single_jk_with_fresh_session(
+    jk: str,
+    query: str = "",
+    location: Optional[str] = None,
+) -> Optional[Job]:
+    """Fetch one Indeed /viewjob page in an isolated browser session.
+
+    Used by the per-jk retry queue (`scrape_indeed_single_jk_task`) when the
+    primary scrape couldn't extract a full description for this jk. Forces
+    a fresh proxy rotation so the retry doesn't reuse the same egress IP
+    Cloudflare likely just blocked.
+
+    Returns a `Job` with `detail_fetch_status="ok"` on success; `None` or a
+    Job with non-ok status on failure. Caller decides what to record.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        raise ImportError(
+            "Playwright is not installed. Install with: "
+            "pip install playwright && python -m playwright install chromium"
+        )
+
+    print(f"🎯 Single-jk fetch: jk={jk} (fresh session)")
+    pw = None
+    browser = None
+    context = None
+    page = None
+    try:
+        pw = await async_playwright().start()
+        # Force-rotate: this retry exists *because* the previous attempt was
+        # blocked, so reusing the same proxy is pointless.
+        proxy_config = _rotate_proxy_on_error()
+        browser, context = await _launch_browser_with_context(pw, proxy_config)
+        page = await context.new_page()
+
+        viewjob_url = f"https://www.indeed.com/viewjob?jk={jk}"
+        # Stub job — the extractor enriches in place. `url` and `job_key`
+        # are what _extract_complete_job_details_from_url_playwright reads.
+        job = Job(
+            title="(pending)",
+            url=viewjob_url,
+            job_key=jk,
+            job_id=jk,
+        )
+
+        enhanced = await _extract_complete_job_details_from_url_playwright(
+            page, job,
+            original_search_url=f"https://www.indeed.com/jobs?q={query}",
+            skip_nav_back=True,
+        )
+
+        if enhanced and enhanced.detail_fetch_status == "ok" and enhanced.description:
+            metrics.incr("per_jk_retry_success")
+            # Title may still be "(pending)" if the extractor didn't refresh
+            # it — try to recover from the page H1.
+            if enhanced.title == "(pending)":
+                try:
+                    h1 = await page.locator("h1").first.text_content(timeout=2000)
+                    if h1:
+                        enhanced.title = h1.strip()
+                except Exception:
+                    pass
+            print(f"  ✓ Single-jk fetch succeeded: {len(enhanced.description)} chars")
+            return enhanced
+
+        print(f"  ⨯ Single-jk fetch failed: status={enhanced.detail_fetch_status if enhanced else 'no-job'}")
+        return enhanced  # caller checks .detail_fetch_status
+
+    except Exception as exc:
+        print(f"  ⨯ Single-jk fetch crashed: {exc}")
+        return None
+    finally:
+        try:
+            if page and not page.is_closed():
+                await page.close()
+        except Exception:
+            pass
+        await _close_browser(browser, context)
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
     PLAYWRIGHT_AVAILABLE = True

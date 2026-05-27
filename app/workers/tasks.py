@@ -152,10 +152,43 @@ def scrape_indeed_task(
             )
 
         result = [j.model_dump() for j in jobs]
-        store.set_result(job_id, result)
+
+        # Drain rows the strict-mode gate dropped during the primary scrape
+        # and enqueue per-jk retries with a forced fresh proxy / fingerprint.
+        # The parent stays in PROCESSING until every retry resolves via
+        # JobStore.complete_retry — this keeps the API client polling instead
+        # of seeing a premature COMPLETED with an incomplete result list.
+        from app.core.config import settings as scrape_settings
+        from app.core import metrics
+        from app.services.indeed_playwright_service import get_last_failed_jks
+
+        failed_jks = get_last_failed_jks() if fetch_full_details else []
+        max_retries_per_batch = getattr(
+            scrape_settings, "MAX_PER_JK_RETRIES_PER_BATCH", 25
+        )
+        # Dedup + cap so a pathological run can't flood scrape.indeed.retry.
+        failed_jks = list(dict.fromkeys(failed_jks))[:max_retries_per_batch]
+
+        store.set_result(job_id, result, pending_retries=len(failed_jks))
         record_success(INDEED_HOST)
-        logger.info("Indeed job %s completed: %d jobs found", job_id, len(result))
-        return {"job_id": job_id, "jobs_found": len(result)}
+        logger.info(
+            "Indeed job %s primary done: %d jobs, %d per-jk retries queued",
+            job_id, len(result), len(failed_jks),
+        )
+
+        if failed_jks:
+            for failed_jk in failed_jks:
+                scrape_indeed_single_jk_task.apply_async(
+                    args=(job_id, failed_jk, query, location),
+                    queue="scrape.indeed.retry",
+                )
+                metrics.incr("per_jk_retry_enqueued")
+
+        return {
+            "job_id": job_id,
+            "jobs_found": len(result),
+            "pending_retries": len(failed_jks),
+        }
 
     except CloudflareBlockedError as exc:
         record_failure(INDEED_HOST)
@@ -186,6 +219,78 @@ def scrape_indeed_task(
         if retry_index >= self.max_retries:
             logger.error("Indeed job %s moved to DLQ after max retries", job_id)
             raise Reject(str(exc), requeue=False)
+
+        backoff = _INDEED_RETRY_DELAYS[min(retry_index, len(_INDEED_RETRY_DELAYS) - 1)]
+        raise self.retry(exc=exc, countdown=backoff)
+
+
+@celery_app.task(
+    bind=True,
+    name="app.workers.tasks.scrape_indeed_single_jk_task",
+    max_retries=3,
+    acks_late=True,
+    queue="scrape.indeed.retry",
+)
+def scrape_indeed_single_jk_task(
+    self,
+    parent_job_id: str,
+    jk: str,
+    query: str = "",
+    location: Optional[str] = None,
+):
+    """Fetch one Indeed /viewjob page that the primary scrape's strict gate
+    dropped. Runs in an isolated browser with a forced fresh proxy.
+
+    On terminal outcome (success or final failure), `JobStore.complete_retry`
+    atomically appends the result (if any), decrements `pending_retries`,
+    and flips the parent's status to COMPLETED when the counter hits zero.
+    """
+    from app.core.host_throttle import host_throttle
+    from app.core.settings_workers import get_worker_settings
+    from app.services.indeed_playwright_service import (
+        scrape_single_jk_with_fresh_session,
+        CloudflareBlockedError,
+    )
+    from app.core import metrics
+
+    store = get_job_store()
+    settings = get_worker_settings()
+    retry_index = self.request.retries
+
+    try:
+        with host_throttle(INDEED_HOST, max_concurrent=settings.MAX_CONCURRENT_SCRAPES_PER_HOST):
+            job = _run_async(
+                scrape_single_jk_with_fresh_session(jk=jk, query=query, location=location)
+            )
+
+        if job is not None and job.detail_fetch_status == "ok":
+            store.complete_retry(parent_job_id, job.model_dump())
+            logger.info("Per-jk retry %s succeeded for parent %s", jk, parent_job_id)
+            return {"jk": jk, "status": "ok"}
+
+        # Sub-task technically returned but the result is degraded — retry if budget allows.
+        raise CloudflareBlockedError(
+            f"per-jk fetch returned degraded result for {jk} "
+            f"(status={getattr(job, 'detail_fetch_status', 'no-job')})"
+        )
+
+    except (CloudflareBlockedError, Exception) as exc:
+        if retry_index >= self.max_retries:
+            # Final failure: record a blocked stub so the parent's
+            # pending_retries counter still ticks down, otherwise the
+            # parent job would hang in PROCESSING forever.
+            stub = {
+                "job_key": jk,
+                "url": f"https://www.indeed.com/viewjob?jk={jk}",
+                "title": "(retry exhausted)",
+                "detail_fetch_status": "blocked",
+            }
+            store.complete_retry(parent_job_id, stub)
+            logger.warning(
+                "Per-jk retry %s exhausted for parent %s: %s",
+                jk, parent_job_id, exc,
+            )
+            return {"jk": jk, "status": "blocked"}
 
         backoff = _INDEED_RETRY_DELAYS[min(retry_index, len(_INDEED_RETRY_DELAYS) - 1)]
         raise self.retry(exc=exc, countdown=backoff)
