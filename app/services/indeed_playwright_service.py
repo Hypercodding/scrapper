@@ -124,12 +124,44 @@ async def scrape_single_jk_with_fresh_session(
             except Exception:
                 pass
 
+# Patchright (Playwright fork) closes the CDP Runtime.Enable leak that
+# Cloudflare's bot-management script tests for. When settings.USE_PATCHRIGHT
+# is true (env: USE_PATCHRIGHT=true on Railway), use patchright. Otherwise
+# fall back to stock playwright so toggling is a runtime decision, not a
+# rebuild.
+_USE_PATCHRIGHT = False
 try:
-    from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    print("⚠️  Playwright not installed. Install with: pip install playwright && python -m playwright install chromium")
+    from app.core.config import settings as _cfg
+    _USE_PATCHRIGHT = bool(getattr(_cfg, "USE_PATCHRIGHT", False))
+except Exception:
+    _USE_PATCHRIGHT = False
+
+if _USE_PATCHRIGHT:
+    try:
+        from patchright.async_api import (
+            async_playwright,
+            Browser,
+            BrowserContext,
+            Page,
+            Playwright,
+        )
+        PLAYWRIGHT_AVAILABLE = True
+        print("✓ Patchright loaded (CDP-leak-patched Playwright fork)")
+    except ImportError as ie:
+        print(f"⚠️  USE_PATCHRIGHT=true but patchright not installed: {ie}. Falling back to stock playwright.")
+        try:
+            from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+            PLAYWRIGHT_AVAILABLE = True
+        except ImportError:
+            PLAYWRIGHT_AVAILABLE = False
+            print("⚠️  Playwright not installed. Install with: pip install playwright && python -m playwright install chromium")
+else:
+    try:
+        from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+        PLAYWRIGHT_AVAILABLE = True
+    except ImportError:
+        PLAYWRIGHT_AVAILABLE = False
+        print("⚠️  Playwright not installed. Install with: pip install playwright && python -m playwright install chromium")
 
 try:
     from playwright_stealth import Stealth
@@ -307,6 +339,10 @@ class CloudflareBlockedError(Exception):
     pass
 
 
+# Bundled-Chromium args. Includes --single-process/--no-zygote/--disable-gpu
+# for tiny-container compatibility — these reduce realism but are required
+# when running stock Chromium under low-RAM headless. Patchright + real Chrome
+# uses _BROWSER_ARGS_CHROME below, which omits them.
 _BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -326,6 +362,31 @@ _BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
 ]
 
+# Args for real Chrome via Patchright. Drops --single-process / --no-zygote
+# / --disable-gpu — those produce an atypical process tree and a SwiftShader
+# GPU vendor string that CreepJS flags. Drops --window-size in favor of the
+# context's `viewport` so size jitter is per-session (Step 5).
+_BROWSER_ARGS_CHROME = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-client-side-phishing-detection",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--disable-features=IsolateOrigins,site-per-process,Translate,InterestFeedContentSuggestions",
+    "--disable-blink-features=AutomationControlled",
+]
+
 
 async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> tuple:
     """
@@ -333,8 +394,19 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
     Caller owns and must close both objects.
     Returns (browser, context).
     """
+    use_real_chrome = _USE_PATCHRIGHT and bool(getattr(settings, "BROWSER_CHANNEL", ""))
+    launch_args = _BROWSER_ARGS_CHROME if use_real_chrome else _BROWSER_ARGS
+    launch_kwargs = {"headless": True, "args": launch_args}
+    if use_real_chrome:
+        # Patchright + channel="chrome" uses /usr/bin/google-chrome from
+        # apt-get instead of Playwright's bundled Chromium. Real Chrome has
+        # the genuine chrome.runtime shape, Widevine, and codec mix that
+        # bot-detection scripts read.
+        launch_kwargs["channel"] = settings.BROWSER_CHANNEL
+        print(f"🔧 Launching real Chrome via Patchright (channel={settings.BROWSER_CHANNEL})")
+
     try:
-        browser = await pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
+        browser = await pw.chromium.launch(**launch_kwargs)
     except Exception as e:
         raise Exception(
             f"Failed to launch Chromium: {e}. Run: python -m playwright install chromium"

@@ -18,6 +18,12 @@ psutil==6.1.0
 playwright>=1.40.0
 playwright-stealth>=2.0.0  # Anti-detection for Playwright
 
+# Patchright — Playwright fork that closes the CDP Runtime.Enable leak and
+# several smaller bot-detection signals. Drop-in API. Activated only when
+# USE_PATCHRIGHT=true is set (see app/core/config.py); otherwise the worker
+# continues to import stock playwright.
+patchright>=1.49.0
+
 # Optional: network interception
 selenium-wire>=5,<6
 

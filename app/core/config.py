@@ -8,7 +8,11 @@ class Settings(BaseSettings):
     
     # Indeed scraping settings
     BASE_URL: str = "https://www.indeed.com/rss"
-    USER_AGENT: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    # User-Agent. The previous default pinned Chrome/120 which Cloudflare's
+    # bot-management script flags as a known-stale UA. Bumped to a current
+    # stable major. Step 5 (FingerprintProfile) replaces this with a rotating
+    # pool per session.
+    USER_AGENT: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     MIN_DELAY: float = 2.0  # Minimum delay between requests in seconds
     PAGE_DELAY_MIN: float = 2.0  # Min per-page human think time
     PAGE_DELAY_MAX: float = 5.8  # Max per-page human think time
@@ -57,6 +61,19 @@ class Settings(BaseSettings):
     # pathological batch (e.g. Cloudflare hard-blocked the worker) from
     # flooding scrape.indeed.retry.
     MAX_PER_JK_RETRIES_PER_BATCH: int = 25
+
+    # When True, the worker imports `patchright` instead of `playwright`
+    # and launches via Patchright's `channel="chrome"` to use the real
+    # google-chrome-stable binary installed in Dockerfile.railway.
+    # Closes the CDP Runtime.Enable leak that stock Playwright exposes —
+    # the single largest detection signal Cloudflare's bot-management
+    # script looks for.
+    USE_PATCHRIGHT: bool = False
+
+    # Chrome channel passed to launch_persistent_context / launch. Only
+    # honored when USE_PATCHRIGHT=True. Valid: "chrome" | "chrome-beta" |
+    # "msedge" | "" (bundled Chromium).
+    BROWSER_CHANNEL: str = "chrome"
 
     class Config:  # pylint: disable=R0903
         env_file = ".env"
