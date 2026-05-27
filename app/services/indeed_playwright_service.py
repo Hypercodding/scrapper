@@ -396,7 +396,12 @@ async def _launch_browser_with_context(pw: "Playwright", proxy_config=None) -> t
     """
     use_real_chrome = _USE_PATCHRIGHT and bool(getattr(settings, "BROWSER_CHANNEL", ""))
     launch_args = _BROWSER_ARGS_CHROME if use_real_chrome else _BROWSER_ARGS
-    launch_kwargs = {"headless": True, "args": launch_args}
+    # HEADFUL=true requires the worker process to already be inside xvfb-run
+    # (start-worker-indeed.sh handles that). The launch itself is identical.
+    headful = bool(getattr(settings, "HEADFUL", False))
+    launch_kwargs = {"headless": not headful, "args": launch_args}
+    if headful:
+        print("🖥️  Launching headful Chrome (HEADFUL=true; assumes xvfb-run wrapper)")
     if use_real_chrome:
         # Patchright + channel="chrome" uses /usr/bin/google-chrome from
         # apt-get instead of Playwright's bundled Chromium. Real Chrome has

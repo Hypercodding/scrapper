@@ -75,6 +75,14 @@ class Settings(BaseSettings):
     # "msedge" | "" (bundled Chromium).
     BROWSER_CHANNEL: str = "chrome"
 
+    # When True, the worker launches Chrome with headless=False. Requires
+    # the worker process to be wrapped in `xvfb-run` (start-worker-indeed.sh
+    # detects HEADFUL=true and does this automatically when the image
+    # includes the xvfb apt package). Headful Chrome reads as a real user
+    # session to Cloudflare bot-management; headless leaks via Permissions
+    # API quirks, missing outerHeight, SwiftShader GPU vendor, etc.
+    HEADFUL: bool = False
+
     class Config:  # pylint: disable=R0903
         env_file = ".env"
         extra = "ignore"  # Ignore extra fields from .env file
