@@ -593,7 +593,7 @@ async def scrape_indeed_playwright(
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not installed. Install with: pip install playwright && python -m playwright install chromium")
 
-    global _last_fetch, _LAST_FAILED_JKS
+    global _last_fetch, _LAST_FAILED_JKS, _CURRENT_SESSION_ID
 
     # Reset the per-scrape failed-jk collector so the next call (or a Celery
     # retry on the same worker process) doesn't leak ghosts from the previous run.
@@ -895,7 +895,7 @@ async def scrape_indeed_playwright(
                     # worker doesn't reuse the same fingerprint Cloudflare
                     # just rejected. _PROCESS_SESSION_ID is intentionally
                     # *not* reseeded — that's the worker-lifecycle anchor.
-                    global _CURRENT_SESSION_ID
+                    # (`global` declared at the top of this function.)
                     _CURRENT_SESSION_ID = _uuid_mod.uuid4().hex
                     print(f"🔁 Rotated session id after CF block; new sid={_CURRENT_SESSION_ID[:8]}")
                     raise CloudflareBlockedError(
